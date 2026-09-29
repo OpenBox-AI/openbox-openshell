@@ -11,5 +11,6 @@ pub mod guard;
 pub mod halt;
 pub mod interceptor;
 pub mod metrics;
+pub mod ocsf_tail;
 pub mod service;
 pub mod token;
