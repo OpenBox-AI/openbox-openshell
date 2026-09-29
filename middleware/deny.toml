@@ -1,0 +1,50 @@
+[advisories]
+version = 2
+yanked = "deny"
+# RUSTSEC-2025-0134 (rustls-pemfile archived, unmaintained): transitive via the
+# LOCKED upstream openshell-core crate at OpenShell v0.1.2. No known
+# vulnerability; this workspace parses PEM through rustls-pki-types. Revisit
+# when the OpenShell lock bumps.
+ignore = [
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; locked upstream openshell-core dep; no vulnerability; revisit on lock bump" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# Keep the explicit allow list stable for this private runtime workspace.
+unused-allowed-license = "allow"
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+exceptions = []
+
+[licenses.private]
+# Workspace crates are proprietary and explicitly non-publishable. Third-party
+# dependencies remain subject to the allow list above.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+# The pinned upstream openshell-policy crate contains an internal path-only dependency without a
+# version field. Keep this visible as a warning; Cargo.toml and Cargo.lock bind the exact Git
+# revision used by this workspace.
+wildcards = "warn"
+allow-wildcard-paths = true
+highlight = "all"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/NVIDIA/OpenShell.git"]
