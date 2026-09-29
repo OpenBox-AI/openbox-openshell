@@ -8,5 +8,6 @@ pub mod action;
 pub mod core_client;
 pub mod guard;
 pub mod halt;
+pub mod metrics;
 pub mod service;
 pub mod token;

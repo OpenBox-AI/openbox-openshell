@@ -14,12 +14,14 @@
 //! the constraint is met and the request proceeds, with a finding recording it.
 //!
 //! Approvals are deny-then-retry, because `OpenShell` has no way to hold a
-//! request. The first attempt is denied with a stable reason code and
-//! remembered by fingerprint. When the identical action comes back, the
-//! approval is read from Core: approved lets it through, still pending denies
-//! it again, and a human rejection (which Core reports as halt) stops the
-//! sandbox. Losing this memory on restart is safe: the retry is evaluated
-//! afresh and, at worst, asks for approval again.
+//! request. Before scoring any request the guard asks Core whether an
+//! approval already exists for this exact action (its fingerprint-derived
+//! activity id): approved lets it be scored and through, still pending denies
+//! it without re-scoring, and a human rejection (which Core reports as halt)
+//! stops the sandbox. The check is deliberately stateless so every replica
+//! behaves the same: re-scoring a pending or approved action makes Core write
+//! a fresh pending verdict over the human's decision, so a replica that did
+//! not see the first attempt must never skip the check.
 //!
 //! Every failure to get a verdict is an explicit deny with
 //! `openbox_unavailable`, never an allow.
@@ -30,7 +32,8 @@ use std::sync::{Arc, Mutex};
 use openshell_core::proto::{Decision, Finding, HttpRequestResult};
 
 use crate::action::Action;
-use crate::core_client::{ApprovalState, CoreDecision, CoreError, Verdict, unix_now};
+use crate::core_client::{ApprovalState, CoreDecision, CoreError, Verdict};
+use crate::metrics::{CoreCall, Metrics};
 
 pub const REASON_APPROVAL_REQUIRED: &str = "openbox_approval_required";
 pub const REASON_BLOCKED: &str = "openbox_blocked";
@@ -38,8 +41,6 @@ pub const REASON_HALTED: &str = "openbox_halted";
 pub const REASON_UNAVAILABLE: &str = "openbox_unavailable";
 
 const MAX_REASON_BYTES: usize = 4 * 1024;
-/// Fallback lifetime of a remembered approval when Core gives no expiry.
-const DEFAULT_APPROVAL_SECS: i64 = 30 * 60;
 
 /// Core's governance API, as the guard uses it.
 #[tonic::async_trait]
@@ -85,7 +86,7 @@ pub trait SandboxStopper: Send + Sync + 'static {
 /// Per-binding behaviour selected by the sandbox policy's middleware config.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ApprovalMode {
-    /// Deny, remember the action, and let the approved retry through.
+    /// Deny, and let the identical retry through once a human approves.
     #[default]
     Queue,
     /// Treat `REQUIRE_APPROVAL` as a block.
@@ -96,9 +97,10 @@ pub struct Guard<G, S: ?Sized> {
     governance: Arc<G>,
     stopper: Arc<S>,
     sessions: Mutex<HashSet<String>>,
+    /// Local cache only: Core latches a halted session, so a replica that
+    /// missed the halt still gets `halt` for the sandbox's next request.
     halted: Arc<Mutex<HashSet<String>>>,
-    /// (sandbox id, fingerprint) → Unix-seconds expiry of a pending approval.
-    pending: Mutex<HashMap<(String, String), i64>>,
+    metrics: Arc<Metrics>,
 }
 
 impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
@@ -108,11 +110,51 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             stopper,
             sessions: Mutex::new(HashSet::new()),
             halted: Arc::new(Mutex::new(HashSet::new())),
-            pending: Mutex::new(HashMap::new()),
+            metrics: Arc::new(Metrics::default()),
         }
     }
 
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Evaluates one request and records its result. The log line carries
+    /// identifiers and the outcome only, never request content.
     pub async fn evaluate(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
+        let started = std::time::Instant::now();
+        let result = self.decide(action, mode).await;
+        let elapsed = started.elapsed();
+        let allowed = result.decision == Decision::Allow as i32;
+        self.metrics
+            .record_result(allowed, &result.reason_code, elapsed);
+        eprintln!(
+            "openbox: eval request_id={} sandbox_id={} decision={} reason_code={} ms={}",
+            action.request_id,
+            action.sandbox_id,
+            if allowed { "allow" } else { "deny" },
+            if result.reason_code.is_empty() {
+                "-"
+            } else {
+                &result.reason_code
+            },
+            elapsed.as_millis()
+        );
+        result
+    }
+
+    async fn timed<T>(
+        &self,
+        call: CoreCall,
+        future: impl Future<Output = Result<T, CoreError>>,
+    ) -> Result<T, CoreError> {
+        let started = std::time::Instant::now();
+        let outcome = future.await;
+        self.metrics
+            .record_core(call, outcome.is_ok(), started.elapsed());
+        outcome
+    }
+
+    async fn decide(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
         if action.sandbox_id.is_empty() {
             return deny(REASON_UNAVAILABLE, "request carried no sandbox id", None);
         }
@@ -122,15 +164,16 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         if let Some(result) = self.ensure_session(action).await {
             return result;
         }
-        let key = (action.sandbox_id.clone(), action.fingerprint.clone());
-        if self.pending_expiry(&key).is_some() {
-            match self.governance.approval_state(action).await {
+        if mode == ApprovalMode::Queue {
+            match self
+                .timed(CoreCall::Approval, self.governance.approval_state(action))
+                .await
+            {
                 Ok(ApprovalState::Pending { .. }) => {
                     return deny(REASON_APPROVAL_REQUIRED, "awaiting human approval", None);
                 }
-                Ok(ApprovalState::Approved | ApprovalState::Gone) => self.forget(&key),
+                Ok(ApprovalState::Approved | ApprovalState::Gone) => {}
                 Ok(ApprovalState::Rejected(verdict)) => {
-                    self.forget(&key);
                     let decision = CoreDecision {
                         verdict,
                         reason: Some("approval was rejected".to_owned()),
@@ -144,7 +187,10 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 Err(error) => return deny(REASON_UNAVAILABLE, &error.to_string(), None),
             }
         }
-        match self.governance.evaluate_action(action).await {
+        match self
+            .timed(CoreCall::Evaluate, self.governance.evaluate_action(action))
+            .await
+        {
             Ok(decision) => self.apply(action, mode, &decision),
             Err(error) => deny(REASON_UNAVAILABLE, &error.to_string(), None),
         }
@@ -155,8 +201,11 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             return None;
         }
         match self
-            .governance
-            .start_session(&action.sandbox_id, &action.sandbox_name)
+            .timed(
+                CoreCall::Session,
+                self.governance
+                    .start_session(&action.sandbox_id, &action.sandbox_name),
+            )
             .await
         {
             Ok(decision) if decision.verdict == Verdict::Halt => {
@@ -179,23 +228,14 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         match decision.verdict {
             Verdict::Allow => allow(decision, "allow"),
             Verdict::Constrain => allow(decision, "constrain_met_by_sandbox"),
-            Verdict::RequireApproval if mode == ApprovalMode::Queue => {
-                let expires_at = decision
-                    .approval_expires_at
-                    .unwrap_or_else(|| unix_now() + DEFAULT_APPROVAL_SECS);
-                self.remember(
-                    (action.sandbox_id.clone(), action.fingerprint.clone()),
-                    expires_at,
-                );
-                deny(
-                    REASON_APPROVAL_REQUIRED,
-                    decision
-                        .reason
-                        .as_deref()
-                        .unwrap_or("human approval required"),
-                    Some(decision),
-                )
-            }
+            Verdict::RequireApproval if mode == ApprovalMode::Queue => deny(
+                REASON_APPROVAL_REQUIRED,
+                decision
+                    .reason
+                    .as_deref()
+                    .unwrap_or("human approval required"),
+                Some(decision),
+            ),
             Verdict::RequireApproval | Verdict::Block => deny(
                 REASON_BLOCKED,
                 decision
@@ -251,24 +291,6 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
 
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
         self.sessions.lock().expect("session set lock")
-    }
-
-    fn pending_expiry(&self, key: &(String, String)) -> Option<i64> {
-        let mut pending = self.pending.lock().expect("pending lock");
-        let now = unix_now();
-        pending.retain(|_, expires_at| *expires_at > now);
-        pending.get(key).copied()
-    }
-
-    fn remember(&self, key: (String, String), expires_at: i64) {
-        self.pending
-            .lock()
-            .expect("pending lock")
-            .insert(key, expires_at);
-    }
-
-    fn forget(&self, key: &(String, String)) {
-        self.pending.lock().expect("pending lock").remove(key);
     }
 }
 
@@ -410,7 +432,7 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("unexpected approval poll")
+                .unwrap_or(Ok(ApprovalState::Gone))
                 .map_err(|()| CoreError::Transport)
         }
     }
@@ -494,6 +516,7 @@ pub(crate) mod tests {
             Verdict::Allow,
         ]));
         core.approvals.lock().unwrap().extend([
+            Ok(ApprovalState::Gone),
             Ok(ApprovalState::Pending { expires_at: None }),
             Ok(ApprovalState::Approved),
         ]);
@@ -508,7 +531,28 @@ pub(crate) mod tests {
         );
         let approved = guard.evaluate(&action(), ApprovalMode::Queue).await;
         assert!(is_allow(&approved));
-        assert_eq!(core.approval_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(core.approval_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_replica_that_missed_the_first_attempt_honours_the_approval() {
+        // Regression: a replica with no memory of the first attempt used to
+        // re-score the retry, which made Core write a fresh pending verdict
+        // over the human's approval.
+        let (replica, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow]));
+        core.approvals.lock().unwrap().extend([
+            Ok(ApprovalState::Pending { expires_at: None }),
+            Ok(ApprovalState::Approved),
+        ]);
+        let pending = replica.evaluate(&action(), ApprovalMode::Queue).await;
+        assert_eq!(pending.reason_code, REASON_APPROVAL_REQUIRED);
+        assert_eq!(
+            core.evaluate_calls.load(Ordering::SeqCst),
+            0,
+            "a pending action is never re-scored"
+        );
+        let approved = replica.evaluate(&action(), ApprovalMode::Queue).await;
+        assert!(is_allow(&approved));
     }
 
     #[tokio::test]
@@ -525,7 +569,7 @@ pub(crate) mod tests {
         ));
         let result = guard.evaluate(&modified, ApprovalMode::Queue).await;
         assert_eq!(result.reason_code, REASON_BLOCKED);
-        assert_eq!(core.approval_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

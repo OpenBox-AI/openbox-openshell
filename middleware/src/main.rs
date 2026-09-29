@@ -12,6 +12,8 @@
 //!
 //! Optional:
 //!   `OPENBOX_MW_LISTEN`               default `127.0.0.1:50051`
+//!   `OPENBOX_MW_ADMIN_LISTEN`         `/healthz`, `/readyz`, `/metrics`; default
+//!                                     `127.0.0.1:9464`
 //!   `OPENBOX_MW_AUDIENCE`             default `urn:openshell:extension:middleware:openbox`
 //!   `OPENBOX_AGENT_DID`, `OPENBOX_AGENT_KEY_FILE`   sign requests (agents with
 //!                                     "Require signed requests" on)
@@ -37,6 +39,7 @@ use openbox_verdict_middleware::core_client::{
 };
 use openbox_verdict_middleware::guard::{Guard, SandboxStopper};
 use openbox_verdict_middleware::halt::{DenyOnlyStopper, GatewayStopper};
+use openbox_verdict_middleware::metrics::serve_admin;
 use openbox_verdict_middleware::service::VerdictMiddleware;
 use openbox_verdict_middleware::token::TokenVerifier;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddlewareServer;
@@ -180,6 +183,15 @@ async fn run() -> Result<(), String> {
     };
 
     let guard = Arc::new(Guard::new(Arc::new(core), stopper));
+    let metrics = guard.metrics();
+    let admin: SocketAddr = env("OPENBOX_MW_ADMIN_LISTEN")
+        .unwrap_or_else(|| "127.0.0.1:9464".to_owned())
+        .parse()
+        .map_err(|_| "OPENBOX_MW_ADMIN_LISTEN must be host:port".to_owned())?;
+    let admin = tokio::net::TcpListener::bind(admin)
+        .await
+        .map_err(|error| format!("admin listener {admin}: {error}"))?;
+    tokio::spawn(serve_admin(admin, Arc::clone(&metrics)));
     let service = VerdictMiddleware::new(
         guard,
         verifier,
@@ -201,13 +213,30 @@ async fn run() -> Result<(), String> {
         "openbox-verdict-middleware: listening on {}://{listen}",
         if insecure { "http" } else { "https" }
     );
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(|error| format!("listener {listen}: {error}"))?;
+    metrics.set_ready();
     server
         .add_service(
             SupervisorMiddlewareServer::new(service).max_decoding_message_size(MAX_MESSAGE_BYTES),
         )
-        .serve_with_shutdown(listen, async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            shutdown_signal(),
+        )
         .await
         .map_err(|error| format!("server: {error}"))
+}
+
+/// Kubernetes sends SIGTERM; a terminal sends SIGINT. In-flight evaluations
+/// finish before the server exits.
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+    eprintln!("openbox-verdict-middleware: shutting down");
 }
