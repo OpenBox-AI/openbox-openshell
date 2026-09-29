@@ -15,6 +15,9 @@
 //!   `OPENBOX_MW_AUDIENCE`             default `urn:openshell:extension:middleware:openbox`
 //!   `OPENBOX_AGENT_DID`, `OPENBOX_AGENT_KEY_FILE`   sign requests (agents with
 //!                                     "Require signed requests" on)
+//!   `OPENBOX_WORKLOAD_KEY_FILE`, `OPENBOX_WORKLOAD_KID`   Keycloak workload
+//!                                     identity: the RSA key registered with the
+//!                                     agent; switches Core calls to the v3 API
 //!   `OPENBOX_CORE_TIMEOUT_MS`         default 450, below `OpenShell`'s 500 ms so a
 //!                                     slow Core yields an explicit deny
 //!   `OPENBOX_MW_MAX_PAYLOAD_BYTES`    default 1 MiB
@@ -29,7 +32,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openbox_verdict_middleware::core_client::{AgentSigner, CoreClient, CoreConfig};
+use openbox_verdict_middleware::core_client::{
+    AgentSigner, CoreClient, CoreConfig, WorkloadIdentity,
+};
 use openbox_verdict_middleware::guard::{Guard, SandboxStopper};
 use openbox_verdict_middleware::halt::{DenyOnlyStopper, GatewayStopper};
 use openbox_verdict_middleware::service::VerdictMiddleware;
@@ -38,6 +43,9 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::Supervi
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 const DEFAULT_AUDIENCE: &str = "urn:openshell:extension:middleware:openbox";
+/// `OpenShell` sends bodies up to 4 MiB plus a protobuf envelope (it asks
+/// services to accept at least 4 MiB + 293 KiB); tonic defaults to 4 MiB.
+const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024 + 512 * 1024;
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key)
@@ -75,13 +83,9 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), String> {
-    let insecure = env("OPENBOX_MW_INSECURE").as_deref() == Some("1");
-    let listen: SocketAddr = env("OPENBOX_MW_LISTEN")
-        .unwrap_or_else(|| "127.0.0.1:50051".to_owned())
-        .parse()
-        .map_err(|_| "OPENBOX_MW_LISTEN must be host:port".to_owned())?;
-
+/// Builds the Core client: API key, plus either v1 request signing or a v3
+/// workload identity.
+fn core_from_env() -> Result<CoreClient, String> {
     let signer = match (env("OPENBOX_AGENT_DID"), env("OPENBOX_AGENT_KEY_FILE")) {
         (Some(did), Some(_)) => Some(
             AgentSigner::new(did, &read_secret("OPENBOX_AGENT_KEY_FILE")?)
@@ -94,14 +98,46 @@ async fn run() -> Result<(), String> {
             );
         }
     };
-    let core = CoreClient::new(CoreConfig {
+    let workload = match (
+        env("OPENBOX_WORKLOAD_KEY_FILE"),
+        env("OPENBOX_WORKLOAD_KID"),
+    ) {
+        (Some(_), Some(kid)) => Some(
+            WorkloadIdentity::from_pem(&read_secret("OPENBOX_WORKLOAD_KEY_FILE")?, kid)
+                .map_err(|_| "OPENBOX_WORKLOAD_KEY_FILE is not an RSA private key".to_owned())?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "set both OPENBOX_WORKLOAD_KEY_FILE and OPENBOX_WORKLOAD_KID, or neither"
+                    .to_owned(),
+            );
+        }
+    };
+    if workload.is_some() && signer.is_some() {
+        return Err(
+            "use either request signing (v1) or a workload identity (v3), not both".to_owned(),
+        );
+    }
+    CoreClient::new(CoreConfig {
         base_url: required("OPENBOX_URL")?,
         api_key: read_secret("OPENBOX_API_KEY_FILE")?,
         signer,
+        workload,
         timeout: Duration::from_millis(number("OPENBOX_CORE_TIMEOUT_MS", 450)?),
         body_limit_bytes: number("OPENBOX_CORE_BODY_LIMIT_BYTES", 64 * 1024)?,
     })
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())
+}
+
+async fn run() -> Result<(), String> {
+    let insecure = env("OPENBOX_MW_INSECURE").as_deref() == Some("1");
+    let listen: SocketAddr = env("OPENBOX_MW_LISTEN")
+        .unwrap_or_else(|| "127.0.0.1:50051".to_owned())
+        .parse()
+        .map_err(|_| "OPENBOX_MW_LISTEN must be host:port".to_owned())?;
+
+    let core = core_from_env()?;
 
     let stopper: Arc<dyn SandboxStopper> = match (
         env("OPENBOX_GATEWAY_ENDPOINT"),
@@ -166,7 +202,9 @@ async fn run() -> Result<(), String> {
         if insecure { "http" } else { "https" }
     );
     server
-        .add_service(SupervisorMiddlewareServer::new(service))
+        .add_service(
+            SupervisorMiddlewareServer::new(service).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        )
         .serve_with_shutdown(listen, async {
             let _ = tokio::signal::ctrl_c().await;
         })

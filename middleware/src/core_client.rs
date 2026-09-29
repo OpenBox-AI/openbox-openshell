@@ -15,15 +15,21 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use ring::signature::Ed25519KeyPair;
+use ring::signature::{Ed25519KeyPair, RSA_PKCS1_SHA256, RsaKeyPair};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::Mutex;
 
 use crate::action::{Action, Payload};
 
 const EVALUATE_PATH: &str = "/api/v1/governance/evaluate";
 const APPROVAL_PATH: &str = "/api/v1/governance/approval";
+const V3_EVALUATE_PATH: &str = "/api/v3/governance/evaluate";
+const V3_APPROVAL_PATH: &str = "/api/v3/governance/approval";
+const V3_BOOTSTRAP_PATH: &str = "/api/v3/auth/bootstrap";
+/// Refresh a workload token this long before Keycloak says it expires.
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 const WORKFLOW_TYPE: &str = "openshell.sandbox";
 const TASK_QUEUE: &str = "openshell";
 const SDK_IDENTIFIER: &str = concat!("openshell-middleware/rust/", env!("CARGO_PKG_VERSION"));
@@ -97,7 +103,11 @@ impl std::error::Error for CoreError {}
 pub struct CoreConfig {
     pub base_url: String,
     pub api_key: String,
+    /// Ed25519 request signing, for v1 agents with "Require signed requests".
     pub signer: Option<AgentSigner>,
+    /// Keycloak workload identity. Agents created in an organization with an
+    /// identity provider generation use it, and must call the v3 API.
+    pub workload: Option<WorkloadIdentity>,
     pub timeout: Duration,
     /// Request bodies larger than this are sent to Core truncated.
     pub body_limit_bytes: usize,
@@ -153,6 +163,103 @@ impl AgentSigner {
     }
 }
 
+/// The agent's workload service-account key.
+///
+/// Core's v3 API wants the agent
+/// API key plus a Keycloak access token obtained with a signed RS256 client
+/// assertion (private-key JWT). Tokens are cached and refreshed ahead of
+/// expiry, so the assertion round trip is not on the per-request path.
+pub struct WorkloadIdentity {
+    key: RsaKeyPair,
+    kid: String,
+    cache: Mutex<Option<CachedToken>>,
+}
+
+struct CachedToken {
+    token: String,
+    refresh_at: std::time::Instant,
+}
+
+impl WorkloadIdentity {
+    /// `pem` is the RSA private key registered with the agent, as PKCS#8
+    /// (`BEGIN PRIVATE KEY`) or PKCS#1 (`BEGIN RSA PRIVATE KEY`).
+    pub fn from_pem(pem: &str, kid: impl Into<String>) -> Result<Self, CoreError> {
+        let pkcs1 = pem.contains("BEGIN RSA PRIVATE KEY");
+        let body: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .map(str::trim)
+            .collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .map_err(|_| CoreError::Malformed)?;
+        let key = if pkcs1 {
+            RsaKeyPair::from_der(&der)
+        } else {
+            RsaKeyPair::from_pkcs8(&der)
+        }
+        .map_err(|_| CoreError::Malformed)?;
+        let kid = kid.into();
+        if kid.is_empty() {
+            return Err(CoreError::Malformed);
+        }
+        Ok(Self {
+            key,
+            kid,
+            cache: Mutex::new(None),
+        })
+    }
+
+    fn assertion(
+        &self,
+        token_endpoint: &str,
+        client_id: &str,
+        now: i64,
+    ) -> Result<String, CoreError> {
+        let encode = |value: &Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+        };
+        let signed = format!(
+            "{}.{}",
+            encode(&json!({"alg": "RS256", "kid": self.kid, "typ": "JWT"})),
+            encode(&json!({
+                "aud": token_endpoint,
+                "iss": client_id,
+                "sub": client_id,
+                "iat": now,
+                "exp": now + 60,
+                "jti": random_hex(16),
+            }))
+        );
+        let mut signature = vec![0_u8; self.key.public().modulus_len()];
+        self.key
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &ring::rand::SystemRandom::new(),
+                signed.as_bytes(),
+                &mut signature,
+            )
+            .map_err(|_| CoreError::Malformed)?;
+        Ok(format!(
+            "{signed}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct Bootstrap {
+    token_endpoint: String,
+    client_id: String,
+    kid: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    expires_in: Option<u64>,
+}
+
 pub struct CoreClient {
     config: CoreConfig,
     http: reqwest::Client,
@@ -197,7 +304,12 @@ impl CoreClient {
             "activity_id": activity_id(action),
         }))
         .map_err(|_| CoreError::Malformed)?;
-        let response = self.post(APPROVAL_PATH, body, None).await?;
+        let path = if self.config.workload.is_some() {
+            V3_APPROVAL_PATH
+        } else {
+            APPROVAL_PATH
+        };
+        let response = self.post(path, body, None).await?;
         let status = response.status().as_u16();
         if status == 404 {
             return Ok(ApprovalState::Gone);
@@ -236,9 +348,12 @@ impl CoreClient {
         idempotency_key: &str,
     ) -> Result<CoreDecision, CoreError> {
         let body = serde_json::to_vec(payload).map_err(|_| CoreError::Malformed)?;
-        let response = self
-            .post(EVALUATE_PATH, body, Some(idempotency_key))
-            .await?;
+        let path = if self.config.workload.is_some() {
+            V3_EVALUATE_PATH
+        } else {
+            EVALUATE_PATH
+        };
+        let response = self.post(path, body, Some(idempotency_key)).await?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(CoreError::Status(status));
@@ -269,11 +384,83 @@ impl CoreClient {
                 request = request.header(name, value);
             }
         }
-        request
+        if let Some(workload) = &self.config.workload {
+            request = request.header(
+                "X-OpenBox-Workload-Token",
+                self.workload_token(workload).await?,
+            );
+        }
+        let response = request
             .body(body)
             .send()
             .await
-            .map_err(|_| CoreError::Transport)
+            .map_err(|_| CoreError::Transport)?;
+        if response.status().as_u16() == 401
+            && let Some(workload) = &self.config.workload
+        {
+            // A revoked or rotated token: fetch a fresh one on the next call.
+            *workload.cache.lock().await = None;
+        }
+        Ok(response)
+    }
+
+    async fn workload_token(&self, workload: &WorkloadIdentity) -> Result<String, CoreError> {
+        let mut cache = workload.cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && std::time::Instant::now() < cached.refresh_at
+        {
+            return Ok(cached.token.clone());
+        }
+        let base = self.config.base_url.trim_end_matches('/');
+        let bootstrap: Bootstrap = self
+            .http
+            .get(format!("{base}{V3_BOOTSTRAP_PATH}"))
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .send()
+            .await
+            .map_err(|_| CoreError::Transport)?
+            .error_for_status()
+            .map_err(|error| CoreError::Status(error.status().map_or(0, |s| s.as_u16())))?
+            .json()
+            .await
+            .map_err(|_| CoreError::Malformed)?;
+        if bootstrap
+            .kid
+            .as_deref()
+            .is_some_and(|kid| kid != workload.kid)
+        {
+            return Err(CoreError::Malformed);
+        }
+        let assertion =
+            workload.assertion(&bootstrap.token_endpoint, &bootstrap.client_id, unix_now())?;
+        let form = form_encode(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", &bootstrap.client_id),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", &assertion),
+        ]);
+        let token: TokenResponse = self
+            .http
+            .post(&bootstrap.token_endpoint)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form)
+            .send()
+            .await
+            .map_err(|_| CoreError::Transport)?
+            .error_for_status()
+            .map_err(|error| CoreError::Status(error.status().map_or(0, |s| s.as_u16())))?
+            .json()
+            .await
+            .map_err(|_| CoreError::Malformed)?;
+        let lifetime = Duration::from_secs(token.expires_in.unwrap_or(300));
+        *cache = Some(CachedToken {
+            token: token.access_token.clone(),
+            refresh_at: std::time::Instant::now() + lifetime.saturating_sub(TOKEN_REFRESH_MARGIN),
+        });
+        Ok(token.access_token)
     }
 }
 
@@ -321,6 +508,25 @@ struct ApprovalResponse {
 /// Core's activity id for an action: stable across retries of the same action.
 pub fn activity_id(action: &Action) -> String {
     format!("oshx-{}", &action.fingerprint[..32])
+}
+
+fn form_encode(fields: &[(&str, &str)]) -> String {
+    let escape = |value: &str| {
+        value.bytes().fold(String::new(), |mut out, byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                out.push(char::from(byte));
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{byte:02X}");
+            }
+            out
+        })
+    };
+    fields
+        .iter()
+        .map(|(key, value)| format!("{}={}", escape(key), escape(value)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn idempotency_key(raw: &str) -> String {
@@ -718,6 +924,25 @@ mod tests {
             AgentSigner::new(
                 "did:web:x",
                 &base64::engine::general_purpose::STANDARD.encode([1_u8; 32])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn form_values_are_percent_encoded() {
+        assert_eq!(
+            form_encode(&[("a", "x y"), ("t", "urn:ietf:x"), ("j", "a.b-c_d")]),
+            "a=x%20y&t=urn%3Aietf%3Ax&j=a.b-c_d"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_workload_keys() {
+        assert!(
+            WorkloadIdentity::from_pem(
+                "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----",
+                "wk1"
             )
             .is_err()
         );

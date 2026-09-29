@@ -17,5 +17,8 @@ fn openshell_pin_matches_the_sandbox_service() {
     let ours = openshell_revs(&std::fs::read_to_string(here.join("Cargo.toml")).unwrap());
     let root = openshell_revs(&std::fs::read_to_string(here.join("../Cargo.toml")).unwrap());
     assert!(!ours.is_empty() && !root.is_empty());
-    assert!(ours.iter().chain(&root).all(|rev| rev == &root[0]), "{ours:?} vs {root:?}");
+    assert!(
+        ours.iter().chain(&root).all(|rev| rev == &root[0]),
+        "{ours:?} vs {root:?}"
+    );
 }
