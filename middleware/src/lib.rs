@@ -6,8 +6,10 @@
 
 pub mod action;
 pub mod core_client;
+pub mod front_desk;
 pub mod guard;
 pub mod halt;
+pub mod interceptor;
 pub mod metrics;
 pub mod service;
 pub mod token;
