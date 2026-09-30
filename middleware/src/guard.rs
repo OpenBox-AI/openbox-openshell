@@ -25,9 +25,17 @@
 //!
 //! Every failure to get a verdict is an explicit deny with
 //! `openbox_unavailable`, never an allow.
+//!
+//! Core runs policy, guardrails and behaviour rules in full on every call,
+//! so a verdict can take seconds. All Core calls for one request (session
+//! start, approval check, evaluation) share one budget, [`DEFAULT_CORE_BUDGET`]
+//! unless configured. It must end before `OpenShell`'s middleware timeout
+//! (30 s, the most `OpenShell` allows) so the sandbox gets our explicit deny
+//! rather than the gateway's generic failure.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use openshell_core::proto::{Decision, Finding, HttpRequestResult};
 
@@ -41,6 +49,10 @@ pub const REASON_HALTED: &str = "openbox_halted";
 pub const REASON_UNAVAILABLE: &str = "openbox_unavailable";
 
 const MAX_REASON_BYTES: usize = 4 * 1024;
+
+/// Time allowed for all Core calls behind one verdict: 1 s under the 30 s
+/// middleware timeout the gateway registration uses.
+pub const DEFAULT_CORE_BUDGET: Duration = Duration::from_secs(29);
 
 /// Core's governance API, as the guard uses it.
 #[tonic::async_trait]
@@ -101,6 +113,7 @@ pub struct Guard<G, S: ?Sized> {
     /// missed the halt still gets `halt` for the sandbox's next request.
     halted: Arc<Mutex<HashSet<String>>>,
     metrics: Arc<Metrics>,
+    core_budget: Duration,
 }
 
 impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
@@ -111,7 +124,15 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             sessions: Mutex::new(HashSet::new()),
             halted: Arc::new(Mutex::new(HashSet::new())),
             metrics: Arc::new(Metrics::default()),
+            core_budget: DEFAULT_CORE_BUDGET,
         }
+    }
+
+    /// Replaces [`DEFAULT_CORE_BUDGET`].
+    #[must_use]
+    pub fn with_core_budget(mut self, budget: Duration) -> Self {
+        self.core_budget = budget;
+        self
     }
 
     pub fn metrics(&self) -> Arc<Metrics> {
@@ -161,6 +182,21 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         if self.is_halted(&action.sandbox_id) {
             return deny(REASON_HALTED, "sandbox was halted by OpenBox", None);
         }
+        tokio::time::timeout(self.core_budget, self.decide_with_core(action, mode))
+            .await
+            .unwrap_or_else(|_| {
+                deny(
+                    REASON_UNAVAILABLE,
+                    &format!(
+                        "OpenBox did not return a verdict within {} ms",
+                        self.core_budget.as_millis()
+                    ),
+                    None,
+                )
+            })
+    }
+
+    async fn decide_with_core(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
         if let Some(result) = self.ensure_session(action).await {
             return result;
         }
@@ -374,6 +410,8 @@ pub(crate) mod tests {
         pub session_calls: AtomicUsize,
         pub evaluate_calls: AtomicUsize,
         pub approval_calls: AtomicUsize,
+        /// How long every call takes.
+        pub delay: Duration,
     }
 
     fn decision(verdict: Verdict) -> CoreDecision {
@@ -401,6 +439,7 @@ pub(crate) mod tests {
     #[tonic::async_trait]
     impl Governance for FakeCore {
         async fn start_session(&self, _: &str, _: &str) -> Result<CoreDecision, CoreError> {
+            tokio::time::sleep(self.delay).await;
             self.session_calls.fetch_add(1, Ordering::SeqCst);
             let next = self
                 .session
@@ -414,6 +453,7 @@ pub(crate) mod tests {
             }
         }
         async fn evaluate_action(&self, _: &Action) -> Result<CoreDecision, CoreError> {
+            tokio::time::sleep(self.delay).await;
             self.evaluate_calls.fetch_add(1, Ordering::SeqCst);
             let next = self
                 .verdicts
@@ -427,6 +467,7 @@ pub(crate) mod tests {
             }
         }
         async fn approval_state(&self, _: &Action) -> Result<ApprovalState, CoreError> {
+            tokio::time::sleep(self.delay).await;
             self.approval_calls.fetch_add(1, Ordering::SeqCst);
             self.approvals
                 .lock()
@@ -655,6 +696,51 @@ pub(crate) mod tests {
             REASON_UNAVAILABLE,
             "approval poll failure"
         );
+    }
+
+    fn slow_core(delay: Duration, verdicts: &[Verdict]) -> FakeCore {
+        FakeCore {
+            delay,
+            ..FakeCore::with_verdicts(verdicts)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_verdict_that_takes_seconds_still_arrives() {
+        // Full policy, guardrails and behaviour rules: slow, but inside budget.
+        let (guard, _, _) = guard(slow_core(Duration::from_secs(9), &[Verdict::Allow]));
+        let started = tokio::time::Instant::now();
+        let result = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        assert!(is_allow(&result), "{result:?}");
+        // Session start, approval check and evaluation: three calls.
+        assert_eq!(started.elapsed(), Duration::from_secs(27));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_covers_every_core_call_for_the_request() {
+        // Each call is inside the budget; the three together are not.
+        let (guard, core, _) = guard(slow_core(Duration::from_secs(12), &[Verdict::Allow]));
+        let started = tokio::time::Instant::now();
+        let result = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        assert_eq!(result.reason_code, REASON_UNAVAILABLE);
+        assert!(result.reason.contains("29000 ms"), "{}", result.reason);
+        assert_eq!(started.elapsed(), DEFAULT_CORE_BUDGET);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "before the gateway gives up"
+        );
+        // Session (12 s) and approval (24 s) finished; evaluation was cut off.
+        assert_eq!(core.session_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(core.approval_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_is_configurable() {
+        let (guard, _, _) = guard(slow_core(Duration::from_millis(300), &[Verdict::Allow]));
+        let guard = guard.with_core_budget(Duration::from_millis(500));
+        let result = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        assert_eq!(result.reason_code, REASON_UNAVAILABLE);
     }
 
     #[tokio::test]

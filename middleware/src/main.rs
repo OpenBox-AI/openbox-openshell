@@ -20,8 +20,10 @@
 //!   `OPENBOX_WORKLOAD_KEY_FILE`, `OPENBOX_WORKLOAD_KID`   Keycloak workload
 //!                                     identity: the RSA key registered with the
 //!                                     agent; switches Core calls to the v3 API
-//!   `OPENBOX_CORE_TIMEOUT_MS`         default 450, below `OpenShell`'s 500 ms so a
-//!                                     slow Core yields an explicit deny
+//!   `OPENBOX_CORE_TIMEOUT_MS`         time for all Core calls behind one verdict,
+//!                                     default 29000: under the 30 s middleware
+//!                                     timeout the gateway registration must set,
+//!                                     so a slow Core yields an explicit deny
 //!   `OPENBOX_MW_MAX_PAYLOAD_BYTES`    default 1 MiB
 //!   `OPENBOX_CORE_BODY_LIMIT_BYTES`   request body sent to Core, default 64 KiB
 //!   `OPENBOX_GATEWAY_ENDPOINT`, `OPENBOX_GATEWAY_MTLS_DIR`   enable stopping
@@ -37,7 +39,7 @@ use std::time::Duration;
 use openbox_verdict_middleware::core_client::{
     AgentSigner, CoreClient, CoreConfig, WorkloadIdentity,
 };
-use openbox_verdict_middleware::guard::{Guard, SandboxStopper};
+use openbox_verdict_middleware::guard::{DEFAULT_CORE_BUDGET, Guard, SandboxStopper};
 use openbox_verdict_middleware::halt::{DenyOnlyStopper, GatewayStopper};
 use openbox_verdict_middleware::metrics::serve_admin;
 use openbox_verdict_middleware::service::VerdictMiddleware;
@@ -65,6 +67,14 @@ fn read_secret(key: &str) -> Result<String, String> {
     std::fs::read_to_string(&path)
         .map(|text| text.trim().to_owned())
         .map_err(|error| format!("{key}: cannot read {path}: {error}"))
+}
+
+fn core_budget() -> Result<Duration, String> {
+    let default = u64::try_from(DEFAULT_CORE_BUDGET.as_millis()).unwrap_or(u64::MAX);
+    Ok(Duration::from_millis(number(
+        "OPENBOX_CORE_TIMEOUT_MS",
+        default,
+    )?))
 }
 
 fn number<T: std::str::FromStr>(key: &str, default: T) -> Result<T, String> {
@@ -127,7 +137,7 @@ fn core_from_env() -> Result<CoreClient, String> {
         api_key: read_secret("OPENBOX_API_KEY_FILE")?,
         signer,
         workload,
-        timeout: Duration::from_millis(number("OPENBOX_CORE_TIMEOUT_MS", 450)?),
+        timeout: core_budget()?,
         body_limit_bytes: number("OPENBOX_CORE_BODY_LIMIT_BYTES", 64 * 1024)?,
     })
     .map_err(|error| error.to_string())
@@ -182,7 +192,7 @@ async fn run() -> Result<(), String> {
         )
     };
 
-    let guard = Arc::new(Guard::new(Arc::new(core), stopper));
+    let guard = Arc::new(Guard::new(Arc::new(core), stopper).with_core_budget(core_budget()?));
     let metrics = guard.metrics();
     let admin: SocketAddr = env("OPENBOX_MW_ADMIN_LISTEN")
         .unwrap_or_else(|| "127.0.0.1:9464".to_owned())
