@@ -197,6 +197,18 @@ impl<I: Inventory + ?Sized> GatewayInterceptor for FrontDesk<I> {
                         "fail_closed",
                     ),
                     binding("update-config", "UpdateConfig", &[Validate], "fail_closed"),
+                    binding(
+                        "import-provider-profiles",
+                        "ImportProviderProfiles",
+                        &[Validate],
+                        "fail_closed",
+                    ),
+                    binding(
+                        "update-provider-profiles",
+                        "UpdateProviderProfiles",
+                        &[Validate],
+                        "fail_closed",
+                    ),
                 ],
                 Role::Inventory => vec![
                     binding(
@@ -296,6 +308,16 @@ impl<I: Inventory + ?Sized> GatewayInterceptor for FrontDesk<I> {
             ("UpdateConfig", Some(interceptor_evaluation::Phase::Validate(phase))) => {
                 let operation = struct_to_json(phase.proposed_operation.as_ref());
                 front_desk::validate_update_config(&operation)
+                    .map_or_else(|refusal| refuse(&refusal), |()| allow())
+            }
+            ("ImportProviderProfiles", Some(interceptor_evaluation::Phase::Validate(phase))) => {
+                let operation = struct_to_json(phase.proposed_operation.as_ref());
+                front_desk::validate_import_provider_profiles(&operation)
+                    .map_or_else(|refusal| refuse(&refusal), |()| allow())
+            }
+            ("UpdateProviderProfiles", Some(interceptor_evaluation::Phase::Validate(phase))) => {
+                let operation = struct_to_json(phase.proposed_operation.as_ref());
+                front_desk::validate_update_provider_profiles(&operation)
                     .map_or_else(|refusal| refuse(&refusal), |()| allow())
             }
             (method, Some(interceptor_evaluation::Phase::PostCommit(phase))) => {
@@ -555,6 +577,56 @@ mod tests {
             .into_inner();
         assert!(!validate.allowed);
         assert_eq!(validate.status_code, "PERMISSION_DENIED");
+    }
+
+    #[tokio::test]
+    async fn provider_profiles_that_send_credentials_uninspected_are_refused() {
+        let signer = TestSigner::new();
+        let (service, _) = service(&signer);
+        let token = gateway_token(&signer);
+        let validate = |method: &str, operation: Value| {
+            service.evaluate(authed(
+                InterceptorEvaluation {
+                    service: SERVICE.to_owned(),
+                    method: method.to_owned(),
+                    phase: Some(interceptor_evaluation::Phase::Validate(
+                        ValidateEvaluation {
+                            proposed_operation: Some(to_struct(&operation)),
+                            current_state: None,
+                        },
+                    )),
+                    ..InterceptorEvaluation::default()
+                },
+                &token,
+            ))
+        };
+        let profile = |uninspected: bool| {
+            json!({"profile": {"id": "p", "endpoints": [
+                {"host": "t.example", "port": 443, "allowUninspectedCredentials": uninspected}
+            ]}})
+        };
+        for (method, operation) in [
+            (
+                "ImportProviderProfiles",
+                json!({"profiles": [profile(true)]}),
+            ),
+            (
+                "UpdateProviderProfiles",
+                json!({"id": "p", "profile": profile(true)}),
+            ),
+        ] {
+            let result = validate(method, operation).await.unwrap().into_inner();
+            assert!(!result.allowed, "{method}");
+            assert_eq!(result.status_code, "PERMISSION_DENIED");
+        }
+        let result = validate(
+            "ImportProviderProfiles",
+            json!({"profiles": [profile(false)]}),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(result.allowed);
     }
 
     #[tokio::test]

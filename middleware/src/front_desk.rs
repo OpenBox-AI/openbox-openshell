@@ -14,6 +14,13 @@
 //!   attachment is missing or weakened, any endpoint that sends credentials
 //!   uninspected (`allow_uninspected_credentials`), and turning on automatic
 //!   approval of agent-authored policy proposals.
+//! - `ImportProviderProfiles` and `UpdateProviderProfiles` (`validate`):
+//!   refuse a profile endpoint that sends credentials uninspected. A
+//!   provider's profile endpoints are composed into the sandbox's effective
+//!   policy when it is attached, so they never pass the policy checks above.
+//!   Since `OpenShell` v0.1.2 every profile enters through these two RPCs
+//!   (the built-in source was removed), so `AttachSandboxProvider`, which
+//!   only names a provider, can only reach profiles that were checked here.
 //!
 //! Operations arrive as canonical `ProtoJSON` (lowerCamelCase field names,
 //! enums as names); patches are RFC 6902 against the same shape.
@@ -292,6 +299,34 @@ pub fn validate_update_config(operation: &Value) -> Result<(), Refusal> {
     Ok(())
 }
 
+fn profile_endpoints(item: &Value) -> impl Iterator<Item = &Value> {
+    item.get("profile")
+        .and_then(|profile| profile.get("endpoints"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+/// `ImportProviderProfiles` in `validate`.
+pub fn validate_import_provider_profiles(operation: &Value) -> Result<(), Refusal> {
+    let items = operation
+        .get("profiles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    refuse_uninspected_credentials(items.flat_map(profile_endpoints))
+}
+
+/// `UpdateProviderProfiles` in `validate`.
+pub fn validate_update_provider_profiles(operation: &Value) -> Result<(), Refusal> {
+    refuse_uninspected_credentials(
+        operation
+            .get("profile")
+            .into_iter()
+            .flat_map(profile_endpoints),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +520,47 @@ mod tests {
             }}
         });
         assert_eq!(validate_policy(&policy), Ok(()));
+    }
+
+    #[test]
+    fn provider_profiles_may_not_send_credentials_uninspected() {
+        // The shape of OpenShell's example copilot profile.
+        let copilot = json!({"profile": {"id": "copilot", "endpoints": [
+            {"host": "api.githubcopilot.com", "port": 443, "protocol": "rest"},
+            {"host": "telemetry.enterprise.githubcopilot.com", "port": 443,
+             "allowUninspectedCredentials": true}
+        ]}, "source": "copilot.yaml"});
+        let github = json!({"profile": {"id": "github", "endpoints": [
+            {"host": "api.github.com", "port": 443, "protocol": "rest"}
+        ]}});
+        let refused = validate_import_provider_profiles(
+            &json!({"profiles": [github, copilot]}),
+        )
+        .unwrap_err();
+        assert!(
+            refused.0.contains("telemetry.enterprise.githubcopilot.com"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            validate_import_provider_profiles(&json!({"profiles": [github]})),
+            Ok(())
+        );
+        assert_eq!(validate_import_provider_profiles(&json!({})), Ok(()));
+
+        assert!(
+            validate_update_provider_profiles(&json!({"id": "copilot", "profile": copilot}))
+                .is_err()
+        );
+        assert_eq!(
+            validate_update_provider_profiles(&json!({"id": "github", "profile": github})),
+            Ok(())
+        );
+        assert!(
+            validate_update_provider_profiles(&json!({"profile": {"profile": {"endpoints": [
+                {"host": "x.example", "port": 443, "allow_uninspected_credentials": true}
+            ]}}}))
+            .is_err(),
+            "snake case too"
+        );
     }
 }
