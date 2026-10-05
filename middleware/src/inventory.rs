@@ -201,6 +201,24 @@ struct ActiveRow {
     external_id: String,
 }
 
+/// The backend wraps every response as `{"status": 200, "data": ...}`.
+#[derive(Deserialize)]
+struct Envelope<T> {
+    data: T,
+}
+
+/// External ids from a `GET` of the runtime environments; the backend
+/// already filters to active rows.
+fn parse_active_list(body: &[u8]) -> Result<Vec<String>, String> {
+    let envelope: Envelope<Vec<ActiveRow>> =
+        serde_json::from_slice(body).map_err(|_| "backend list was malformed".to_owned())?;
+    Ok(envelope
+        .data
+        .into_iter()
+        .map(|row| row.external_id)
+        .collect())
+}
+
 #[tonic::async_trait]
 impl InventoryBackend for BackendInventory {
     async fn upsert(&self, environment: &RuntimeEnvironment) -> Result<(), String> {
@@ -220,16 +238,16 @@ impl InventoryBackend for BackendInventory {
     }
 
     async fn list_active(&self) -> Result<Vec<String>, String> {
-        let rows: Vec<ActiveRow> = self
+        let body = self
             .send(
                 self.http
                     .get(format!("{}{RUNTIME_ENVIRONMENTS_PATH}", self.base_url)),
             )
             .await?
-            .json()
+            .bytes()
             .await
             .map_err(|_| "backend list was malformed".to_owned())?;
-        Ok(rows.into_iter().map(|row| row.external_id).collect())
+        parse_active_list(&body)
     }
 }
 
@@ -751,6 +769,29 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reads_the_backend_list_envelope() {
+        // The shape the backend returns, trimmed to the fields that matter.
+        let body = json!({
+            "status": 200,
+            "data": [
+                {"id": "7538b4b6", "external_id": "sbx-1", "status": "active"},
+                {"id": "9c0e2f11", "external_id": "sbx-2", "status": "active"}
+            ]
+        });
+        assert_eq!(
+            parse_active_list(body.to_string().as_bytes()).unwrap(),
+            ["sbx-1", "sbx-2"]
+        );
+        assert!(
+            parse_active_list(br#"{"status":200,"data":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
+        // A bare array is not what the backend sends.
+        assert!(parse_active_list(br#"[{"external_id":"sbx-1"}]"#).is_err());
     }
 
     #[test]
