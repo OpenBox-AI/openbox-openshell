@@ -15,12 +15,29 @@
 //!   `OPENBOX_FD_AUDIENCE`             default `urn:openshell:extension:interceptor:openbox`
 //!   `OPENBOX_FD_INVENTORY_AUDIENCE`   default
 //!                                     `urn:openshell:extension:interceptor:openbox-inventory`
+//!
+//! AI Inventory (without `OPENBOX_BACKEND_URL`, inventory events are only
+//! logged):
+//!   `OPENBOX_BACKEND_URL`             backend base URL; sandboxes are recorded
+//!                                     with the agent's workload token
+//!   `OPENBOX_URL`, `OPENBOX_API_KEY_FILE`   Core, for the workload bootstrap
+//!   `OPENBOX_WORKLOAD_KEY_FILE`, `OPENBOX_WORKLOAD_KID`   the RSA key
+//!                                     registered with the agent
+//!   `OPENBOX_GATEWAY_ENDPOINT`, `OPENBOX_GATEWAY_MTLS_DIR`   gateway API
+//!                                     credential; enables reconciliation
+//!   `OPENBOX_FD_RECONCILE_SECS`       reconciliation interval, default 60
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
-use openbox_verdict_middleware::interceptor::{FrontDesk, LogInventory, Role};
+use openbox_verdict_middleware::core_client::{CoreClient, CoreConfig, WorkloadIdentity};
+use openbox_verdict_middleware::interceptor::{FrontDesk, Inventory, LogInventory, Role};
+use openbox_verdict_middleware::inventory::{
+    BackendInventory, GatewayLister, HttpInventory, SandboxLister,
+};
 use openbox_verdict_middleware::token::TokenVerifier;
 use openshell_core::proto::gateway_interceptor::v1::gateway_interceptor_server::GatewayInterceptorServer;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -49,6 +66,73 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn read_secret(key: &str) -> Result<String, String> {
+    let path = required(key)?;
+    std::fs::read_to_string(&path)
+        .map(|text| text.trim().to_owned())
+        .map_err(|error| format!("{key}: cannot read {path}: {error}"))
+}
+
+/// The inventory the front desk writes to: the backend when configured,
+/// otherwise the service log.
+fn inventory_from_env(gateway: Option<String>) -> Result<Arc<dyn Inventory>, String> {
+    let Some(backend_url) = env("OPENBOX_BACKEND_URL") else {
+        eprintln!(
+            "openbox-governance-interceptor: no OPENBOX_BACKEND_URL; inventory events are only logged"
+        );
+        return Ok(Arc::new(LogInventory));
+    };
+    let workload = WorkloadIdentity::from_pem(
+        &read_secret("OPENBOX_WORKLOAD_KEY_FILE")?,
+        required("OPENBOX_WORKLOAD_KID")?,
+    )
+    .map_err(|_| "OPENBOX_WORKLOAD_KEY_FILE is not an RSA private key".to_owned())?;
+    let tokens = CoreClient::new(CoreConfig {
+        base_url: required("OPENBOX_URL")?,
+        api_key: read_secret("OPENBOX_API_KEY_FILE")?,
+        signer: None,
+        workload: Some(workload),
+        timeout: Duration::from_secs(10),
+        body_limit_bytes: 0,
+    })
+    .map_err(|error| error.to_string())?;
+    let backend = BackendInventory::new(&backend_url, Arc::new(tokens))?;
+    let lister: Option<Arc<dyn SandboxLister>> = match (
+        env("OPENBOX_GATEWAY_ENDPOINT"),
+        env("OPENBOX_GATEWAY_MTLS_DIR"),
+    ) {
+        (Some(endpoint), Some(dir)) => Some(Arc::new(GatewayLister::connect_lazy(
+            &endpoint,
+            &PathBuf::from(dir),
+        )?)),
+        (None, None) => {
+            eprintln!(
+                "openbox-governance-interceptor: no gateway credential; inventory is not reconciled, missed events stay missed"
+            );
+            None
+        }
+        _ => {
+            return Err(
+                "set both OPENBOX_GATEWAY_ENDPOINT and OPENBOX_GATEWAY_MTLS_DIR, or neither"
+                    .to_owned(),
+            );
+        }
+    };
+    let interval: u64 = env("OPENBOX_FD_RECONCILE_SECS").map_or(Ok(60), |value| {
+        value
+            .parse()
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .ok_or_else(|| "OPENBOX_FD_RECONCILE_SECS must be a positive number".to_owned())
+    })?;
+    Ok(Arc::new(HttpInventory::spawn(
+        Arc::new(backend),
+        lister,
+        gateway,
+        Duration::from_secs(interval),
+    )))
 }
 
 fn address(key: &str, default: &str) -> Result<SocketAddr, String> {
@@ -95,6 +179,7 @@ async fn serve(
     listen: SocketAddr,
     verifier: Option<TokenVerifier>,
     tls: Option<ServerTlsConfig>,
+    inventory: Arc<dyn Inventory>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut server = Server::builder();
@@ -107,7 +192,7 @@ async fn serve(
         "openbox-governance-interceptor: {role:?} registration on {}://{listen}",
         if verifier.is_some() { "https" } else { "http" }
     );
-    let service = FrontDesk::new(role, verifier, Arc::new(LogInventory));
+    let service = FrontDesk::new(role, verifier, inventory);
     server
         .add_service(GatewayInterceptorServer::new(service))
         .serve_with_shutdown(listen, async move {
@@ -132,6 +217,7 @@ async fn run() -> Result<(), String> {
         "OPENBOX_FD_INVENTORY_AUDIENCE",
         DEFAULT_INVENTORY_AUDIENCE,
     )?;
+    let inventory_sink = inventory_from_env(env("OPENBOX_FD_GATEWAY_ID"))?;
     let (stop, stopped) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         let mut terminate =
@@ -149,6 +235,7 @@ async fn run() -> Result<(), String> {
             govern,
             govern_verifier,
             tls(insecure)?,
+            Arc::new(LogInventory),
             stopped.clone()
         ),
         serve(
@@ -156,6 +243,7 @@ async fn run() -> Result<(), String> {
             inventory,
             inventory_verifier,
             tls(insecure)?,
+            inventory_sink,
             stopped
         ),
     )

@@ -404,6 +404,21 @@ impl CoreClient {
         Ok(response)
     }
 
+    /// The agent's current Keycloak workload token, for other `OpenBox` APIs
+    /// that take the same identity (the backend's runtime-environment routes).
+    /// `None` when the agent has no workload identity configured.
+    pub async fn current_workload_token(&self) -> Option<Result<String, CoreError>> {
+        let workload = self.config.workload.as_ref()?;
+        Some(self.workload_token(workload).await)
+    }
+
+    /// Drops the cached workload token after a caller saw it rejected.
+    pub async fn forget_workload_token(&self) {
+        if let Some(workload) = &self.config.workload {
+            *workload.cache.lock().await = None;
+        }
+    }
+
     async fn workload_token(&self, workload: &WorkloadIdentity) -> Result<String, CoreError> {
         let mut cache = workload.cache.lock().await;
         if let Some(cached) = cache.as_ref()

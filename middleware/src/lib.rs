@@ -10,6 +10,7 @@ pub mod front_desk;
 pub mod guard;
 pub mod halt;
 pub mod interceptor;
+pub mod inventory;
 pub mod metrics;
 pub mod service;
 pub mod token;
