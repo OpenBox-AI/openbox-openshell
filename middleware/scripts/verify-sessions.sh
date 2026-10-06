@@ -29,8 +29,9 @@
 #
 # example.com is also the GET target, so one policy rule covers both.
 #
-# The middleware gets a larger time budget than OpenShell's 500 ms default,
-# because a local Core answers an evaluate in about a second (see PROD-832).
+# The gateway registers the middleware with OpenShell's maximum timeout, 30 s,
+# and the door guard keeps its default 29 s budget for all Core calls behind a
+# verdict (PROD-772 / PROD-783: no fast path).
 #
 # Required: an OpenBox agent with a Keycloak workload identity (IAM v3):
 #   OBX_API_KEY_FILE        file with the agent's obx_ API key
@@ -44,7 +45,7 @@
 #                           (default: the local stack's Postgres on Colima)
 #   OBX_HOST_IP             host IPv4 the sandbox VM can reach the middleware
 #                           on (default: en0's address)
-#   OBX_MW_TIMEOUT          OpenShell's budget for the middleware, default 5s
+#   OBX_MW_TIMEOUT          OpenShell's timeout for the middleware, default 30s
 #   OBX_REDIS_URL           shared store for both services, default the local
 #                           stack's Redis, database 7
 #   OPENSHELL_PREFIX        OpenShell v0.1.2 install (default ~/openshell-repro)
@@ -66,7 +67,7 @@ ADMIN_PORT=$((MW_PORT + 1))
 FD_PORT=${OBX_FD_PORT:-50271}
 MODEL_HOST=example.com
 INV_PORT=$((FD_PORT + 1))
-MW_TIMEOUT=${OBX_MW_TIMEOUT:-5s}
+MW_TIMEOUT=${OBX_MW_TIMEOUT:-30s}
 CORE=${OPENBOX_URL:-http://localhost:8086}
 REDIS=${OBX_REDIS_URL:-redis://localhost:6379/7}
 PSQL=${OBX_PSQL:-docker --context colima exec -i openbox-local-postgres-1 psql -U postgres -d openbox -tA -c}
@@ -168,7 +169,7 @@ env $CORE_ENV OPENBOX_FD_INSECURE=1 OPENBOX_FD_LISTEN=127.0.0.1:$FD_PORT \
 echo $! >"$WORK/fd.pid"
 wait_listen "$INV_PORT" "$WORK/fd.pid" "$WORK/fd.log"
 env $CORE_ENV OPENBOX_MW_INSECURE=1 OPENBOX_MW_LISTEN=0.0.0.0:$MW_PORT \
-  OPENBOX_MW_ADMIN_LISTEN=127.0.0.1:$ADMIN_PORT OPENBOX_CORE_TIMEOUT_MS=${OPENBOX_CORE_TIMEOUT_MS:-2000} \
+  OPENBOX_MW_ADMIN_LISTEN=127.0.0.1:$ADMIN_PORT \
   "$HERE/target/debug/openbox-verdict-middleware" >"$WORK/mw.log" 2>&1 &
 echo $! >"$WORK/mw.pid"
 wait_listen "$MW_PORT" "$WORK/mw.pid" "$WORK/mw.log"
