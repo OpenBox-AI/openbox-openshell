@@ -1,9 +1,14 @@
 #!/bin/sh
-# Verify PROD-831 (with PROD-772): an OpenShell sandbox is one complete
-# OpenBox Core session. The front desk opens it when the sandbox is created,
-# every request through the verdict middleware lands in it, and the front desk
-# completes it when the sandbox is deleted, after which Core seals it. The
-# result is what the dashboard shows under Sessions.
+# Verify PROD-839 (with PROD-831 and PROD-772): an OpenShell sandbox is one
+# complete OpenBox Core session that follows the OpenBox event sequence:
+#
+#   WorkflowStarted    sandbox created, input = the sandbox (name, image, ...)
+#   ActivityStarted    each request, its own activity, named "GET example.com"
+#   ActivityCompleted  its response, same activity id, status and duration
+#   WorkflowCompleted  sandbox deleted, with the session's duration
+#
+# after which Core seals it. The result is what the dashboard shows under
+# Sessions.
 #
 #   OBX_API_KEY_FILE=... OBX_WORKLOAD_KEY_FILE=... OBX_WORKLOAD_KID=... \
 #     middleware/scripts/verify-sessions.sh
@@ -31,6 +36,8 @@
 #   OBX_HOST_IP             host IPv4 the sandbox VM can reach the middleware
 #                           on (default: en0's address)
 #   OBX_MW_TIMEOUT          OpenShell's budget for the middleware, default 5s
+#   OBX_REDIS_URL           shared store for both services, default the local
+#                           stack's Redis, database 7
 #   OPENSHELL_PREFIX        OpenShell v0.1.2 install (default ~/openshell-repro)
 #   OBX_GATEWAY_PORT        default 17890 (+1 health, +2 metrics)
 #   OBX_MW_PORT             default 50251 (+1 admin)
@@ -51,6 +58,7 @@ FD_PORT=${OBX_FD_PORT:-50271}
 INV_PORT=$((FD_PORT + 1))
 MW_TIMEOUT=${OBX_MW_TIMEOUT:-5s}
 CORE=${OPENBOX_URL:-http://localhost:8086}
+REDIS=${OBX_REDIS_URL:-redis://localhost:6379/7}
 PSQL=${OBX_PSQL:-docker --context colima exec -i openbox-local-postgres-1 psql -U postgres -d openbox -tA -c}
 HOST_IP=${OBX_HOST_IP:-$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)}
 : "${OBX_API_KEY_FILE:?set OBX_API_KEY_FILE}"
@@ -125,9 +133,16 @@ $PSQL "select 1" >/dev/null || { echo "OBX_PSQL cannot query the OpenBox databas
 "$PREFIX/bin/openshell" --version
 echo "middleware reachable from the sandbox at $HOST_IP:$MW_PORT, budget $MW_TIMEOUT"
 
+echo "== Shared store against the real Redis ($REDIS)"
+if (cd "$HERE" && OBX_TEST_REDIS_URL=$REDIS cargo test -q --lib store::tests::redis_store_round_trip 2>&1 | grep -q '1 passed'); then
+  pass "0 the shared store reads, writes and takes against Redis"
+else
+  fail "0 the shared store reads, writes and takes against Redis"
+fi
+
 echo "== Build and start the front desk and the verdict middleware"
 (cd "$HERE" && cargo build -q --bin openbox-governance-interceptor --bin openbox-verdict-middleware)
-CORE_ENV="OPENBOX_URL=$CORE OPENBOX_API_KEY_FILE=$OBX_API_KEY_FILE OPENBOX_WORKLOAD_KEY_FILE=$OBX_WORKLOAD_KEY_FILE OPENBOX_WORKLOAD_KID=$OBX_WORKLOAD_KID"
+CORE_ENV="OPENBOX_REDIS_URL=$REDIS OPENBOX_URL=$CORE OPENBOX_API_KEY_FILE=$OBX_API_KEY_FILE OPENBOX_WORKLOAD_KEY_FILE=$OBX_WORKLOAD_KEY_FILE OPENBOX_WORKLOAD_KID=$OBX_WORKLOAD_KID"
 env $CORE_ENV OPENBOX_FD_INSECURE=1 OPENBOX_FD_LISTEN=127.0.0.1:$FD_PORT \
   OPENBOX_FD_INVENTORY_LISTEN=127.0.0.1:$INV_PORT OPENBOX_FD_GATEWAY_ID=obx-verify-sessions \
   "$HERE/target/debug/openbox-governance-interceptor" >"$WORK/fd.log" 2>&1 &
@@ -217,53 +232,68 @@ echo "== Scenarios"
 os sandbox create --name "$A" --policy "$WORK/policy.yaml" --detach --no-tty --no-auto-providers >/dev/null
 ID=$(sandbox_id "$A")
 [ -n "$ID" ] || { echo "sandbox $A did not come up"; tail -20 "$WORK/gateway.log"; exit 1; }
+EV="from governance_events where workflow_id='$ID'"
 SESSION="select count(*) from sessions where workflow_id='$ID'"
 if wait_q 30 "$SESSION" 1; then
   pass "1 creating the sandbox opens its Core session, before any traffic ($ID)"
 else
   fail "1 creating the sandbox opens its Core session, before any traffic (sessions: $(q "$SESSION"))"
 fi
+STARTED_IN="select coalesce(input->0->>'name','') || '|' || coalesce(input->0->>'image','') $EV and event_type='WorkflowStarted'"
+got=$(q "$STARTED_IN")
+if [ "${got%%|*}" = "$A" ] && [ -n "${got#*|}" ]; then
+  pass "2 WorkflowStarted carries the sandbox as its input (name $A, image ${got#*|})"
+else
+  fail "2 WorkflowStarted carries the sandbox as its input (got '$got')"
+fi
 
-# Three different requests. Identical requests share one activity id (it is
-# the action fingerprint, so a retry finds its approval), and Core folds them
-# into a single event; distinct ones are distinct activities.
+# Two identical requests and a third: each is its own activity.
 ok=0
-for n in 1 2 3; do
-  code=$(request "$A" "/?n=$n")
+for path in "/?n=1" "/?n=1" "/?n=2"; do
+  code=$(request "$A" "$path")
   [ "$code" = 200 ] && ok=$((ok + 1))
 done
 if [ $ok = 3 ]; then
-  pass "2 three different requests from the sandbox are allowed through the middleware (HTTP 200)"
+  pass "3 three requests from the sandbox, two of them identical, are allowed (HTTP 200)"
 else
-  fail "2 three different requests from the sandbox are allowed through the middleware ($ok/3, last '$code')"
+  fail "3 three requests from the sandbox, two of them identical, are allowed ($ok/3, last '$code')"
 fi
-ALLOWED="select count(*) from governance_events where workflow_id='$ID' and activity_type='http_request' and verdict=0"
-if wait_q 30 "$ALLOWED" 3 && [ "$(q "$SESSION")" = 1 ]; then
-  pass "3 each request is its own activity in that one session, allowed"
+STARTS="select count(distinct activity_id) $EV and event_type='ActivityStarted' and activity_type='GET example.com' and verdict=0"
+if wait_q 30 "$STARTS" 3; then
+  pass "4 each request is its own activity named 'GET example.com', identical ones too"
 else
-  fail "3 each request is its own activity in that one session, allowed (events: $(q "$ALLOWED"), sessions: $(q "$SESSION"))"
+  fail "4 each request is its own activity named 'GET example.com', identical ones too (distinct: $(q "$STARTS"))"
+fi
+PAIRED="select count(*) $EV and event_type='ActivityStarted' and activity_id in
+        (select activity_id $EV and event_type='ActivityCompleted' and output is not null and duration_ms is not null)"
+if wait_q 30 "$PAIRED" 3; then
+  pass "5 every activity is completed by its response, with output and duration"
+else
+  fail "5 every activity is completed by its response, with output and duration (paired: $(q "$PAIRED"))"
 fi
 
 os sandbox delete "$A" >/dev/null
 STATUS="select status from sessions where workflow_id='$ID'"
-if wait_q 30 "$STATUS" completed; then
-  pass "4 deleting the sandbox completes its session"
+ENDED="select count(*) $EV and event_type='WorkflowCompleted' and duration_ms is not null"
+if wait_q 30 "$STATUS" completed && [ "$(q "$ENDED")" = 1 ]; then
+  pass "6 deleting the sandbox completes the session, with its duration"
 else
-  fail "4 deleting the sandbox completes its session (status: '$(q "$STATUS")')"
+  fail "6 deleting the sandbox completes the session, with its duration (status '$(q "$STATUS")', timed ends $(q "$ENDED"))"
 fi
 SEALED="select count(*) from session_attestations a join sessions s on s.id=a.session_id where s.workflow_id='$ID'"
 if wait_q 90 "$SEALED" 1; then
-  pass "5 Core seals the completed session (attestation recorded)"
+  pass "7 Core seals the completed session (attestation recorded)"
 else
-  fail "5 Core seals the completed session (attestations: $(q "$SEALED"))"
+  fail "7 Core seals the completed session (attestations: $(q "$SEALED"))"
 fi
 
 echo "== The session (open it in the dashboard under the agent)"
 $PSQL "select 'session ' || s.id || '  ' || s.status || '  ' || s.started_at || ' -> ' || coalesce(s.completed_at::text,'-')
        from sessions s where s.workflow_id='$ID'"
-$PSQL "select '  ' || e.created_at || '  ' || e.event_type || coalesce('  ' || e.activity_type, '') || '  verdict=' || coalesce(e.verdict::text,'-')
+$PSQL "select '  ' || to_char(e.created_at,'HH24:MI:SS.MS') || '  ' || rpad(e.event_type,18) || rpad(coalesce(e.activity_type,''),17)
+              || rpad(coalesce(e.activity_id,''),42) || coalesce(round(e.duration_ms)::text || ' ms','')
        from governance_events e where e.workflow_id='$ID' order by e.created_at"
 echo "== Front desk and middleware logs"
 grep 'session' "$WORK/fd.log" || true
-grep 'eval ' "$WORK/mw.log" || true
+grep -E 'eval |completed request_id' "$WORK/mw.log" || true
 [ $FAILED = 0 ] && echo "ALL PASS" || { echo "SOME FAILED (logs: rerun with KEEP=1)"; exit 1; }

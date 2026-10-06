@@ -29,6 +29,13 @@
 //!   `OPENBOX_GATEWAY_ENDPOINT`, `OPENBOX_GATEWAY_MTLS_DIR`   enable stopping
 //!                                     halted sandboxes
 //!   `OPENBOX_MW_INSECURE=1`           plaintext, no token checks: local dev only
+//!   `OPENBOX_REDIS_URL`               `redis://[:password@]host[:port][/db]`, shared
+//!                                     by every replica: approval retries and
+//!                                     response completions are matched through
+//!                                     it. Without it they are matched in process,
+//!                                     which is only correct for one replica.
+//!   `OPENBOX_APPROVAL_TTL_SECS`       how long an approval's retry can match it,
+//!                                     default 900
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -39,11 +46,15 @@ use std::time::Duration;
 use openbox_verdict_middleware::core_client::{
     AgentSigner, CoreClient, CoreConfig, WorkloadIdentity,
 };
-use openbox_verdict_middleware::guard::{DEFAULT_CORE_BUDGET, Guard, SandboxStopper};
+use openbox_verdict_middleware::guard::{
+    DEFAULT_APPROVAL_TTL, DEFAULT_CORE_BUDGET, Guard, SandboxStopper,
+};
 use openbox_verdict_middleware::halt::{DenyOnlyStopper, GatewayStopper};
 use openbox_verdict_middleware::metrics::serve_admin;
 use openbox_verdict_middleware::service::VerdictMiddleware;
+use openbox_verdict_middleware::store::{MemoryStore, RedisStore, SharedStore};
 use openbox_verdict_middleware::token::TokenVerifier;
+use openshell_core::proto::middleware::v1::http_response_pre_return_server::HttpResponsePreReturnServer;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddlewareServer;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
@@ -143,6 +154,43 @@ fn core_from_env() -> Result<CoreClient, String> {
     .map_err(|error| error.to_string())
 }
 
+/// The gRPC server, with TLS unless the operator chose plaintext.
+fn server_from_env(insecure: bool) -> Result<Server, String> {
+    let server = Server::builder();
+    if insecure {
+        return Ok(server);
+    }
+    let cert = std::fs::read(required("OPENBOX_MW_TLS_CERT")?)
+        .map_err(|error| format!("OPENBOX_MW_TLS_CERT: {error}"))?;
+    let key = std::fs::read(required("OPENBOX_MW_TLS_KEY")?)
+        .map_err(|error| format!("OPENBOX_MW_TLS_KEY: {error}"))?;
+    server
+        .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
+        .map_err(|error| format!("server TLS: {error}"))
+}
+
+/// Where approvals and completions are matched, and for how long.
+fn store_from_env() -> Result<(Arc<dyn SharedStore>, Duration), String> {
+    let store: Arc<dyn SharedStore> = if let Some(url) = env("OPENBOX_REDIS_URL") {
+        Arc::new(RedisStore::from_url(&url, Duration::from_millis(200))?)
+    } else {
+        eprintln!(
+            "openbox-verdict-middleware: no OPENBOX_REDIS_URL; approvals and completions are matched in this process only (one replica)"
+        );
+        Arc::new(MemoryStore::default())
+    };
+    let approval_ttl =
+        env("OPENBOX_APPROVAL_TTL_SECS").map_or(Ok(DEFAULT_APPROVAL_TTL), |value| {
+            value
+                .parse()
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .map(Duration::from_secs)
+                .ok_or_else(|| "OPENBOX_APPROVAL_TTL_SECS must be a positive number".to_owned())
+        })?;
+    Ok((store, approval_ttl))
+}
+
 async fn run() -> Result<(), String> {
     let insecure = env("OPENBOX_MW_INSECURE").as_deref() == Some("1");
     let listen: SocketAddr = env("OPENBOX_MW_LISTEN")
@@ -192,7 +240,11 @@ async fn run() -> Result<(), String> {
         )
     };
 
-    let guard = Arc::new(Guard::new(Arc::new(core), stopper).with_core_budget(core_budget()?));
+    let (store, approval_ttl) = store_from_env()?;
+    let guard = Arc::new(
+        Guard::with_store(Arc::new(core), stopper, store, approval_ttl)
+            .with_core_budget(core_budget()?),
+    );
     let metrics = guard.metrics();
     let admin: SocketAddr = env("OPENBOX_MW_ADMIN_LISTEN")
         .unwrap_or_else(|| "127.0.0.1:9464".to_owned())
@@ -202,23 +254,14 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|error| format!("admin listener {admin}: {error}"))?;
     tokio::spawn(serve_admin(admin, Arc::clone(&metrics)));
-    let service = VerdictMiddleware::new(
+    let service = Arc::new(VerdictMiddleware::new(
         guard,
         verifier,
         number("OPENBOX_MW_MAX_PAYLOAD_BYTES", 1024 * 1024)?,
         None,
-    );
+    ));
 
-    let mut server = Server::builder();
-    if !insecure {
-        let cert = std::fs::read(required("OPENBOX_MW_TLS_CERT")?)
-            .map_err(|error| format!("OPENBOX_MW_TLS_CERT: {error}"))?;
-        let key = std::fs::read(required("OPENBOX_MW_TLS_KEY")?)
-            .map_err(|error| format!("OPENBOX_MW_TLS_KEY: {error}"))?;
-        server = server
-            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
-            .map_err(|error| format!("server TLS: {error}"))?;
-    }
+    let mut server = server_from_env(insecure)?;
     eprintln!(
         "openbox-verdict-middleware: listening on {}://{listen}",
         if insecure { "http" } else { "https" }
@@ -229,7 +272,12 @@ async fn run() -> Result<(), String> {
     metrics.set_ready();
     server
         .add_service(
-            SupervisorMiddlewareServer::new(service).max_decoding_message_size(MAX_MESSAGE_BYTES),
+            SupervisorMiddlewareServer::from_arc(Arc::clone(&service))
+                .max_decoding_message_size(MAX_MESSAGE_BYTES),
+        )
+        .add_service(
+            HttpResponsePreReturnServer::from_arc(service)
+                .max_decoding_message_size(MAX_MESSAGE_BYTES),
         )
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),

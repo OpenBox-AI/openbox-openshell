@@ -4,6 +4,9 @@
 //! operator explicitly runs without authentication (local development only).
 //! A supervisor may only evaluate traffic for the sandbox its token names, so
 //! one sandbox cannot spend another's approvals or trip another's halt.
+//!
+//! The same service also answers `HttpResponsePreReturn`: it never inspects
+//! or changes a response (skip), it only closes the request's Core activity.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,14 +14,18 @@ use std::time::Duration;
 use openshell_core::extension_protocol::{
     ExtensionFamily, extension_metadata, validate_gateway_metadata,
 };
-use openshell_core::middleware::WebSocketResponseStream;
+use openshell_core::middleware::{HttpResponseResultStream, WebSocketResponseStream};
+use openshell_core::proto::middleware::v1::http_response_pre_return_server::HttpResponsePreReturn;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Finding, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
-    MiddlewareDescribeRequest, MiddlewareManifest, SupervisorMiddlewareOperation,
-    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
-    WebSocketPreflightAction, WebSocketPreflightDecision, WebSocketSessionEvent,
-    WebSocketSessionEventResult, web_socket_session_event, web_socket_session_event_result,
+    Finding, HttpRequestEvaluation, HttpRequestResult, HttpResponseEvent, HttpResponseEventResult,
+    HttpResponsePreflight, HttpResponsePreflightResult, HttpResponsePreflightSkip,
+    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketPreflightAction, WebSocketPreflightDecision,
+    WebSocketSessionEvent, WebSocketSessionEventResult, http_response_event,
+    http_response_event_result, http_response_preflight_result, web_socket_session_event,
+    web_socket_session_event_result,
 };
 use prost_types::Struct;
 use prost_types::value::Kind;
@@ -26,8 +33,8 @@ use tokio_stream::StreamExt as _;
 use tonic::{Request, Response, Status};
 
 use crate::action::Action;
-use crate::core_client::unix_now;
-use crate::guard::{ApprovalMode, Governance, Guard, SandboxStopper};
+use crate::core_client::{target_url, unix_now};
+use crate::guard::{ApprovalMode, Governance, Guard, ResponseSeen, SandboxStopper};
 use crate::token::{Caller, TokenVerifier};
 
 pub const MANIFEST_NAME: &str = "openbox/verdict-middleware";
@@ -71,6 +78,52 @@ impl<G: Governance, S: SandboxStopper + ?Sized> VerdictMiddleware<G, S> {
             .map(Some)
             .map_err(|error| Status::unauthenticated(error.to_string()))
     }
+
+    /// A supervisor token may only act for the sandbox it names.
+    fn check_sandbox(caller: Option<&Caller>, sandbox_id: &str) -> Result<(), Status> {
+        match caller {
+            None => Ok(()),
+            Some(Caller::Supervisor {
+                sandbox_id: token_sandbox,
+            }) if token_sandbox == sandbox_id => Ok(()),
+            Some(_) => Err(Status::permission_denied(
+                "token does not authorize evaluation for this sandbox",
+            )),
+        }
+    }
+}
+
+/// What a response preflight says about the request it answers.
+fn response_seen(preflight: &HttpResponsePreflight) -> ResponseSeen {
+    let context = preflight.context.clone().unwrap_or_default();
+    let target = preflight.target.clone().unwrap_or_default();
+    ResponseSeen {
+        sandbox_id: context.sandbox_id,
+        request_id: context.request_id,
+        url: target_url(
+            &target.scheme,
+            &target.host,
+            target.port,
+            &target.path,
+            &target.query,
+        ),
+        method: target.method,
+        host: target.host,
+        status_code: preflight.status_code,
+    }
+}
+
+fn skip_response() -> HttpResponseEventResult {
+    HttpResponseEventResult {
+        result: Some(http_response_event_result::Result::PreflightResult(
+            HttpResponsePreflightResult {
+                action: Some(http_response_preflight_result::Action::Skip(
+                    HttpResponsePreflightSkip {},
+                )),
+                ..HttpResponsePreflightResult::default()
+            },
+        )),
+    }
 }
 
 /// Parses the policy-supplied middleware config. Only known keys are accepted
@@ -110,7 +163,11 @@ impl<G: Governance, S: SandboxStopper + ?Sized> SupervisorMiddleware for Verdict
         self.caller(&request)?;
         let binding = |operation: SupervisorMiddlewareOperation| MiddlewareBinding {
             operation: operation as i32,
-            phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+            phase: if operation == SupervisorMiddlewareOperation::HttpResponse {
+                SupervisorMiddlewarePhase::PreReturn as i32
+            } else {
+                SupervisorMiddlewarePhase::PreCredentials as i32
+            },
             max_payload_bytes: self.max_payload_bytes,
             request_timeout: self
                 .request_timeout
@@ -121,6 +178,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> SupervisorMiddleware for Verdict
             service_version: env!("CARGO_PKG_VERSION").to_owned(),
             bindings: vec![
                 binding(SupervisorMiddlewareOperation::HttpRequest),
+                binding(SupervisorMiddlewareOperation::HttpResponse),
                 binding(SupervisorMiddlewareOperation::WebsocketMessage),
             ],
             expected_audience: self
@@ -178,17 +236,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> SupervisorMiddleware for Verdict
             .context
             .as_ref()
             .map_or("", |context| context.sandbox_id.as_str());
-        match caller {
-            None => {}
-            Some(Caller::Supervisor {
-                sandbox_id: token_sandbox,
-            }) if token_sandbox == sandbox_id => {}
-            Some(_) => {
-                return Err(Status::permission_denied(
-                    "token does not authorize evaluation for this sandbox",
-                ));
-            }
-        }
+        Self::check_sandbox(caller.as_ref(), sandbox_id)?;
         let mode = parse_config(evaluation.config.as_ref()).map_err(Status::invalid_argument)?;
         let action = Action::from_evaluation(&evaluation);
         Ok(Response::new(self.guard.evaluate(&action, mode).await))
@@ -227,6 +275,45 @@ impl<G: Governance, S: SandboxStopper + ?Sized> SupervisorMiddleware for Verdict
                     if sender.send(Ok(decision)).await.is_err() {
                         break;
                     }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        )))
+    }
+}
+
+#[tonic::async_trait]
+impl<G: Governance, S: SandboxStopper + ?Sized> HttpResponsePreReturn for VerdictMiddleware<G, S> {
+    type EvaluateStream = HttpResponseResultStream;
+
+    async fn evaluate(
+        &self,
+        request: Request<tonic::Streaming<HttpResponseEvent>>,
+    ) -> Result<Response<Self::EvaluateStream>, Status> {
+        let caller = self.caller(&request)?;
+        let mut inbound = request.into_inner();
+        let guard = Arc::clone(&self.guard);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            // Skip ends this stage after preflight, so no body or trailers
+            // follow; anything else ends the stream.
+            while let Some(Ok(event)) = inbound.next().await {
+                let Some(http_response_event::Event::Preflight(preflight)) = event.event else {
+                    break;
+                };
+                let seen = response_seen(&preflight);
+                let result = match Self::check_sandbox(caller.as_ref(), &seen.sandbox_id) {
+                    Ok(()) => {
+                        guard.complete(seen).await;
+                        Ok(skip_response())
+                    }
+                    Err(status) => Err(status),
+                };
+                let failed = result.is_err();
+                if sender.send(result).await.is_err() || failed {
+                    break;
                 }
             }
         });
@@ -322,7 +409,28 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(manifest.expected_audience, AUDIENCE);
-        assert_eq!(manifest.bindings.len(), 2);
+        let bound: Vec<_> = manifest
+            .bindings
+            .iter()
+            .map(|binding| (binding.operation, binding.phase))
+            .collect();
+        assert_eq!(
+            bound,
+            [
+                (
+                    SupervisorMiddlewareOperation::HttpRequest as i32,
+                    SupervisorMiddlewarePhase::PreCredentials as i32
+                ),
+                (
+                    SupervisorMiddlewareOperation::HttpResponse as i32,
+                    SupervisorMiddlewarePhase::PreReturn as i32
+                ),
+                (
+                    SupervisorMiddlewareOperation::WebsocketMessage as i32,
+                    SupervisorMiddlewarePhase::PreCredentials as i32
+                ),
+            ]
+        );
         assert!(
             manifest
                 .bindings

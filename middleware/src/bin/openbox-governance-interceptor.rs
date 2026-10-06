@@ -30,6 +30,9 @@
 //! Sandbox sessions: with `OPENBOX_URL` and the workload identity above, the
 //! front desk opens each sandbox's Core session on create and completes it on
 //! delete (best effort, like the inventory). Without them it does neither.
+//!   `OPENBOX_REDIS_URL`               shared store for each session's start
+//!                                     time, so any replica can close it with a
+//!                                     duration; in process without it
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,6 +46,7 @@ use openbox_verdict_middleware::inventory::{
     BackendInventory, GatewayLister, HttpInventory, SandboxLister,
 };
 use openbox_verdict_middleware::sessions::SessionLifecycle;
+use openbox_verdict_middleware::store::{MemoryStore, RedisStore, SharedStore};
 use openbox_verdict_middleware::token::TokenVerifier;
 use openshell_core::proto::gateway_interceptor::v1::gateway_interceptor_server::GatewayInterceptorServer;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -238,7 +242,17 @@ async fn run() -> Result<(), String> {
     let core = core_from_env()?;
     let mut inventory_sink = inventory_from_env(env("OPENBOX_FD_GATEWAY_ID"), core.clone())?;
     if let Some(core) = core {
-        inventory_sink = Arc::new(SessionLifecycle::new(inventory_sink, core));
+        let store: Arc<dyn SharedStore> = if let Some(url) = env("OPENBOX_REDIS_URL") {
+            Arc::new(RedisStore::from_url(&url, Duration::from_millis(500))?)
+        } else {
+            Arc::new(MemoryStore::default())
+        };
+        inventory_sink = Arc::new(SessionLifecycle::new(
+            inventory_sink,
+            core,
+            store,
+            env("OPENBOX_FD_GATEWAY_ID"),
+        ));
     } else {
         eprintln!(
             "openbox-governance-interceptor: no OPENBOX_URL; sandbox sessions are not opened or closed"

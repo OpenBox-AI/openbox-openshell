@@ -13,15 +13,18 @@
 //! middleware already comes from inside an `OpenShell` sandbox under policy, so
 //! the constraint is met and the request proceeds, with a finding recording it.
 //!
+//! Each request is its own Core activity (`oshx-<request id>`), and its
+//! response closes it ([`Guard::complete`]).
+//!
 //! Approvals are deny-then-retry, because `OpenShell` has no way to hold a
-//! request. Before scoring any request the guard asks Core whether an
-//! approval already exists for this exact action (its fingerprint-derived
-//! activity id): approved lets it be scored and through, still pending denies
-//! it without re-scoring, and a human rejection (which Core reports as halt)
-//! stops the sandbox. The check is deliberately stateless so every replica
-//! behaves the same: re-scoring a pending or approved action makes Core write
-//! a fresh pending verdict over the human's decision, so a replica that did
-//! not see the first attempt must never skip the check.
+//! request. When Core requires approval, the guard records `sandbox + action
+//! fingerprint → activity id` in the shared store. The identical retry, on any
+//! replica, finds that activity and asks Core about it: approved lets it be
+//! scored under that activity and through (where Core's grant matches), still
+//! pending denies it without re-scoring, and a human rejection (which Core
+//! reports as halt) stops the sandbox. Without an entry, or when the store is
+//! unreachable, the retry is a new activity and is scored afresh, so a lost
+//! entry can cost a second approval but never skips one.
 //!
 //! Every failure to get a verdict is an explicit deny with
 //! `openbox_unavailable`, never an allow.
@@ -35,13 +38,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openshell_core::proto::{Decision, Finding, HttpRequestResult};
+use serde_json::{Value, json};
 
 use crate::action::Action;
-use crate::core_client::{ApprovalState, CoreDecision, CoreError, Verdict};
+use crate::core_client::{
+    ApprovalState, Completion, CoreDecision, CoreError, Verdict, activity_name, request_activity_id,
+};
 use crate::metrics::{CoreCall, Metrics};
+use crate::store::{MemoryStore, SharedStore, approval_key, request_key};
+
+/// How long an approval can be matched by its retry, unless configured.
+pub const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(15 * 60);
+/// How long a request waits for its response to complete its activity.
+const REQUEST_TTL: Duration = Duration::from_secs(60 * 60);
 
 pub const REASON_APPROVAL_REQUIRED: &str = "openbox_approval_required";
 pub const REASON_BLOCKED: &str = "openbox_blocked";
@@ -62,8 +74,17 @@ pub trait Governance: Send + Sync + 'static {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<CoreDecision, CoreError>;
-    async fn evaluate_action(&self, action: &Action) -> Result<CoreDecision, CoreError>;
-    async fn approval_state(&self, action: &Action) -> Result<ApprovalState, CoreError>;
+    async fn evaluate_action(
+        &self,
+        action: &Action,
+        activity_id: &str,
+    ) -> Result<CoreDecision, CoreError>;
+    async fn approval_state(
+        &self,
+        action: &Action,
+        activity_id: &str,
+    ) -> Result<ApprovalState, CoreError>;
+    async fn complete_activity(&self, completion: &Completion) -> Result<CoreDecision, CoreError>;
 }
 
 #[tonic::async_trait]
@@ -75,12 +96,34 @@ impl Governance for crate::core_client::CoreClient {
     ) -> Result<CoreDecision, CoreError> {
         Self::start_session(self, sandbox_id, sandbox_name).await
     }
-    async fn evaluate_action(&self, action: &Action) -> Result<CoreDecision, CoreError> {
-        Self::evaluate_action(self, action).await
+    async fn evaluate_action(
+        &self,
+        action: &Action,
+        activity_id: &str,
+    ) -> Result<CoreDecision, CoreError> {
+        Self::evaluate_action(self, action, activity_id).await
     }
-    async fn approval_state(&self, action: &Action) -> Result<ApprovalState, CoreError> {
-        Self::approval_state(self, action).await
+    async fn approval_state(
+        &self,
+        action: &Action,
+        activity_id: &str,
+    ) -> Result<ApprovalState, CoreError> {
+        Self::approval_state(self, action, activity_id).await
     }
+    async fn complete_activity(&self, completion: &Completion) -> Result<CoreDecision, CoreError> {
+        Self::complete_activity(self, completion).await
+    }
+}
+
+/// A response `OpenShell` is about to return, as the response hook sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseSeen {
+    pub sandbox_id: String,
+    pub request_id: String,
+    pub method: String,
+    pub url: String,
+    pub host: String,
+    pub status_code: u32,
 }
 
 /// Stops a sandbox after a HALT. Called in the background; the triggering
@@ -108,6 +151,8 @@ pub enum ApprovalMode {
 pub struct Guard<G, S: ?Sized> {
     governance: Arc<G>,
     stopper: Arc<S>,
+    store: Arc<dyn SharedStore>,
+    approval_ttl: Duration,
     sessions: Mutex<HashSet<String>>,
     /// Local cache only: Core latches a halted session, so a replica that
     /// missed the halt still gets `halt` for the sandbox's next request.
@@ -117,10 +162,27 @@ pub struct Guard<G, S: ?Sized> {
 }
 
 impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
+    /// One replica: approvals and requests are remembered in process.
     pub fn new(governance: Arc<G>, stopper: Arc<S>) -> Self {
+        Self::with_store(
+            governance,
+            stopper,
+            Arc::new(MemoryStore::default()),
+            DEFAULT_APPROVAL_TTL,
+        )
+    }
+
+    pub fn with_store(
+        governance: Arc<G>,
+        stopper: Arc<S>,
+        store: Arc<dyn SharedStore>,
+        approval_ttl: Duration,
+    ) -> Self {
         Self {
             governance,
             stopper,
+            store,
+            approval_ttl,
             sessions: Mutex::new(HashSet::new()),
             halted: Arc::new(Mutex::new(HashSet::new())),
             metrics: Arc::new(Metrics::default()),
@@ -200,36 +262,136 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         if let Some(result) = self.ensure_session(action).await {
             return result;
         }
+        let approval = approval_key(&action.sandbox_id, &action.fingerprint);
+        let mut activity_id = request_activity_id(&action.request_id);
         if mode == ApprovalMode::Queue {
-            match self
-                .timed(CoreCall::Approval, self.governance.approval_state(action))
-                .await
-            {
-                Ok(ApprovalState::Pending { .. }) => {
-                    return deny(REASON_APPROVAL_REQUIRED, "awaiting human approval", None);
-                }
-                Ok(ApprovalState::Approved | ApprovalState::Gone) => {}
-                Ok(ApprovalState::Rejected(verdict)) => {
-                    let decision = CoreDecision {
-                        verdict,
-                        reason: Some("approval was rejected".to_owned()),
-                        governance_event_id: None,
-                        risk_score: None,
-                        approval_expires_at: None,
-                        policy_id: None,
-                    };
-                    return self.apply(action, mode, &decision);
-                }
-                Err(error) => return deny(REASON_UNAVAILABLE, &error.to_string(), None),
+            match self.store.get(&approval).await {
+                Ok(Some(held)) => match self
+                    .timed(
+                        CoreCall::Approval,
+                        self.governance.approval_state(action, &held),
+                    )
+                    .await
+                {
+                    Ok(ApprovalState::Pending { .. }) => {
+                        return deny(REASON_APPROVAL_REQUIRED, "awaiting human approval", None);
+                    }
+                    Ok(ApprovalState::Approved) => activity_id = held,
+                    Ok(ApprovalState::Gone) => {
+                        let _ = self.store.delete(&approval).await;
+                    }
+                    Ok(ApprovalState::Rejected(verdict)) => {
+                        let decision = CoreDecision {
+                            verdict,
+                            reason: Some("approval was rejected".to_owned()),
+                            governance_event_id: None,
+                            risk_score: None,
+                            approval_expires_at: None,
+                            policy_id: None,
+                        };
+                        return self.apply(action, mode, &decision);
+                    }
+                    Err(error) => return deny(REASON_UNAVAILABLE, &error.to_string(), None),
+                },
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "openbox: approval lookup unavailable, scoring request_id={} as a new activity: {error}",
+                    action.request_id
+                ),
             }
         }
-        match self
-            .timed(CoreCall::Evaluate, self.governance.evaluate_action(action))
+        let decision = match self
+            .timed(
+                CoreCall::Evaluate,
+                self.governance.evaluate_action(action, &activity_id),
+            )
             .await
         {
-            Ok(decision) => self.apply(action, mode, &decision),
-            Err(error) => deny(REASON_UNAVAILABLE, &error.to_string(), None),
+            Ok(decision) => decision,
+            Err(error) => return deny(REASON_UNAVAILABLE, &error.to_string(), None),
+        };
+        if mode == ApprovalMode::Queue
+            && decision.verdict == Verdict::RequireApproval
+            && let Err(error) = self
+                .store
+                .set(&approval, &activity_id, Some(self.approval_ttl))
+                .await
+        {
+            eprintln!(
+                "openbox: approval for request_id={} not recorded, its retry will be scored again: {error}",
+                action.request_id
+            );
         }
+        let result = self.apply(action, mode, &decision);
+        if result.decision == Decision::Allow as i32 {
+            let record = json!({
+                "activity_id": activity_id,
+                "activity_type": activity_name(action),
+                "started_ms": unix_millis(),
+            });
+            if let Err(error) = self
+                .store
+                .set(
+                    &request_key(&action.request_id),
+                    &record.to_string(),
+                    Some(REQUEST_TTL),
+                )
+                .await
+            {
+                eprintln!(
+                    "openbox: request_id={} not recorded, its completion carries no duration: {error}",
+                    action.request_id
+                );
+            }
+        }
+        result
+    }
+
+    /// Closes the activity a response belongs to. Runs in the background: the
+    /// response is not held for Core.
+    pub async fn complete(&self, response: ResponseSeen) {
+        let record = self
+            .store
+            .take(&request_key(&response.request_id))
+            .await
+            .unwrap_or_default()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let field = |name: &str| {
+            record
+                .as_ref()
+                .and_then(|record| record.get(name))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let completion = Completion {
+            activity_id: field("activity_id")
+                .unwrap_or_else(|| request_activity_id(&response.request_id)),
+            activity_type: field("activity_type")
+                .unwrap_or_else(|| format!("{} {}", response.method, response.host)),
+            duration_ms: record
+                .as_ref()
+                .and_then(|record| record.get("started_ms"))
+                .and_then(Value::as_u64)
+                .map(|started| unix_millis().saturating_sub(started)),
+            sandbox_id: response.sandbox_id,
+            request_id: response.request_id,
+            method: response.method,
+            url: response.url,
+            status_code: response.status_code,
+        };
+        let governance = Arc::clone(&self.governance);
+        tokio::spawn(async move {
+            match governance.complete_activity(&completion).await {
+                Ok(_) => eprintln!(
+                    "openbox: completed request_id={} activity_id={} status={}",
+                    completion.request_id, completion.activity_id, completion.status_code
+                ),
+                Err(error) => eprintln!(
+                    "openbox: completion for request_id={} failed: {error}",
+                    completion.request_id
+                ),
+            }
+        });
     }
 
     async fn ensure_session(&self, action: &Action) -> Option<HttpRequestResult> {
@@ -330,6 +492,14 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     }
 }
 
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 fn allow(decision: &CoreDecision, label: &str) -> HttpRequestResult {
     HttpRequestResult {
         decision: Decision::Allow as i32,
@@ -412,6 +582,10 @@ pub(crate) mod tests {
         pub approval_calls: AtomicUsize,
         /// How long every call takes.
         pub delay: Duration,
+        /// Activity ids, in call order, of evaluations and approval polls.
+        pub evaluated: Mutex<Vec<String>>,
+        pub polled: Mutex<Vec<String>>,
+        pub completions: Mutex<Vec<Completion>>,
     }
 
     fn decision(verdict: Verdict) -> CoreDecision {
@@ -452,9 +626,14 @@ pub(crate) mod tests {
                 Err(()) => Err(CoreError::Transport),
             }
         }
-        async fn evaluate_action(&self, _: &Action) -> Result<CoreDecision, CoreError> {
+        async fn evaluate_action(
+            &self,
+            _: &Action,
+            activity_id: &str,
+        ) -> Result<CoreDecision, CoreError> {
             tokio::time::sleep(self.delay).await;
             self.evaluate_calls.fetch_add(1, Ordering::SeqCst);
+            self.evaluated.lock().unwrap().push(activity_id.to_owned());
             let next = self
                 .verdicts
                 .lock()
@@ -466,15 +645,46 @@ pub(crate) mod tests {
                 Err(()) => Err(CoreError::Status(500)),
             }
         }
-        async fn approval_state(&self, _: &Action) -> Result<ApprovalState, CoreError> {
+        async fn approval_state(
+            &self,
+            _: &Action,
+            activity_id: &str,
+        ) -> Result<ApprovalState, CoreError> {
             tokio::time::sleep(self.delay).await;
             self.approval_calls.fetch_add(1, Ordering::SeqCst);
+            self.polled.lock().unwrap().push(activity_id.to_owned());
             self.approvals
                 .lock()
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Ok(ApprovalState::Gone))
                 .map_err(|()| CoreError::Transport)
+        }
+        async fn complete_activity(
+            &self,
+            completion: &Completion,
+        ) -> Result<CoreDecision, CoreError> {
+            self.completions.lock().unwrap().push(completion.clone());
+            Ok(decision(Verdict::Allow))
+        }
+    }
+
+    /// A store that is always down.
+    struct DownStore;
+
+    #[tonic::async_trait]
+    impl SharedStore for DownStore {
+        async fn get(&self, _: &str) -> Result<Option<String>, String> {
+            Err("down".to_owned())
+        }
+        async fn set(&self, _: &str, _: &str, _: Option<Duration>) -> Result<(), String> {
+            Err("down".to_owned())
+        }
+        async fn take(&self, _: &str) -> Result<Option<String>, String> {
+            Err("down".to_owned())
+        }
+        async fn delete(&self, _: &str) -> Result<(), String> {
+            Err("down".to_owned())
         }
     }
 
@@ -511,11 +721,18 @@ pub(crate) mod tests {
     }
 
     fn action() -> Action {
-        Action::from_evaluation(&evaluation(
+        request("req-1")
+    }
+
+    /// The same action, sent as a new request (a retry).
+    fn request(request_id: &str) -> Action {
+        let mut evaluation = evaluation(
             "POST",
             "/mcp",
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pay","arguments":{"amount":10}}}"#,
-        ))
+        );
+        evaluation.context.as_mut().unwrap().request_id = request_id.to_owned();
+        Action::from_evaluation(&evaluation)
     }
 
     fn is_allow(result: &HttpRequestResult) -> bool {
@@ -551,49 +768,154 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn every_request_is_its_own_activity() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow, Verdict::Allow]));
+        guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        assert_eq!(
+            *core.evaluated.lock().unwrap(),
+            ["oshx-req-1", "oshx-req-2"]
+        );
+        assert_eq!(
+            core.approval_calls.load(Ordering::SeqCst),
+            0,
+            "no approval poll without a held approval"
+        );
+    }
+
+    #[tokio::test]
     async fn approval_is_denied_then_released_on_the_approved_retry() {
         let (guard, core, _) = guard(FakeCore::with_verdicts(&[
             Verdict::RequireApproval,
             Verdict::Allow,
         ]));
         core.approvals.lock().unwrap().extend([
-            Ok(ApprovalState::Gone),
             Ok(ApprovalState::Pending { expires_at: None }),
             Ok(ApprovalState::Approved),
         ]);
-        let first = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        let first = guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
         assert_eq!(first.reason_code, REASON_APPROVAL_REQUIRED);
-        let still_pending = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        let still_pending = guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
         assert_eq!(still_pending.reason_code, REASON_APPROVAL_REQUIRED);
         assert_eq!(
             core.evaluate_calls.load(Ordering::SeqCst),
             1,
             "pending retries are not re-scored"
         );
-        let approved = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        let approved = guard.evaluate(&request("req-3"), ApprovalMode::Queue).await;
         assert!(is_allow(&approved));
-        assert_eq!(core.approval_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            *core.polled.lock().unwrap(),
+            ["oshx-req-1", "oshx-req-1"],
+            "retries ask about the activity holding the approval"
+        );
+        assert_eq!(
+            *core.evaluated.lock().unwrap(),
+            ["oshx-req-1", "oshx-req-1"],
+            "the approved retry is scored under that activity, where Core's grant matches"
+        );
     }
 
     #[tokio::test]
     async fn a_replica_that_missed_the_first_attempt_honours_the_approval() {
         // Regression: a replica with no memory of the first attempt used to
         // re-score the retry, which made Core write a fresh pending verdict
-        // over the human's approval.
-        let (replica, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow]));
+        // over the human's approval. The shared store is that memory.
+        let store: Arc<dyn SharedStore> = Arc::new(MemoryStore::default());
+        let core = Arc::new(FakeCore::with_verdicts(&[
+            Verdict::RequireApproval,
+            Verdict::Allow,
+        ]));
         core.approvals.lock().unwrap().extend([
             Ok(ApprovalState::Pending { expires_at: None }),
             Ok(ApprovalState::Approved),
         ]);
-        let pending = replica.evaluate(&action(), ApprovalMode::Queue).await;
+        let replica = |store: &Arc<dyn SharedStore>| {
+            Guard::with_store(
+                Arc::clone(&core),
+                Arc::new(FakeStopper::default()),
+                Arc::clone(store),
+                DEFAULT_APPROVAL_TTL,
+            )
+        };
+        let (first, second) = (replica(&store), replica(&store));
+        first.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        let pending = second
+            .evaluate(&request("req-2"), ApprovalMode::Queue)
+            .await;
         assert_eq!(pending.reason_code, REASON_APPROVAL_REQUIRED);
         assert_eq!(
             core.evaluate_calls.load(Ordering::SeqCst),
-            0,
+            1,
             "a pending action is never re-scored"
         );
-        let approved = replica.evaluate(&action(), ApprovalMode::Queue).await;
+        let approved = second
+            .evaluate(&request("req-3"), ApprovalMode::Queue)
+            .await;
         assert!(is_allow(&approved));
+        assert_eq!(core.evaluated.lock().unwrap()[1], "oshx-req-1");
+    }
+
+    #[tokio::test]
+    async fn without_the_store_a_retry_is_scored_again_never_released() {
+        let core = Arc::new(FakeCore::with_verdicts(&[
+            Verdict::RequireApproval,
+            Verdict::RequireApproval,
+        ]));
+        let guard = Guard::with_store(
+            Arc::clone(&core),
+            Arc::new(FakeStopper::default()),
+            Arc::new(DownStore),
+            DEFAULT_APPROVAL_TTL,
+        );
+        let first = guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        let retry = guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        assert_eq!(first.reason_code, REASON_APPROVAL_REQUIRED);
+        assert_eq!(retry.reason_code, REASON_APPROVAL_REQUIRED);
+        assert_eq!(
+            *core.evaluated.lock().unwrap(),
+            ["oshx-req-1", "oshx-req-2"]
+        );
+        assert_eq!(core.approval_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_response_completes_its_requests_activity() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow]));
+        guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        let seen = |request_id: &str, status_code| ResponseSeen {
+            sandbox_id: "sbx-id-1".to_owned(),
+            request_id: request_id.to_owned(),
+            method: "POST".to_owned(),
+            url: "https://mcp.example.com/mcp".to_owned(),
+            host: "mcp.example.com".to_owned(),
+            status_code,
+        };
+        guard.complete(seen("req-1", 200)).await;
+        // A response for a request this replica never recorded still closes
+        // the request's own activity, without a duration.
+        guard.complete(seen("req-9", 503)).await;
+        for _ in 0..50 {
+            if core.completions.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let completions = core.completions.lock().unwrap();
+        let first = completions
+            .iter()
+            .find(|c| c.request_id == "req-1")
+            .unwrap();
+        assert_eq!(first.activity_id, "oshx-req-1");
+        assert_eq!(first.activity_type, "MCP pay");
+        assert!(first.duration_ms.is_some());
+        let other = completions
+            .iter()
+            .find(|c| c.request_id == "req-9")
+            .unwrap();
+        assert_eq!(other.activity_id, "oshx-req-9");
+        assert_eq!(other.activity_type, "POST mcp.example.com");
+        assert_eq!(other.duration_ms, None);
     }
 
     #[tokio::test]
@@ -712,14 +1034,15 @@ pub(crate) mod tests {
         let started = tokio::time::Instant::now();
         let result = guard.evaluate(&action(), ApprovalMode::Queue).await;
         assert!(is_allow(&result), "{result:?}");
-        // Session start, approval check and evaluation: three calls.
-        assert_eq!(started.elapsed(), Duration::from_secs(27));
+        // Session start and evaluation: two calls. (The approval check only
+        // runs for a retry of an action holding an approval.)
+        assert_eq!(started.elapsed(), Duration::from_secs(18));
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_budget_covers_every_core_call_for_the_request() {
-        // Each call is inside the budget; the three together are not.
-        let (guard, core, _) = guard(slow_core(Duration::from_secs(12), &[Verdict::Allow]));
+        // Each call is inside the budget; the two together are not.
+        let (guard, core, _) = guard(slow_core(Duration::from_secs(15), &[Verdict::Allow]));
         let started = tokio::time::Instant::now();
         let result = guard.evaluate(&action(), ApprovalMode::Queue).await;
         assert_eq!(result.reason_code, REASON_UNAVAILABLE);
@@ -729,9 +1052,9 @@ pub(crate) mod tests {
             started.elapsed() < Duration::from_secs(30),
             "before the gateway gives up"
         );
-        // Session (12 s) and approval (24 s) finished; evaluation was cut off.
+        // Session (15 s) finished; evaluation was cut off at 29 s.
         assert_eq!(core.session_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(core.approval_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(core.approval_calls.load(Ordering::SeqCst), 0);
         assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 0);
     }
 

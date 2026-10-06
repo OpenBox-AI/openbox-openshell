@@ -10,34 +10,51 @@
 //! idempotent and whichever arrives second is replayed. A missed delete
 //! leaves the session open, as before this module existed.
 //!
+//! The session's input is the sandbox as created (name, image, policy
+//! version, labels); its duration comes from the start time the front desk
+//! keeps in the shared store, so any replica can close it.
+//!
 //! Like the inventory, this runs in `post_commit` and is best effort. Core
 //! calls run in the background so a slow Core never holds up the gateway.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::core_client::CoreClient;
 use crate::interceptor::{Inventory, InventoryEvent};
+use crate::inventory::RuntimeEnvironment;
+use crate::store::{SharedStore, session_key};
 
 /// The two Core calls a sandbox's lifecycle needs.
 #[tonic::async_trait]
 pub trait SessionGovernance: Send + Sync + 'static {
-    async fn start(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), String>;
-    async fn end(&self, sandbox_id: &str) -> Result<(), String>;
+    async fn start(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        input: &Value,
+    ) -> Result<(), String>;
+    async fn end(&self, sandbox_id: &str, duration_ms: Option<u64>) -> Result<(), String>;
 }
 
 #[tonic::async_trait]
 impl SessionGovernance for CoreClient {
-    async fn start(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), String> {
-        self.start_session(sandbox_id, sandbox_name)
+    async fn start(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        input: &Value,
+    ) -> Result<(), String> {
+        self.start_session_with(sandbox_id, sandbox_name, Some(input))
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
 
-    async fn end(&self, sandbox_id: &str) -> Result<(), String> {
-        self.end_session(sandbox_id)
+    async fn end(&self, sandbox_id: &str, duration_ms: Option<u64>) -> Result<(), String> {
+        self.end_session(sandbox_id, duration_ms)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -49,12 +66,32 @@ impl SessionGovernance for CoreClient {
 pub struct SessionLifecycle {
     inventory: Arc<dyn Inventory>,
     core: Arc<dyn SessionGovernance>,
+    store: Arc<dyn SharedStore>,
+    gateway: Option<String>,
 }
 
 impl SessionLifecycle {
-    pub fn new(inventory: Arc<dyn Inventory>, core: Arc<dyn SessionGovernance>) -> Self {
-        Self { inventory, core }
+    pub fn new(
+        inventory: Arc<dyn Inventory>,
+        core: Arc<dyn SessionGovernance>,
+        store: Arc<dyn SharedStore>,
+        gateway: Option<String>,
+    ) -> Self {
+        Self {
+            inventory,
+            core,
+            store,
+            gateway,
+        }
     }
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 #[tonic::async_trait]
@@ -65,9 +102,23 @@ impl Inventory for SessionLifecycle {
                 let id = text(sandbox, "/sandbox/metadata/id");
                 if !id.is_empty() {
                     let name = text(sandbox, "/sandbox/metadata/name");
+                    let mut input =
+                        RuntimeEnvironment::from_create_response(sandbox, self.gateway.as_deref())
+                            .and_then(|environment| serde_json::to_value(environment).ok())
+                            .unwrap_or_else(|| json!({}));
+                    input["sandboxId"] = json!(id);
+                    if let Err(error) = self
+                        .store
+                        .set(&session_key(&id), &unix_millis().to_string(), None)
+                        .await
+                    {
+                        eprintln!(
+                            "openbox: session start time for sandbox_id={id} not kept, its end carries no duration: {error}"
+                        );
+                    }
                     let core = Arc::clone(&self.core);
                     tokio::spawn(async move {
-                        match core.start(&id, &name).await {
+                        match core.start(&id, &name, &input).await {
                             Ok(()) => eprintln!("openbox: session started sandbox_id={id}"),
                             Err(error) => {
                                 eprintln!("openbox: session start failed sandbox_id={id}: {error}");
@@ -80,9 +131,16 @@ impl Inventory for SessionLifecycle {
             InventoryEvent::Deleted { response } => {
                 let id = text(response, "/sandboxId");
                 if !id.is_empty() {
+                    let duration = self
+                        .store
+                        .take(&session_key(&id))
+                        .await
+                        .unwrap_or_default()
+                        .and_then(|started| started.parse::<u64>().ok())
+                        .map(|started| unix_millis().saturating_sub(started));
                     let core = Arc::clone(&self.core);
                     tokio::spawn(async move {
-                        match core.end(&id).await {
+                        match core.end(&id, duration).await {
                             Ok(()) => eprintln!("openbox: session completed sandbox_id={id}"),
                             Err(error) => {
                                 eprintln!("openbox: session end failed sandbox_id={id}: {error}");
@@ -108,7 +166,7 @@ fn text(value: &Value, pointer: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::store::MemoryStore;
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -120,9 +178,17 @@ mod tests {
 
     #[tonic::async_trait]
     impl SessionGovernance for FakeCore {
-        async fn start(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), String> {
+        async fn start(
+            &self,
+            sandbox_id: &str,
+            sandbox_name: &str,
+            input: &Value,
+        ) -> Result<(), String> {
             self.calls
-                .send(format!("start {sandbox_id} {sandbox_name}"))
+                .send(format!(
+                    "start {sandbox_id} {sandbox_name} image={}",
+                    input["image"].as_str().unwrap_or("-")
+                ))
                 .unwrap();
             if self.fail {
                 Err("down".to_owned())
@@ -131,8 +197,10 @@ mod tests {
             }
         }
 
-        async fn end(&self, sandbox_id: &str) -> Result<(), String> {
-            self.calls.send(format!("end {sandbox_id}")).unwrap();
+        async fn end(&self, sandbox_id: &str, duration_ms: Option<u64>) -> Result<(), String> {
+            self.calls
+                .send(format!("end {sandbox_id} timed={}", duration_ms.is_some()))
+                .unwrap();
             if self.fail {
                 Err("down".to_owned())
             } else {
@@ -162,7 +230,12 @@ mod tests {
         let (calls, received) = mpsc::unbounded_channel();
         let inventory = Arc::new(FakeInventory::default());
         let sink: Arc<dyn Inventory> = inventory.clone();
-        let sessions = SessionLifecycle::new(sink, Arc::new(FakeCore { calls, fail }));
+        let sessions = SessionLifecycle::new(
+            sink,
+            Arc::new(FakeCore { calls, fail }),
+            Arc::new(MemoryStore::default()),
+            Some("gw-1".to_owned()),
+        );
         (sessions, inventory, received)
     }
 
@@ -177,7 +250,10 @@ mod tests {
     async fn create_opens_and_delete_closes_the_session() {
         let (sessions, inventory, mut received) = lifecycle(false);
         let created = InventoryEvent::Created {
-            sandbox: json!({"sandbox": {"metadata": {"id": "sbx-1", "name": "research"}}}),
+            sandbox: json!({"sandbox": {
+                "metadata": {"id": "sbx-1", "name": "research"},
+                "spec": {"template": {"image": "ubuntu:24.04"}},
+            }}),
         };
         let deleted = InventoryEvent::Deleted {
             response: json!({"sandboxId": "sbx-1"}),
@@ -185,10 +261,14 @@ mod tests {
         sessions.record(created.clone()).await.unwrap();
         assert_eq!(
             next(&mut received).await.as_deref(),
-            Some("start sbx-1 research")
+            Some("start sbx-1 research image=ubuntu:24.04")
         );
         sessions.record(deleted.clone()).await.unwrap();
-        assert_eq!(next(&mut received).await.as_deref(), Some("end sbx-1"));
+        assert_eq!(
+            next(&mut received).await.as_deref(),
+            Some("end sbx-1 timed=true"),
+            "the end carries the time since the create"
+        );
         assert_eq!(*inventory.0.lock().unwrap(), [created, deleted]);
     }
 
@@ -225,7 +305,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(next(&mut received).await.as_deref(), Some("end sbx-2"));
+        assert_eq!(
+            next(&mut received).await.as_deref(),
+            Some("end sbx-2 timed=false")
+        );
         assert_eq!(inventory.0.lock().unwrap().len(), 1);
     }
 }
