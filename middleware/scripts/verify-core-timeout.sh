@@ -5,10 +5,13 @@
 #   middleware/scripts/verify-core-timeout.sh
 #
 # Real OpenShell v0.1.2 gateway and sandbox (VM driver), the real door guard,
-# and a fake Core whose answer delay is set per scenario:
+# and a fake Core whose answer delay is set per scenario. A sandbox's first
+# request through a fresh door guard makes two Core calls (session start and
+# evaluation; the approval check only runs for a retry holding an approval,
+# PROD-839):
 #
-#   A  Core takes 9 s per call (27 s per verdict): the request goes through
-#   B  Core takes 12 s per call (36 s): explicit deny openbox_unavailable at
+#   A  Core takes 13 s per call (26 s per verdict): the request goes through
+#   B  Core takes 15 s per call (30 s): explicit deny openbox_unavailable at
 #      29 s, before the gateway's 30 s, so the sandbox sees OpenBox's reason
 #   C  the old 450 ms door guard default with the same 9 s Core: denied at
 #      once. This is what the change fixes
@@ -253,21 +256,21 @@ else
   fail "0 fast Core: expected 200 via the door guard, got '$CODE' (evals: $(evals)) [$(raw)]; the rest is meaningless"
 fi
 
-start_stack 9
+start_stack 13
 request
-if [ "$CODE" = 200 ] && [ "$SECS" -ge 26 ] && last_eval | grep -q 'decision=allow'; then
-  pass "A Core 9 s per call (27 s verdict): allowed after ${SECS}s"
+if [ "$CODE" = 200 ] && [ "$SECS" -ge 25 ] && last_eval | grep -q 'decision=allow'; then
+  pass "A Core 13 s per call (26 s verdict): allowed after ${SECS}s"
 else
-  fail "A Core 9 s per call: expected 200 after ~27 s, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
+  fail "A Core 13 s per call: expected 200 after ~26 s, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
 fi
 
-start_stack 12
+start_stack 15
 request
 if [ "$CODE" = 403 ] && [ "$SECS" -ge 28 ] && [ "$SECS" -le 31 ] &&
   last_eval | grep -q 'reason_code=openbox_unavailable'; then
-  pass "B Core 12 s per call (36 s verdict): explicit openbox_unavailable deny after ${SECS}s"
+  pass "B Core 15 s per call (30 s verdict): explicit openbox_unavailable deny after ${SECS}s"
 else
-  fail "B Core 12 s per call: expected 403 openbox_unavailable at ~29 s, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
+  fail "B Core 15 s per call: expected 403 openbox_unavailable at ~29 s, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
 fi
 
 start_stack 9 450
@@ -278,7 +281,7 @@ else
   fail "C old 450 ms budget: expected a quick 403 openbox_unavailable, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
 fi
 
-start_stack 5.7
+start_stack 8.5
 request example.com 80
 if [ -z "$CODE" ]; then
   echo "INFO  D example.com, 17 s allow: no response after ${SECS}s (its ~15 s idle timeout dropped the upstream)"
