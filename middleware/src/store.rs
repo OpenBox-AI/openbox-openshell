@@ -174,24 +174,23 @@ impl RedisStore {
     async fn command(&self, args: &[&[u8]]) -> Result<Reply, String> {
         let attempt = async {
             let mut slot = self.connection.lock().await;
-            if slot.is_none() {
-                *slot = Some(self.open().await?);
-            }
-            let connection = slot.as_mut().expect("connection just opened");
-            let outcome = exchange(connection, args).await;
-            if outcome.is_err() {
-                *slot = None;
+            // Out of the slot while in use: if this future is dropped mid
+            // exchange (a timeout, or OpenShell cancelling the request), the
+            // half-used connection goes with it instead of desynchronising
+            // the next caller.
+            let mut connection = match slot.take() {
+                Some(connection) => connection,
+                None => self.open().await?,
+            };
+            let outcome = exchange(&mut connection, args).await;
+            if outcome.is_ok() {
+                *slot = Some(connection);
             }
             outcome
         };
-        if let Ok(outcome) = tokio::time::timeout(self.timeout, attempt).await {
-            return outcome;
-        }
-        // The connection may hold a half-read reply: drop it.
-        if let Ok(mut slot) = self.connection.try_lock() {
-            *slot = None;
-        }
-        Err("redis timed out".to_owned())
+        tokio::time::timeout(self.timeout, attempt)
+            .await
+            .unwrap_or_else(|_| Err("redis timed out".to_owned()))
     }
 }
 
