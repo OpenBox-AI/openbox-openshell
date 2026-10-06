@@ -12,6 +12,7 @@ pub mod halt;
 pub mod interceptor;
 pub mod inventory;
 pub mod metrics;
+pub mod prompt;
 pub mod service;
 pub mod sessions;
 pub mod store;

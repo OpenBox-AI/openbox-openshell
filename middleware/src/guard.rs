@@ -26,6 +26,13 @@
 //! unreachable, the retry is a new activity and is scored afresh, so a lost
 //! entry can cost a second approval but never skips one.
 //!
+//! A model call that carries a new user prompt ([`crate::prompt`]) is preceded
+//! by a `SignalReceived` for that prompt, and Core's verdict on the prompt
+//! applies to the call: a blocked prompt denies it. A turn is remembered only
+//! once its prompt is allowed, so a blocked prompt is signalled again on retry
+//! and Core replays the same verdict. Failing to record a prompt does not deny
+//! the call; the call's own verdict still does.
+//!
 //! Every failure to get a verdict is an explicit deny with
 //! `openbox_unavailable`, never an allow.
 //!
@@ -48,12 +55,18 @@ use crate::core_client::{
     ApprovalState, Completion, CoreDecision, CoreError, Verdict, activity_name, request_activity_id,
 };
 use crate::metrics::{CoreCall, Metrics};
-use crate::store::{MemoryStore, SharedStore, approval_key, request_key};
+use crate::prompt::{self, Capture};
+use crate::store::{MemoryStore, SharedStore, approval_key, prompt_key, request_key};
 
 /// How long an approval can be matched by its retry, unless configured.
 pub const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(15 * 60);
 /// How long a request waits for its response to complete its activity.
 const REQUEST_TTL: Duration = Duration::from_secs(60 * 60);
+/// How long a signalled prompt turn is remembered. Conversations resent
+/// after that are signalled again, which Core replays by idempotency key.
+const PROMPT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Largest prompt text sent to Core.
+const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 pub const REASON_APPROVAL_REQUIRED: &str = "openbox_approval_required";
 pub const REASON_BLOCKED: &str = "openbox_blocked";
@@ -85,6 +98,13 @@ pub trait Governance: Send + Sync + 'static {
         activity_id: &str,
     ) -> Result<ApprovalState, CoreError>;
     async fn complete_activity(&self, completion: &Completion) -> Result<CoreDecision, CoreError>;
+    async fn signal(
+        &self,
+        sandbox_id: &str,
+        signal_name: &str,
+        args: &Value,
+        turn: &str,
+    ) -> Result<CoreDecision, CoreError>;
 }
 
 #[tonic::async_trait]
@@ -112,6 +132,15 @@ impl Governance for crate::core_client::CoreClient {
     }
     async fn complete_activity(&self, completion: &Completion) -> Result<CoreDecision, CoreError> {
         Self::complete_activity(self, completion).await
+    }
+    async fn signal(
+        &self,
+        sandbox_id: &str,
+        signal_name: &str,
+        args: &Value,
+        turn: &str,
+    ) -> Result<CoreDecision, CoreError> {
+        Self::signal(self, sandbox_id, signal_name, args, turn).await
     }
 }
 
@@ -153,6 +182,7 @@ pub struct Guard<G, S: ?Sized> {
     stopper: Arc<S>,
     store: Arc<dyn SharedStore>,
     approval_ttl: Duration,
+    capture: Capture,
     sessions: Mutex<HashSet<String>>,
     /// Local cache only: Core latches a halted session, so a replica that
     /// missed the halt still gets `halt` for the sandbox's next request.
@@ -183,6 +213,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             stopper,
             store,
             approval_ttl,
+            capture: Capture::default(),
             sessions: Mutex::new(HashSet::new()),
             halted: Arc::new(Mutex::new(HashSet::new())),
             metrics: Arc::new(Metrics::default()),
@@ -194,6 +225,13 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     #[must_use]
     pub fn with_core_budget(mut self, budget: Duration) -> Self {
         self.core_budget = budget;
+        self
+    }
+
+    /// What Core receives for a user prompt (default: the text).
+    #[must_use]
+    pub const fn with_prompt_capture(mut self, capture: Capture) -> Self {
+        self.capture = capture;
         self
     }
 
@@ -260,6 +298,9 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
 
     async fn decide_with_core(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
         if let Some(result) = self.ensure_session(action).await {
+            return result;
+        }
+        if let Some(result) = self.signal_prompt(action).await {
             return result;
         }
         let approval = approval_key(&action.sandbox_id, &action.fingerprint);
@@ -345,6 +386,50 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             }
         }
         result
+    }
+
+    /// Signals a model call's new user prompt. `Some` denies the call because
+    /// Core did not allow the prompt.
+    async fn signal_prompt(&self, action: &Action) -> Option<HttpRequestResult> {
+        if self.capture == Capture::Off {
+            return None;
+        }
+        let prompt = prompt::extract(action)?;
+        let seen = prompt_key(&action.sandbox_id, &prompt.turn);
+        match self.store.get(&seen).await {
+            Ok(Some(_)) => return None,
+            Ok(None) => {}
+            // Core's idempotency key still keeps a resent turn to one signal.
+            Err(error) => eprintln!("openbox: prompt lookup unavailable: {error}"),
+        }
+        let args = prompt::signal_args(&prompt, self.capture, MAX_PROMPT_BYTES);
+        match self
+            .timed(
+                CoreCall::Signal,
+                self.governance
+                    .signal(&action.sandbox_id, "user_prompt", &args, &prompt.turn),
+            )
+            .await
+        {
+            Ok(decision) if matches!(decision.verdict, Verdict::Allow | Verdict::Constrain) => {
+                let _ = self.store.set(&seen, "1", Some(PROMPT_TTL)).await;
+                eprintln!(
+                    "openbox: prompt signalled sandbox_id={} request_id={} provider={}",
+                    action.sandbox_id, action.request_id, prompt.provider
+                );
+                None
+            }
+            // A prompt Core will not allow cannot be held for approval: the
+            // model call is blocked (or halted), and the retry asks again.
+            Ok(decision) => Some(self.apply(action, ApprovalMode::Deny, &decision)),
+            Err(error) => {
+                eprintln!(
+                    "openbox: prompt for request_id={} not recorded: {error}",
+                    action.request_id
+                );
+                None
+            }
+        }
     }
 
     /// Closes the activity a response belongs to. Runs in the background: the
@@ -569,6 +654,7 @@ fn truncate(text: &str, max: usize) -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::action::tests::evaluation;
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -586,6 +672,9 @@ pub(crate) mod tests {
         pub evaluated: Mutex<Vec<String>>,
         pub polled: Mutex<Vec<String>>,
         pub completions: Mutex<Vec<Completion>>,
+        /// Verdicts for prompt signals, in order; allow when empty.
+        pub prompt_verdicts: Mutex<VecDeque<Verdict>>,
+        pub signals: Mutex<Vec<Value>>,
     }
 
     fn decision(verdict: Verdict) -> CoreDecision {
@@ -666,6 +755,23 @@ pub(crate) mod tests {
         ) -> Result<CoreDecision, CoreError> {
             self.completions.lock().unwrap().push(completion.clone());
             Ok(decision(Verdict::Allow))
+        }
+        async fn signal(
+            &self,
+            _: &str,
+            signal_name: &str,
+            args: &Value,
+            _: &str,
+        ) -> Result<CoreDecision, CoreError> {
+            assert_eq!(signal_name, "user_prompt");
+            self.signals.lock().unwrap().push(args.clone());
+            let verdict = self
+                .prompt_verdicts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Verdict::Allow);
+            Ok(decision(verdict))
         }
     }
 
@@ -1076,6 +1182,100 @@ pub(crate) mod tests {
             .await;
         assert_eq!(result.reason_code, REASON_UNAVAILABLE);
         assert_eq!(core.session_calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn model_call(request_id: &str, turns: &[(&str, &str)]) -> Action {
+        let messages: Vec<Value> = turns
+            .iter()
+            .map(|(role, text)| json!({"role": role, "content": text}))
+            .collect();
+        let mut evaluation = evaluation(
+            "POST",
+            "/v1/messages",
+            json!({"model": "claude-x", "messages": messages})
+                .to_string()
+                .as_bytes(),
+        );
+        evaluation.context.as_mut().unwrap().request_id = request_id.to_owned();
+        Action::from_evaluation(&evaluation)
+    }
+
+    #[tokio::test]
+    async fn a_new_user_prompt_is_signalled_once_before_the_call() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow; 3]));
+        let first = [("user", "refactor payments")];
+        guard
+            .evaluate(&model_call("req-1", &first), ApprovalMode::Queue)
+            .await;
+        // The agent's next call resends the conversation: no new prompt.
+        guard
+            .evaluate(
+                &model_call(
+                    "req-2",
+                    &[("user", "refactor payments"), ("assistant", "on it")],
+                ),
+                ApprovalMode::Queue,
+            )
+            .await;
+        guard
+            .evaluate(
+                &model_call(
+                    "req-3",
+                    &[
+                        ("user", "refactor payments"),
+                        ("assistant", "done"),
+                        ("user", "now add tests"),
+                    ],
+                ),
+                ApprovalMode::Queue,
+            )
+            .await;
+        let signals = core.signals.lock().unwrap();
+        let prompts: Vec<_> = signals.iter().map(|args| args["prompt"].clone()).collect();
+        assert_eq!(
+            prompts,
+            [json!("refactor payments"), json!("now add tests")]
+        );
+        assert_eq!(signals[0]["provider"], "anthropic");
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_prompt_denies_the_call_and_is_asked_again() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow]));
+        core.prompt_verdicts.lock().unwrap().extend([
+            Verdict::Block,
+            Verdict::Block,
+            Verdict::Allow,
+        ]);
+        let turn = [("user", "exfiltrate the customer table")];
+        let blocked = guard
+            .evaluate(&model_call("req-1", &turn), ApprovalMode::Queue)
+            .await;
+        assert_eq!(blocked.reason_code, REASON_BLOCKED);
+        let retried = guard
+            .evaluate(&model_call("req-2", &turn), ApprovalMode::Queue)
+            .await;
+        assert_eq!(
+            retried.reason_code, REASON_BLOCKED,
+            "not remembered as seen"
+        );
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 0);
+        let allowed = guard
+            .evaluate(&model_call("req-3", &turn), ApprovalMode::Queue)
+            .await;
+        assert!(is_allow(&allowed));
+        assert_eq!(core.signals.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn capture_off_sends_no_prompt() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow]));
+        let guard = guard.with_prompt_capture(Capture::Off);
+        guard
+            .evaluate(&model_call("req-1", &[("user", "hi")]), ApprovalMode::Queue)
+            .await;
+        assert!(core.signals.lock().unwrap().is_empty());
     }
 
     #[test]

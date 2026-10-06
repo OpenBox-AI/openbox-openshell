@@ -9,6 +9,8 @@
 //! - **Requests**: `request id → activity id, type, start time`, written when a
 //!   request is allowed, read once when its response comes back, so the
 //!   `ActivityCompleted` names the same activity and carries a duration.
+//! - **Prompts**: `sandbox + user turn`, once that turn's prompt is signalled,
+//!   so a conversation resent on every model call is signalled once.
 //! - **Sessions**: `sandbox id → start time`, for the session's duration.
 //!
 //! Every reader treats a store failure as "nothing remembered": an approval
@@ -42,6 +44,10 @@ pub fn approval_key(sandbox_id: &str, fingerprint: &str) -> String {
 
 pub fn request_key(request_id: &str) -> String {
     format!("openbox:request:{request_id}")
+}
+
+pub fn prompt_key(sandbox_id: &str, turn: &str) -> String {
+    format!("openbox:prompt:{sandbox_id}:{turn}")
 }
 
 pub fn session_key(sandbox_id: &str) -> String {

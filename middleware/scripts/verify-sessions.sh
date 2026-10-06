@@ -3,6 +3,7 @@
 # complete OpenBox Core session that follows the OpenBox event sequence:
 #
 #   WorkflowStarted    sandbox created, input = the sandbox (name, image, ...)
+#   SignalReceived     user_prompt: a new user turn in a model call (PROD-840)
 #   ActivityStarted    each request, its own activity, named "GET example.com"
 #   ActivityCompleted  its response, same activity id, status and duration
 #   WorkflowCompleted  sandbox deleted, with the session's duration
@@ -19,6 +20,14 @@
 # gateway-to-extension legs run plaintext (OPENBOX_*_INSECURE=1, no gateway
 # token check); the legs to Core are the real ones (Keycloak workload token,
 # Core v3).
+#
+# Model calls are Anthropic Messages requests (POST /v1/messages) sent to
+# example.com instead of a provider, so no provider key is needed: the door
+# guard reads the prompt from the request, and example.com answers 405, which
+# proves the call was let through. Everything between the sandbox and Core is
+# real. Results that depend on it are labelled "stand-in provider".
+#
+# example.com is also the GET target, so one policy rule covers both.
 #
 # The middleware gets a larger time budget than OpenShell's 500 ms default,
 # because a local Core answers an evaluate in about a second (see PROD-832).
@@ -55,6 +64,7 @@ GW_PORT=${OBX_GATEWAY_PORT:-17890}
 MW_PORT=${OBX_MW_PORT:-50251}
 ADMIN_PORT=$((MW_PORT + 1))
 FD_PORT=${OBX_FD_PORT:-50271}
+MODEL_HOST=example.com
 INV_PORT=$((FD_PORT + 1))
 MW_TIMEOUT=${OBX_MW_TIMEOUT:-5s}
 CORE=${OPENBOX_URL:-http://localhost:8086}
@@ -119,6 +129,15 @@ request() {
     exec 3<>/dev/tcp/example.com/80 || { echo "connect failed"; exit 0; }
     printf "GET %s HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n" "$0" >&3
     IFS=" " read -r _ code _ <&3; echo "${code:-none}"' "$2" 2>&1 | tail -1 || true
+}
+
+# post <sandbox> <path> <json>: one Anthropic-shaped model call from inside the
+# sandbox to the stand-in provider; prints the status code.
+post() {
+  os sandbox exec -n "$1" --no-tty --timeout 60 -- bash -c '
+    exec 3<>/dev/tcp/'"$MODEL_HOST"'/80 || { echo "connect failed"; exit 0; }
+    printf "POST %s HTTP/1.1\r\nHost: '"$MODEL_HOST"'\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s" "$0" "${#1}" "$1" >&3
+    IFS=" " read -r _ code _ <&3; echo "${code:-none}"' "$2" "$3" 2>&1 | tail -1 || true
 }
 
 for port in "$GW_PORT" $((GW_PORT + 1)) $((GW_PORT + 2)) "$MW_PORT" "$ADMIN_PORT" "$FD_PORT" "$INV_PORT"; do
@@ -223,7 +242,7 @@ network_policies:
       - host: example.com
         port: 80
         protocol: rest
-        access: read-only
+        access: read-write
     binaries:
       - path: /usr/bin/bash
 EOF
@@ -234,6 +253,15 @@ ID=$(sandbox_id "$A")
 [ -n "$ID" ] || { echo "sandbox $A did not come up"; tail -20 "$WORK/gateway.log"; exit 1; }
 EV="from governance_events where workflow_id='$ID'"
 SESSION="select count(*) from sessions where workflow_id='$ID'"
+# About 10 s after start the sandbox's settings poll picks up its provider
+# environment and reloads; a request still waiting on a verdict at that moment
+# is dropped ("policy generation is stale"). Let it settle before traffic.
+i=0
+until os logs "$A" --source sandbox 2>/dev/null | grep -q 'Settings poll'; do
+  i=$((i + 1))
+  [ $i -le 30 ] || break
+  sleep 1
+done
 if wait_q 30 "$SESSION" 1; then
   pass "1 creating the sandbox opens its Core session, before any traffic ($ID)"
 else
@@ -272,6 +300,40 @@ else
   fail "5 every activity is completed by its response, with output and duration (paired: $(q "$PAIRED"))"
 fi
 
+# The user's prompts, as an agent sends them to its model (stand-in provider):
+# a first turn, a tool-loop call that resends it, and a second turn.
+FIRST='{"model":"claude-standin","messages":[{"role":"user","content":"refactor the payment module"}]}'
+LOOP='{"model":"claude-standin","messages":[{"role":"user","content":"refactor the payment module"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read_file","input":{"path":"pay.py"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"def pay(): ..."}]}]}'
+SECOND='{"model":"claude-standin","messages":[{"role":"user","content":"refactor the payment module"},{"role":"assistant","content":"done"},{"role":"user","content":"now add tests"}]}'
+ok=0
+for body in "$FIRST" "$LOOP" "$SECOND"; do
+  code=$(post "$A" /v1/messages "$body")
+  # Any upstream status means it was let through; 403 is a deny.
+  case $code in [1-5][0-9][0-9]) [ "$code" != 403 ] && ok=$((ok + 1)) ;; esac
+done
+if [ $ok = 3 ]; then
+  pass "8 three model calls from the sandbox are let through to the provider (stand-in provider)"
+else
+  fail "8 three model calls from the sandbox are let through to the provider ($ok/3, last '$code') (stand-in provider)"
+  sleep 8
+  os logs "$A" --source sandbox >"$WORK/sandbox.log" 2>&1 || true
+  echo "      sandbox log saved: $WORK/sandbox.log"
+fi
+PROMPTS="select string_agg(input->0->>'prompt', ' | ' order by created_at) $EV and event_type='SignalReceived' and signal_name='user_prompt'"
+if wait_q 30 "select count(*) $EV and event_type='SignalReceived' and signal_name='user_prompt'" 2 &&
+  [ "$($PSQL "$PROMPTS")" = "refactor the payment module | now add tests" ]; then
+  pass "9 each new user turn is one user_prompt signal; the tool-loop call adds none"
+else
+  fail "9 each new user turn is one user_prompt signal; the tool-loop call adds none (got '$($PSQL "$PROMPTS")')"
+fi
+ORDER="select string_agg(case when event_type='SignalReceived' then 'S' else 'A' end, '' order by created_at)
+       $EV and (event_type='SignalReceived' or (event_type='ActivityStarted' and activity_type='POST $MODEL_HOST'))"
+if [ "$(q "$ORDER")" = "SAASA" ]; then
+  pass "10 each prompt is recorded before the model call that carries it (SAASA)"
+else
+  fail "10 each prompt is recorded before the model call that carries it (order '$(q "$ORDER")', want SAASA)"
+fi
+
 os sandbox delete "$A" >/dev/null
 STATUS="select status from sessions where workflow_id='$ID'"
 ENDED="select count(*) $EV and event_type='WorkflowCompleted' and duration_ms is not null"
@@ -290,10 +352,10 @@ fi
 echo "== The session (open it in the dashboard under the agent)"
 $PSQL "select 'session ' || s.id || '  ' || s.status || '  ' || s.started_at || ' -> ' || coalesce(s.completed_at::text,'-')
        from sessions s where s.workflow_id='$ID'"
-$PSQL "select '  ' || to_char(e.created_at,'HH24:MI:SS.MS') || '  ' || rpad(e.event_type,18) || rpad(coalesce(e.activity_type,''),17)
-              || rpad(coalesce(e.activity_id,''),42) || coalesce(round(e.duration_ms)::text || ' ms','')
+$PSQL "select '  ' || to_char(e.created_at,'HH24:MI:SS.MS') || '  ' || rpad(e.event_type,18) || rpad(coalesce(e.activity_type, e.signal_name, ''),28)
+              || rpad(coalesce(e.activity_id, e.input->0->>'prompt', ''),42) || coalesce(round(e.duration_ms)::text || ' ms','')
        from governance_events e where e.workflow_id='$ID' order by e.created_at"
 echo "== Front desk and middleware logs"
 grep 'session' "$WORK/fd.log" || true
-grep -E 'eval |completed request_id' "$WORK/mw.log" || true
+grep -E 'eval |completed request_id|prompt' "$WORK/mw.log" || true
 [ $FAILED = 0 ] && echo "ALL PASS" || { echo "SOME FAILED (logs: rerun with KEEP=1)"; exit 1; }

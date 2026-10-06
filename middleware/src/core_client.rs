@@ -329,6 +329,21 @@ impl CoreClient {
         self.evaluate(&payload, &idempotency_key(&key)).await
     }
 
+    /// Records something that entered the sandbox's session, such as the
+    /// user's prompt, as `SignalReceived`. `turn` identifies it so a resent
+    /// signal is replayed by Core rather than recorded twice.
+    pub async fn signal(
+        &self,
+        sandbox_id: &str,
+        signal_name: &str,
+        args: &Value,
+        turn: &str,
+    ) -> Result<CoreDecision, CoreError> {
+        let payload = signal_event(sandbox_id, signal_name, args, SystemTime::now());
+        let key = format!("sig-{sandbox_id}-{signal_name}-{turn}");
+        self.evaluate(&payload, &idempotency_key(&key)).await
+    }
+
     /// Closes an activity when its response comes back. A notification: the
     /// response is already on its way to the sandbox.
     pub async fn complete_activity(
@@ -677,6 +692,25 @@ fn session_end_event(sandbox_id: &str, duration_ms: Option<u64>, now: SystemTime
         event["duration_ms"] = json!(duration);
     }
     event
+}
+
+fn signal_event(sandbox_id: &str, signal_name: &str, args: &Value, now: SystemTime) -> Value {
+    json!({
+        "source": "workflow-telemetry",
+        "event_type": "SignalReceived",
+        "workflow_id": sandbox_id,
+        "run_id": sandbox_id,
+        "workflow_type": WORKFLOW_TYPE,
+        "task_queue": TASK_QUEUE,
+        "signal_name": signal_name,
+        "signal_args": [args],
+        "activity_input": [args],
+        "timestamp": rfc3339_micros(now),
+        "span_count": 0,
+        "spans": [],
+        "hook_trigger": false,
+        "metadata": {"openshell": {"sandbox_id": sandbox_id}},
+    })
 }
 
 fn completion_event(completion: &Completion, now: SystemTime) -> Value {

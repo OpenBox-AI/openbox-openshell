@@ -68,6 +68,7 @@ pub enum CoreCall {
     Session,
     Approval,
     Evaluate,
+    Signal,
 }
 
 impl CoreCall {
@@ -76,6 +77,7 @@ impl CoreCall {
             Self::Session => "session",
             Self::Approval => "approval",
             Self::Evaluate => "evaluate",
+            Self::Signal => "signal",
         }
     }
 }
@@ -91,6 +93,7 @@ pub struct Metrics {
     session_latency: Histogram,
     approval_latency: Histogram,
     evaluate_latency: Histogram,
+    signal_latency: Histogram,
 }
 
 impl Metrics {
@@ -120,6 +123,7 @@ impl Metrics {
             CoreCall::Session => &self.session_latency,
             CoreCall::Approval => &self.approval_latency,
             CoreCall::Evaluate => &self.evaluate_latency,
+            CoreCall::Signal => &self.signal_latency,
         }
         .observe(elapsed);
     }
@@ -156,6 +160,7 @@ impl Metrics {
             (CoreCall::Session, &self.session_latency),
             (CoreCall::Approval, &self.approval_latency),
             (CoreCall::Evaluate, &self.evaluate_latency),
+            (CoreCall::Signal, &self.signal_latency),
         ] {
             histogram.render(
                 &mut out,

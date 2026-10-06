@@ -36,6 +36,9 @@
 //!                                     which is only correct for one replica.
 //!   `OPENBOX_APPROVAL_TTL_SECS`       how long an approval's retry can match it,
 //!                                     default 900
+//!   `OPENBOX_PROMPT_CAPTURE`          what Core receives for a user prompt read
+//!                                     from a model call: `text` (default),
+//!                                     `hash` (SHA-256 and length), `off`
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -51,6 +54,7 @@ use openbox_verdict_middleware::guard::{
 };
 use openbox_verdict_middleware::halt::{DenyOnlyStopper, GatewayStopper};
 use openbox_verdict_middleware::metrics::serve_admin;
+use openbox_verdict_middleware::prompt::Capture;
 use openbox_verdict_middleware::service::VerdictMiddleware;
 use openbox_verdict_middleware::store::{MemoryStore, RedisStore, SharedStore};
 use openbox_verdict_middleware::token::TokenVerifier;
@@ -241,9 +245,14 @@ async fn run() -> Result<(), String> {
     };
 
     let (store, approval_ttl) = store_from_env()?;
+    let capture = env("OPENBOX_PROMPT_CAPTURE").map_or(Ok(Capture::Text), |value| {
+        Capture::parse(&value)
+            .ok_or_else(|| "OPENBOX_PROMPT_CAPTURE must be text, hash or off".to_owned())
+    })?;
     let guard = Arc::new(
         Guard::with_store(Arc::new(core), stopper, store, approval_ttl)
-            .with_core_budget(core_budget()?),
+            .with_core_budget(core_budget()?)
+            .with_prompt_capture(capture),
     );
     let metrics = guard.metrics();
     let admin: SocketAddr = env("OPENBOX_MW_ADMIN_LISTEN")
