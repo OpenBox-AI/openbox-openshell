@@ -287,6 +287,14 @@ impl CoreClient {
         self.evaluate(&payload, &key).await
     }
 
+    /// Closes the Core session for a deleted sandbox, so Core marks it
+    /// completed and seals it. Safe to repeat, like [`Self::start_session`].
+    pub async fn end_session(&self, sandbox_id: &str) -> Result<CoreDecision, CoreError> {
+        let payload = session_end_event(sandbox_id, SystemTime::now());
+        let key = format!("wfc-{sandbox_id}");
+        self.evaluate(&payload, &key).await
+    }
+
     /// Asks Core for a verdict on one action.
     pub async fn evaluate_action(&self, action: &Action) -> Result<CoreDecision, CoreError> {
         let payload = action_event(action, self.config.body_limit_bytes, SystemTime::now());
@@ -564,6 +572,23 @@ fn session_event(sandbox_id: &str, sandbox_name: &str, now: SystemTime) -> Value
         "spans": [],
         "hook_trigger": false,
         "metadata": {"openshell": {"sandbox_id": sandbox_id, "sandbox": sandbox_name}},
+    })
+}
+
+fn session_end_event(sandbox_id: &str, now: SystemTime) -> Value {
+    json!({
+        "source": "workflow-telemetry",
+        "event_type": "WorkflowCompleted",
+        "workflow_id": sandbox_id,
+        "run_id": sandbox_id,
+        "workflow_type": WORKFLOW_TYPE,
+        "task_queue": TASK_QUEUE,
+        "timestamp": rfc3339_micros(now),
+        "status": "completed",
+        "span_count": 0,
+        "spans": [],
+        "hook_trigger": false,
+        "metadata": {"openshell": {"sandbox_id": sandbox_id}},
     })
 }
 

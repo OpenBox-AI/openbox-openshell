@@ -26,6 +26,10 @@
 //!   `OPENBOX_GATEWAY_ENDPOINT`, `OPENBOX_GATEWAY_MTLS_DIR`   gateway API
 //!                                     credential; enables reconciliation
 //!   `OPENBOX_FD_RECONCILE_SECS`       reconciliation interval, default 60
+//!
+//! Sandbox sessions: with `OPENBOX_URL` and the workload identity above, the
+//! front desk opens each sandbox's Core session on create and completes it on
+//! delete (best effort, like the inventory). Without them it does neither.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -38,6 +42,7 @@ use openbox_verdict_middleware::interceptor::{FrontDesk, Inventory, LogInventory
 use openbox_verdict_middleware::inventory::{
     BackendInventory, GatewayLister, HttpInventory, SandboxLister,
 };
+use openbox_verdict_middleware::sessions::SessionLifecycle;
 use openbox_verdict_middleware::token::TokenVerifier;
 use openshell_core::proto::gateway_interceptor::v1::gateway_interceptor_server::GatewayInterceptorServer;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -75,30 +80,43 @@ fn read_secret(key: &str) -> Result<String, String> {
         .map_err(|error| format!("{key}: cannot read {path}: {error}"))
 }
 
-/// The inventory the front desk writes to: the backend when configured,
-/// otherwise the service log.
-fn inventory_from_env(gateway: Option<String>) -> Result<Arc<dyn Inventory>, String> {
-    let Some(backend_url) = env("OPENBOX_BACKEND_URL") else {
-        eprintln!(
-            "openbox-governance-interceptor: no OPENBOX_BACKEND_URL; inventory events are only logged"
-        );
-        return Ok(Arc::new(LogInventory));
+/// Core, for the workload token and sandbox sessions: set when `OPENBOX_URL`
+/// is, and then the workload identity is required.
+fn core_from_env() -> Result<Option<Arc<CoreClient>>, String> {
+    let Some(base_url) = env("OPENBOX_URL") else {
+        return Ok(None);
     };
     let workload = WorkloadIdentity::from_pem(
         &read_secret("OPENBOX_WORKLOAD_KEY_FILE")?,
         required("OPENBOX_WORKLOAD_KID")?,
     )
     .map_err(|_| "OPENBOX_WORKLOAD_KEY_FILE is not an RSA private key".to_owned())?;
-    let tokens = CoreClient::new(CoreConfig {
-        base_url: required("OPENBOX_URL")?,
+    CoreClient::new(CoreConfig {
+        base_url,
         api_key: read_secret("OPENBOX_API_KEY_FILE")?,
         signer: None,
         workload: Some(workload),
         timeout: Duration::from_secs(10),
         body_limit_bytes: 0,
     })
-    .map_err(|error| error.to_string())?;
-    let backend = BackendInventory::new(&backend_url, Arc::new(tokens))?;
+    .map(|core| Some(Arc::new(core)))
+    .map_err(|error| error.to_string())
+}
+
+/// The inventory the front desk writes to: the backend when configured,
+/// otherwise the service log.
+fn inventory_from_env(
+    gateway: Option<String>,
+    core: Option<Arc<CoreClient>>,
+) -> Result<Arc<dyn Inventory>, String> {
+    let Some(backend_url) = env("OPENBOX_BACKEND_URL") else {
+        eprintln!(
+            "openbox-governance-interceptor: no OPENBOX_BACKEND_URL; inventory events are only logged"
+        );
+        return Ok(Arc::new(LogInventory));
+    };
+    let tokens = core.ok_or("OPENBOX_BACKEND_URL needs OPENBOX_URL for the workload token")?;
+    let backend = BackendInventory::new(&backend_url, tokens)?;
     let lister: Option<Arc<dyn SandboxLister>> = match (
         env("OPENBOX_GATEWAY_ENDPOINT"),
         env("OPENBOX_GATEWAY_MTLS_DIR"),
@@ -217,7 +235,15 @@ async fn run() -> Result<(), String> {
         "OPENBOX_FD_INVENTORY_AUDIENCE",
         DEFAULT_INVENTORY_AUDIENCE,
     )?;
-    let inventory_sink = inventory_from_env(env("OPENBOX_FD_GATEWAY_ID"))?;
+    let core = core_from_env()?;
+    let mut inventory_sink = inventory_from_env(env("OPENBOX_FD_GATEWAY_ID"), core.clone())?;
+    if let Some(core) = core {
+        inventory_sink = Arc::new(SessionLifecycle::new(inventory_sink, core));
+    } else {
+        eprintln!(
+            "openbox-governance-interceptor: no OPENBOX_URL; sandbox sessions are not opened or closed"
+        );
+    }
     let (stop, stopped) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         let mut terminate =

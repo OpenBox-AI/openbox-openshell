@@ -13,4 +13,5 @@ pub mod interceptor;
 pub mod inventory;
 pub mod metrics;
 pub mod service;
+pub mod sessions;
 pub mod token;
