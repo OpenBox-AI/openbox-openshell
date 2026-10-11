@@ -265,6 +265,8 @@ EOF
   env $ISOLATE "$PREFIX/bin/openshell-gateway" --config "$DIR/gateway.toml" >"$DIR/gateway.log" 2>&1 &
   echo $! >"$DIR/gateway.pid"
   wait_listen "$GW_PORT" gateway
+  # A registration left by an earlier run would make `gateway add` refuse.
+  os gateway remove "$GATEWAY_NAME" >/dev/null 2>&1 || true
   os gateway add "https://127.0.0.1:$GW_PORT" --local --name "$GATEWAY_NAME" >/dev/null
 
   # A CLI wrapper bound to this gateway's config, so `openshell` here never
