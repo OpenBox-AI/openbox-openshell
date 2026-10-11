@@ -122,7 +122,9 @@ body = urllib.parse.urlencode({
     "grant_type": "client_credentials", "client_id": client_id,
     "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
     "client_assertion": f"{head}.{claims}.{b64(sig)}"}).encode()
-token = json.load(urllib.request.urlopen(urllib.request.Request(endpoint, data=body)))["access_token"]
+# Cloudflare in front of hosted Keycloak bans urllib's default User-Agent (error 1010).
+req = urllib.request.Request(endpoint, data=body, headers={"User-Agent": "openbox-openshell.sh"})
+token = json.load(urllib.request.urlopen(req))["access_token"]
 payload = token.split(".")[1]
 aud = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))).get("aud")
 print(" ".join(aud) if isinstance(aud, list) else (aud or ""))
