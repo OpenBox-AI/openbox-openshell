@@ -6,16 +6,17 @@
 #
 # Real OpenShell v0.1.2 gateway and sandbox (VM driver), the real door guard,
 # and a fake Core whose answer delay is set per scenario. A sandbox's first
-# request through a fresh door guard makes two Core calls (session start and
-# evaluation; the approval check only runs for a retry holding an approval,
+# request through a fresh door guard makes three Core calls (session start,
+# the plain ActivityStarted that opens the activity, and the hook carrying its
+# span; the approval check only runs for a retry holding an approval,
 # PROD-839):
 #
-#   A  Core takes 13 s per call (26 s per verdict): the request goes through
-#   B  Core takes 15 s per call (30 s): explicit deny openbox_unavailable at
+#   A  Core takes 8.7 s per call (26 s per verdict): the request goes through
+#   B  Core takes 10 s per call (30 s): explicit deny openbox_unavailable at
 #      29 s, before the gateway's 30 s, so the sandbox sees OpenBox's reason
 #   C  the old 450 ms door guard default with the same 9 s Core: denied at
 #      once. This is what the change fixes
-#   D  (informational, needs internet) the same 17 s allow to example.com
+#   D  (informational, needs internet) a 25.5 s allow to example.com
 #      gets no response: OpenShell opens the upstream connection before the
 #      verdict and example.com drops it after ~15 s idle. A real destination's
 #      idle timeout, not only the 30 s, bounds how slow a verdict can be
@@ -256,21 +257,21 @@ else
   fail "0 fast Core: expected 200 via the door guard, got '$CODE' (evals: $(evals)) [$(raw)]; the rest is meaningless"
 fi
 
-start_stack 13
+start_stack 8.7
 request
 if [ "$CODE" = 200 ] && [ "$SECS" -ge 25 ] && last_eval | grep -q 'decision=allow'; then
-  pass "A Core 13 s per call (26 s verdict): allowed after ${SECS}s"
+  pass "A Core 8.7 s per call (26 s verdict): allowed after ${SECS}s"
 else
-  fail "A Core 13 s per call: expected 200 after ~26 s, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
+  fail "A Core 8.7 s per call: expected 200 after ~26 s, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
 fi
 
-start_stack 15
+start_stack 10
 request
 if [ "$CODE" = 403 ] && [ "$SECS" -ge 28 ] && [ "$SECS" -le 31 ] &&
   last_eval | grep -q 'reason_code=openbox_unavailable'; then
-  pass "B Core 15 s per call (30 s verdict): explicit openbox_unavailable deny after ${SECS}s"
+  pass "B Core 10 s per call (30 s verdict): explicit openbox_unavailable deny after ${SECS}s"
 else
-  fail "B Core 15 s per call: expected 403 openbox_unavailable at ~29 s, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
+  fail "B Core 10 s per call: expected 403 openbox_unavailable at ~29 s, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
 fi
 
 start_stack 9 450
@@ -284,18 +285,18 @@ fi
 start_stack 8.5
 request example.com 80
 if [ -z "$CODE" ]; then
-  echo "INFO  D example.com, 17 s allow: no response after ${SECS}s (its ~15 s idle timeout dropped the upstream)"
+  echo "INFO  D example.com, 25.5 s allow: no response after ${SECS}s (its ~15 s idle timeout dropped the upstream)"
 else
-  echo "INFO  D example.com, 17 s allow: got '$CODE' after ${SECS}s (not the idle drop; see the door guard log)"
+  echo "INFO  D example.com, 25.5 s allow: got '$CODE' after ${SECS}s (not the idle drop; see the door guard log)"
 fi
 
-# E: the D verdict (~17 s) is visible in the latency histogram, not lumped
+# E: the D evaluation (two calls, ~17 s) is visible in the latency histogram, not lumped
 # into +Inf above a 10 s top bucket.
 M=$(curl -s "http://127.0.0.1:$((MW_PORT + 1))/metrics")
 b15=$(echo "$M" | awk -F' ' '/^openbox_mw_evaluation_duration_seconds_bucket\{le="15"\}/{print $2}')
 b20=$(echo "$M" | awk -F' ' '/^openbox_mw_evaluation_duration_seconds_bucket\{le="20"\}/{print $2}')
 if [ "$b15" = 0 ] && [ "$b20" = 1 ]; then
-  pass "E /metrics: the ~17 s verdict falls in the 15-20 s bucket"
+  pass "E /metrics: the ~17 s evaluation falls in the 15-20 s bucket"
 else
   fail "E /metrics: expected le=15 0 and le=20 1, got le=15 '$b15' le=20 '$b20'"
 fi

@@ -2,9 +2,11 @@
 //!
 //! Each `OpenShell` sandbox is one Core session: `workflow_id` and `run_id`
 //! are the sandbox id, announced once with `WorkflowStarted`. Every evaluated
-//! request is an `ActivityStarted` hook event carrying one span that describes
-//! the HTTP or MCP call, so policy, guardrails and behavioral rules see it the
-//! same way they see SDK-instrumented traffic, and its response closes it with
+//! request follows the SDK sequence: a plain `ActivityStarted` opens the
+//! activity, then an `ActivityStarted` hook event carries one started span
+//! that describes the HTTP or MCP call, so policy, guardrails and behavioral
+//! rules see it the same way they see SDK-instrumented traffic. Its response
+//! sends the span again, completed, and closes the activity with
 //! `ActivityCompleted` under the same `activity_id`. Each request is its own
 //! activity (`oshx-<request id>`); an approval retry reuses the activity Core
 //! holds the approval on, which the guard looks up by the action fingerprint.
@@ -313,12 +315,24 @@ impl CoreClient {
         self.evaluate(&payload, &key).await
     }
 
-    /// Asks Core for a verdict on one action.
+    /// Asks Core for a verdict on one action. A new activity is opened first
+    /// with a plain `ActivityStarted`: Core stores a hook span only on an
+    /// activity whose event already exists, and evaluates but drops one sent
+    /// with the activity's first `ActivityStarted`. An approval retry reuses
+    /// an activity Core already holds, so it goes straight to the hook.
     pub async fn evaluate_action(
         &self,
         action: &Action,
         activity_id: &str,
     ) -> Result<CoreDecision, CoreError> {
+        if activity_id == request_activity_id(&action.request_id) {
+            let payload = activity_event(action, activity_id, SystemTime::now());
+            let key = format!("ast-{}-{}", action.sandbox_id, action.request_id);
+            let opened = self.evaluate(&payload, &idempotency_key(&key)).await?;
+            if !matches!(opened.verdict, Verdict::Allow | Verdict::Constrain) {
+                return Ok(opened);
+            }
+        }
         let payload = action_event(
             action,
             activity_id,
@@ -344,12 +358,22 @@ impl CoreClient {
         self.evaluate(&payload, &idempotency_key(&key)).await
     }
 
-    /// Closes an activity when its response comes back. A notification: the
-    /// response is already on its way to the sandbox.
+    /// Closes an activity when its response comes back: the request's span,
+    /// completed, then `ActivityCompleted`. A notification: the response is
+    /// already on its way to the sandbox. A span Core does not take still
+    /// lets the activity close.
     pub async fn complete_activity(
         &self,
         completion: &Completion,
     ) -> Result<CoreDecision, CoreError> {
+        let span = completed_span_event(completion, SystemTime::now());
+        let key = format!("acs-{}-{}", completion.sandbox_id, completion.request_id);
+        if let Err(error) = self.evaluate(&span, &idempotency_key(&key)).await {
+            eprintln!(
+                "openbox: completed span for request_id={} not recorded: {error}",
+                completion.request_id
+            );
+        }
         let payload = completion_event(completion, SystemTime::now());
         let key = format!("acd-{}-{}", completion.sandbox_id, completion.request_id);
         self.evaluate(&payload, &idempotency_key(&key)).await
@@ -780,9 +804,10 @@ fn action_event(action: &Action, activity_id: &str, body_limit: usize, now: Syst
             );
         }
     }
+    let (span_id, trace_id) = span_ids(&action.request_id);
     let span = json!({
-        "span_id": random_hex(8),
-        "trace_id": random_hex(16),
+        "span_id": span_id,
+        "trace_id": trace_id,
         "name": format!("HTTP {}", action.method),
         "kind": "CLIENT",
         "stage": "started",
@@ -826,6 +851,79 @@ fn action_event(action: &Action, activity_id: &str, body_limit: usize, now: Syst
             "ancestors": action.process_ancestors,
         }},
     })
+}
+
+/// The plain `ActivityStarted` that opens an activity: its input, no span.
+fn activity_event(action: &Action, activity_id: &str, now: SystemTime) -> Value {
+    let mut event = action_event(action, activity_id, 0, now);
+    event["hook_trigger"] = json!(false);
+    event["span_count"] = json!(0);
+    event["spans"] = json!([]);
+    event
+}
+
+/// The request's span again, completed with its response: a hook
+/// `ActivityStarted` under the same activity, span and trace ids, stage
+/// `completed`.
+fn completed_span_event(completion: &Completion, now: SystemTime) -> Value {
+    let (span_id, trace_id) = span_ids(&completion.request_id);
+    let end_ns = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let duration_ns = completion
+        .duration_ms
+        .map_or(0, |ms| ms.saturating_mul(1_000_000));
+    let span = json!({
+        "span_id": span_id,
+        "trace_id": trace_id,
+        "name": format!("HTTP {}", completion.method),
+        "kind": "CLIENT",
+        "stage": "completed",
+        "start_time": end_ns.saturating_sub(duration_ns),
+        "end_time": end_ns,
+        "duration_ns": duration_ns,
+        "attributes": {
+            "http.request.method": completion.method,
+            "url.full": completion.url,
+            "http.response.status_code": completion.status_code,
+            "openshell.sandbox_id": completion.sandbox_id,
+            "openshell.request_id": completion.request_id,
+        },
+        "status": {"code": if completion.status_code >= 500 { "ERROR" } else { "OK" }},
+        "events": [],
+        "hook_type": if completion.activity_type.starts_with("MCP ") { "mcp" } else { "http_request" },
+        "http_method": completion.method,
+        "http_url": completion.url,
+        "request_headers": {},
+        "http_status_code": completion.status_code,
+    });
+    json!({
+        "source": "workflow-telemetry",
+        "event_type": "ActivityStarted",
+        "workflow_id": completion.sandbox_id,
+        "run_id": completion.sandbox_id,
+        "workflow_type": WORKFLOW_TYPE,
+        "task_queue": TASK_QUEUE,
+        "activity_id": completion.activity_id,
+        "activity_type": completion.activity_type,
+        "attempt": 1,
+        "timestamp": rfc3339_micros(now),
+        "hook_trigger": true,
+        "span_count": 1,
+        "spans": [span],
+        "metadata": {"openshell": {
+            "sandbox_id": completion.sandbox_id,
+            "request_id": completion.request_id,
+        }},
+    })
+}
+
+/// A request's span and trace ids, derived from its request id so its
+/// started and completed spans pair up, and a resent request names the same
+/// span.
+fn span_ids(request_id: &str) -> (String, String) {
+    let digest = Sha256::digest(request_id.as_bytes());
+    (hex(&digest[..8]), hex(&digest[8..24]))
 }
 
 pub fn request_url(action: &Action) -> String {
@@ -1057,6 +1155,48 @@ mod tests {
             "https://mcp.example.com:8443/v1/charge?dry_run=1"
         );
         assert_eq!(span["request_body"], "0123");
+    }
+
+    #[test]
+    fn an_activity_opens_without_a_span_before_its_hook() {
+        let action = Action::from_evaluation(&evaluation("GET", "/", b""));
+        let opened = activity_event(&action, "oshx-req-1", UNIX_EPOCH);
+        assert_eq!(opened["event_type"], "ActivityStarted");
+        assert_eq!(opened["hook_trigger"], false);
+        assert_eq!(opened["span_count"], 0);
+        assert_eq!(opened["spans"], json!([]));
+        assert_eq!(opened["activity_id"], "oshx-req-1");
+        assert_eq!(opened["activity_input"][0]["method"], "GET");
+    }
+
+    #[test]
+    fn a_response_completes_the_requests_span() {
+        let action = Action::from_evaluation(&evaluation("GET", "/", b""));
+        let started = action_event(&action, "oshx-req-1", 1024, UNIX_EPOCH);
+        let completion = Completion {
+            sandbox_id: action.sandbox_id.clone(),
+            request_id: action.request_id,
+            activity_id: "oshx-req-1".to_owned(),
+            activity_type: "GET mcp.example.com".to_owned(),
+            method: "GET".to_owned(),
+            url: "https://mcp.example.com/".to_owned(),
+            status_code: 503,
+            duration_ms: Some(12),
+        };
+        let event = completed_span_event(&completion, UNIX_EPOCH + Duration::from_secs(1));
+        assert_eq!(event["event_type"], "ActivityStarted");
+        assert_eq!(event["hook_trigger"], true);
+        assert_eq!(event["activity_id"], "oshx-req-1");
+        let span = &event["spans"][0];
+        assert_eq!(span["stage"], "completed");
+        assert_eq!(span["span_id"], started["spans"][0]["span_id"]);
+        assert_eq!(span["trace_id"], started["spans"][0]["trace_id"]);
+        assert_eq!(span["end_time"], 1_000_000_000_u64);
+        assert_eq!(span["duration_ns"], 12_000_000_u64);
+        assert_eq!(span["start_time"], 988_000_000_u64);
+        assert_eq!(span["http_status_code"], 503);
+        assert_eq!(span["status"]["code"], "ERROR");
+        assert_eq!(span["hook_type"], "http_request");
     }
 
     #[test]
