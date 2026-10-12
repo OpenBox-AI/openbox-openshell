@@ -1128,6 +1128,11 @@ mod tests {
             Some(1_790_674_275)
         );
         assert_eq!(parse_rfc3339("2026-09-29T09:31:15Z"), Some(1_790_674_275));
+        // Go's time.Time, as Core sends `approval_expiration_time`.
+        assert_eq!(
+            parse_rfc3339("2026-09-29T09:31:15.359123456Z"),
+            Some(1_790_674_275)
+        );
         assert_eq!(
             parse_rfc3339("2026-09-29T16:31:15+07:00"),
             Some(1_790_674_275)

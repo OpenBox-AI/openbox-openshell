@@ -69,6 +69,7 @@ use crate::agent;
 use crate::core_client::{
     Activity, ApprovalState, Completion, CoreDecision, CoreError, LLM_CALL, Outcome, Verdict,
     activity_name, request_activity_id, request_url, span_ids, started_span, tool_activity_id,
+    unix_now,
 };
 use crate::metrics::{CoreCall, Metrics};
 use crate::prompt::{self, Capture};
@@ -77,8 +78,13 @@ use crate::store::{
     MemoryStore, SharedStore, approval_key, open_tools_key, prompt_key, request_key, tool_key,
 };
 
-/// How long an approval can be matched by its retry, unless configured.
+/// How long an approval can be matched by its retry when Core sends no
+/// expiry with the verdict, unless configured.
 pub const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(15 * 60);
+/// Kept past Core's approval expiry, for clock skew between the door guard and
+/// Core. Outliving the window is harmless: the retry's poll finds the approval
+/// gone and scores the request afresh.
+const APPROVAL_SKEW: Duration = Duration::from_secs(60);
 /// How long a request waits for its response to complete its activity.
 const REQUEST_TTL: Duration = Duration::from_secs(60 * 60);
 /// Most a background Core call may hold a sandbox's queue.
@@ -413,7 +419,15 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             && decision.verdict == Verdict::RequireApproval
             && let Err(error) = self
                 .store
-                .set(&approval, &activity.id, Some(self.approval_ttl))
+                .set(
+                    &approval,
+                    &activity.id,
+                    Some(approval_hold(
+                        decision.approval_expires_at,
+                        unix_now(),
+                        self.approval_ttl,
+                    )),
+                )
                 .await
         {
             eprintln!(
@@ -1193,6 +1207,15 @@ fn truncate(text: &str, max: usize) -> String {
     text[..end].to_owned()
 }
 
+/// How long the door guard remembers a pending approval: until Core's own
+/// expiry for it (the agent's `approval_wait_time`), or `fallback` when Core
+/// sends none.
+fn approval_hold(expires_at: Option<i64>, now: i64, fallback: Duration) -> Duration {
+    expires_at.map_or(fallback, |at| {
+        Duration::from_secs(u64::try_from(at.saturating_sub(now)).unwrap_or(0)) + APPROVAL_SKEW
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1206,6 +1229,8 @@ pub(crate) mod tests {
         pub session: Mutex<VecDeque<Result<Verdict, ()>>>,
         pub verdicts: Mutex<VecDeque<Result<Verdict, ()>>>,
         pub approvals: Mutex<VecDeque<Result<ApprovalState, ()>>>,
+        /// Sent with every verdict, as Core's `approval_expiration_time`.
+        pub approval_expires_at: Option<i64>,
         pub session_calls: AtomicUsize,
         pub evaluate_calls: AtomicUsize,
         pub approval_calls: AtomicUsize,
@@ -1313,7 +1338,10 @@ pub(crate) mod tests {
                 .pop_front()
                 .expect("unexpected evaluation");
             match next {
-                Ok(verdict) => Ok(decision(verdict)),
+                Ok(verdict) => Ok(CoreDecision {
+                    approval_expires_at: self.approval_expires_at,
+                    ..decision(verdict)
+                }),
                 Err(()) => Err(CoreError::Status(500)),
             }
         }
@@ -1565,6 +1593,78 @@ pub(crate) mod tests {
             .await;
         assert!(is_allow(&approved));
         assert_eq!(core.evaluated.lock().unwrap()[1], "oshx-req-1");
+    }
+
+    /// Remembers the TTL of every entry written.
+    #[derive(Default)]
+    struct TtlStore {
+        inner: MemoryStore,
+        ttls: Mutex<Vec<(String, Option<Duration>)>>,
+    }
+
+    #[tonic::async_trait]
+    impl SharedStore for TtlStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, String> {
+            self.inner.get(key).await
+        }
+        async fn set(&self, key: &str, value: &str, ttl: Option<Duration>) -> Result<(), String> {
+            self.ttls.lock().unwrap().push((key.to_owned(), ttl));
+            self.inner.set(key, value, ttl).await
+        }
+        async fn take(&self, key: &str) -> Result<Option<String>, String> {
+            self.inner.take(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), String> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[test]
+    fn a_pending_approval_is_held_for_cores_window() {
+        let fallback = DEFAULT_APPROVAL_TTL;
+        assert_eq!(
+            approval_hold(Some(1_000 + 30 * 60), 1_000, fallback),
+            Duration::from_secs(30 * 60) + APPROVAL_SKEW,
+            "Core's 30 min default outlives the old fixed 15 min"
+        );
+        assert_eq!(approval_hold(None, 1_000, fallback), fallback);
+        assert_eq!(
+            approval_hold(Some(900), 1_000, fallback),
+            APPROVAL_SKEW,
+            "an expiry already past is not a negative TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_is_remembered_until_core_says_it_expires() {
+        // Regression (PROD-890): an approval given between minute 15 and
+        // Core's 30 min window was lost, because the door guard forgot the
+        // pending activity after a fixed 15 min.
+        let store = Arc::new(TtlStore::default());
+        let shared: Arc<dyn SharedStore> = store.clone();
+        let core = Arc::new(FakeCore {
+            approval_expires_at: Some(unix_now() + 30 * 60),
+            ..FakeCore::with_verdicts(&[Verdict::RequireApproval])
+        });
+        let guard = Guard::with_store(
+            Arc::clone(&core),
+            Arc::new(FakeStopper::default()),
+            shared,
+            DEFAULT_APPROVAL_TTL,
+        );
+        let held = guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        assert_eq!(held.reason_code, REASON_APPROVAL_REQUIRED);
+        let ttls = store.ttls.lock().unwrap();
+        let (_, ttl) = ttls
+            .iter()
+            .find(|(key, _)| key.starts_with("openbox:approval:"))
+            .expect("the pending approval is recorded");
+        let ttl = ttl.expect("an approval entry expires");
+        assert!(
+            ttl > Duration::from_secs(29 * 60)
+                && ttl <= Duration::from_secs(30 * 60) + APPROVAL_SKEW,
+            "held for Core's window, not the fallback: {ttl:?}"
+        );
     }
 
     #[tokio::test]
