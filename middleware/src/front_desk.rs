@@ -145,6 +145,21 @@ pub fn required_attachment(policy: &Value) -> Value {
     })
 }
 
+/// `OpenShell`'s restrictive default sandbox policy (`openshell-policy`
+/// `restrictive_default_policy`): standard system paths, Landlock best
+/// effort, no network rules of its own.
+fn default_policy() -> Value {
+    json!({
+        "version": 1,
+        "filesystem": {
+            "includeWorkdir": true,
+            "readOnly": ["/bin", "/usr", "/lib", "/proc", "/dev/urandom", "/etc", "/var/log"],
+            "readWrite": ["/tmp", "/dev/null"],
+        },
+        "landlock": { "compatibility": "best_effort" },
+    })
+}
+
 /// Patches for `CreateSandbox` in `modify_operation`.
 pub fn modify_create_sandbox(operation: &Value) -> Result<Vec<Patch>, Refusal> {
     let spec = operation.get("spec");
@@ -166,10 +181,30 @@ pub fn modify_create_sandbox(operation: &Value) -> Result<Vec<Patch>, Refusal> {
                 value: Value::Object(middlewares),
             });
         }
-        // No policy yet: the gateway fills in its default. Without network
-        // policies there is no egress for the middleware to govern, and the
-        // validate phase still checks whatever the gateway prepared.
-        _ => {}
+        // No policy: the gateway leaves it to the sandbox, which falls back
+        // to OpenShell's restrictive default with no attachment, and the
+        // provider rules merged into it (`_provider_<name>`) would bypass
+        // OpenBox. Set that default here, governed: OpenShell's documented
+        // way for an interceptor to apply an approved initial policy. A
+        // policy shipped inside the image is then not picked up; pass
+        // `--policy` to use one.
+        _ => {
+            let mut policy = default_policy();
+            policy["networkMiddlewares"] = json!({ ATTACHMENT_KEY: required_attachment(&policy) });
+            patches.push(if spec.is_some_and(Value::is_object) {
+                Patch {
+                    op: "add",
+                    path: "/spec/policy".to_owned(),
+                    value: policy,
+                }
+            } else {
+                Patch {
+                    op: "add",
+                    path: "/spec".to_owned(),
+                    value: json!({ "policy": policy }),
+                }
+            });
+        }
     }
     let labels_path = if operation.get("labels").is_some_and(Value::is_object) {
         format!(
@@ -382,6 +417,36 @@ mod tests {
     }
 
     #[test]
+    fn create_without_a_policy_gets_openshells_default_governed() {
+        for operation in [
+            json!({"name": "pi", "spec": {"template": {"image": "pi-agent:local"}, "providers": ["openrouter"]}}),
+            json!({"name": "pi", "spec": {"policy": null}}),
+            json!({"name": "pi"}),
+        ] {
+            let patched = apply(&operation, &modify_create_sandbox(&operation).unwrap());
+            let policy = &patched["spec"]["policy"];
+            assert_eq!(policy["version"], 1);
+            assert_eq!(policy["filesystem"]["includeWorkdir"], true);
+            assert_eq!(
+                policy["filesystem"]["readWrite"],
+                json!(["/tmp", "/dev/null"])
+            );
+            assert_eq!(policy["landlock"]["compatibility"], "best_effort");
+            let attachment = &policy["networkMiddlewares"]["openbox"];
+            assert_eq!(attachment["middleware"], MIDDLEWARE_NAME);
+            assert_eq!(attachment["onError"], "fail_closed");
+            assert_eq!(attachment["endpoints"]["include"], json!([ALL_HOSTS]));
+            // What else the request carried is kept, and the result passes
+            // the validate phase.
+            if operation.pointer("/spec/template").is_some() {
+                assert_eq!(patched["spec"]["template"]["image"], "pi-agent:local");
+                assert_eq!(patched["spec"]["providers"], json!(["openrouter"]));
+            }
+            validate_create_sandbox(&patched).unwrap();
+        }
+    }
+
+    #[test]
     fn create_keeps_other_middleware_and_orders_openbox_after_it() {
         let mut policy = policy();
         policy["networkMiddlewares"] = json!({
@@ -423,11 +488,11 @@ mod tests {
 
     #[test]
     fn a_policy_without_egress_needs_no_attachment() {
+        // An explicit policy with no network rules validates as is. A missing
+        // policy is another matter: provider rules add egress to it later
+        // (see `create_without_a_policy_gets_openshells_default_governed`).
         let operation = json!({"spec": {"policy": {"version": 1}}});
         assert_eq!(validate_create_sandbox(&operation), Ok(()));
-        let operation = json!({"spec": {}});
-        let patches = modify_create_sandbox(&operation).unwrap();
-        assert_eq!(patches.len(), 1, "only the label");
     }
 
     #[test]
