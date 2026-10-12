@@ -30,6 +30,7 @@ use crate::core_client::{Activity, CoreClient, Outcome};
 use crate::interceptor::{Inventory, InventoryEvent};
 use crate::inventory::RuntimeEnvironment;
 use crate::store::{SharedStore, open_tools_key, session_key, tool_key};
+use crate::telemetry;
 
 /// The two Core calls a sandbox's lifecycle needs.
 #[tonic::async_trait]
@@ -190,14 +191,24 @@ impl Inventory for SessionLifecycle {
                         );
                     }
                     let core = Arc::clone(&self.core);
-                    tokio::spawn(async move {
-                        match core.start(&id, &name, &input).await {
-                            Ok(()) => eprintln!("openbox: session started sandbox_id={id}"),
-                            Err(error) => {
-                                eprintln!("openbox: session start failed sandbox_id={id}: {error}");
+                    let attributes = vec![telemetry::sandbox(&id)];
+                    tokio::spawn(telemetry::job(
+                        "openbox.session.start",
+                        attributes,
+                        async move {
+                            let started = core.start(&id, &name, &input);
+                            match telemetry::call("openbox.core.session_start", Vec::new(), started)
+                                .await
+                            {
+                                Ok(()) => eprintln!("openbox: session started sandbox_id={id}"),
+                                Err(error) => {
+                                    eprintln!(
+                                        "openbox: session start failed sandbox_id={id}: {error}"
+                                    );
+                                }
                             }
-                        }
-                    });
+                        },
+                    ));
                 }
             }
             // Empty for ALREADY_ABSENT: nothing was deleted by this call.
@@ -213,22 +224,36 @@ impl Inventory for SessionLifecycle {
                         .map(|started| unix_millis().saturating_sub(started));
                     let tools = self.open_tools(&id).await;
                     let core = Arc::clone(&self.core);
-                    tokio::spawn(async move {
-                        for (tool, opened) in tools {
-                            if let Err(error) = core.close_tool(&id, &tool, opened).await {
-                                eprintln!(
-                                    "openbox: tool activity {} left open sandbox_id={id}: {error}",
-                                    tool.id
-                                );
+                    let attributes = vec![telemetry::sandbox(&id)];
+                    tokio::spawn(telemetry::job(
+                        "openbox.session.end",
+                        attributes,
+                        async move {
+                            for (tool, opened) in tools {
+                                let closed = core.close_tool(&id, &tool, opened);
+                                if let Err(error) =
+                                    telemetry::call("openbox.core.close_tool", Vec::new(), closed)
+                                        .await
+                                {
+                                    eprintln!(
+                                        "openbox: tool activity {} left open sandbox_id={id}: {error}",
+                                        tool.id
+                                    );
+                                }
                             }
-                        }
-                        match core.end(&id, duration).await {
-                            Ok(()) => eprintln!("openbox: session completed sandbox_id={id}"),
-                            Err(error) => {
-                                eprintln!("openbox: session end failed sandbox_id={id}: {error}");
+                            let ended = core.end(&id, duration);
+                            match telemetry::call("openbox.core.session_end", Vec::new(), ended)
+                                .await
+                            {
+                                Ok(()) => eprintln!("openbox: session completed sandbox_id={id}"),
+                                Err(error) => {
+                                    eprintln!(
+                                        "openbox: session end failed sandbox_id={id}: {error}"
+                                    );
+                                }
                             }
-                        }
-                    });
+                        },
+                    ));
                 }
             }
             InventoryEvent::PolicyChanged { .. } => {}

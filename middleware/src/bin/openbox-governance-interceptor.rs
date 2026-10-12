@@ -33,6 +33,10 @@
 //!   `OPENBOX_REDIS_URL`               shared store for each session's start
 //!                                     time, so any replica can close it with a
 //!                                     duration; in process without it
+//!
+//! Traces: `OTEL_EXPORTER_OTLP_ENDPOINT` exports a span per intercepted call
+//! and per session start and end over OTLP/gRPC (see [`telemetry`]); off
+//! when unset.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -47,6 +51,7 @@ use openbox_verdict_middleware::inventory::{
 };
 use openbox_verdict_middleware::sessions::SessionLifecycle;
 use openbox_verdict_middleware::store::{MemoryStore, RedisStore, SharedStore};
+use openbox_verdict_middleware::telemetry;
 use openbox_verdict_middleware::token::TokenVerifier;
 use openshell_core::proto::gateway_interceptor::v1::gateway_interceptor_server::GatewayInterceptorServer;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -68,7 +73,19 @@ fn required(key: &str) -> Result<String, String> {
 async fn main() -> ExitCode {
     // openshell-core enables aws-lc-rs next to our ring; choose explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    match run().await {
+    let telemetry = match telemetry::init("openbox-governance-interceptor") {
+        Ok(telemetry) => telemetry,
+        Err(error) => {
+            eprintln!("openbox-governance-interceptor: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = run().await;
+    // After the server stops, so the spans of the last requests are sent.
+    if let Some(telemetry) = telemetry {
+        let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
+    }
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("openbox-governance-interceptor: {error}");

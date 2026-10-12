@@ -44,6 +44,8 @@
 #   OBX_MW_PORT             door guard, default 50351 (+1 admin)
 #   OBX_FD_PORT             front desk, default 50371 (+1 inventory)
 #   OBX_MODEL_PORT          the demo's stand-in model, default 17995
+#   OTEL_EXPORTER_OTLP_ENDPOINT   OTLP/gRPC collector both services send their
+#                           traces to, e.g. http://localhost:4317; unset, none
 set -eu
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -175,6 +177,8 @@ up() {
   creds="OPENBOX_URL=$core OPENBOX_API_KEY_FILE=$DIR/creds/api-key OPENBOX_WORKLOAD_KEY_FILE=$DIR/creds/workload.pem OPENBOX_WORKLOAD_KID=$kid OPENBOX_REDIS_URL=$REDIS"
   inventory=
   [ "$BACKEND" = - ] || inventory="OPENBOX_BACKEND_URL=$BACKEND"
+  otel=
+  [ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ] || otel="OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_EXPORTER_OTLP_ENDPOINT"
 
   # The gateway's certificates first: the front desk reconciles over the
   # gateway API with its client certificate and reads it at startup.
@@ -186,12 +190,12 @@ up() {
   cp "$DIR/tls/ca.crt" "$DIR/gwclient/ca.crt"
   cp "$DIR/tls/client/tls.crt" "$DIR/tls/client/tls.key" "$DIR/gwclient/"
   say "== Start the door guard on :$MW_PORT and the front desk on :$FD_PORT/:$INV_PORT"
-  env $creds OPENBOX_MW_INSECURE=1 OPENBOX_MW_LISTEN=0.0.0.0:$MW_PORT \
+  env $creds $otel OPENBOX_MW_INSECURE=1 OPENBOX_MW_LISTEN=0.0.0.0:$MW_PORT \
     OPENBOX_MW_ADMIN_LISTEN=127.0.0.1:$((MW_PORT + 1)) \
     "$HERE/target/debug/openbox-verdict-middleware" >"$DIR/door-guard.log" 2>&1 &
   echo $! >"$DIR/door-guard.pid"
   wait_listen "$MW_PORT" door-guard
-  env $creds $inventory OPENBOX_FD_INSECURE=1 OPENBOX_FD_LISTEN=127.0.0.1:$FD_PORT \
+  env $creds $inventory $otel OPENBOX_FD_INSECURE=1 OPENBOX_FD_LISTEN=127.0.0.1:$FD_PORT \
     OPENBOX_FD_INVENTORY_LISTEN=127.0.0.1:$INV_PORT OPENBOX_FD_GATEWAY_ID=$GATEWAY_NAME \
     OPENBOX_GATEWAY_ENDPOINT=https://localhost:$GW_PORT OPENBOX_GATEWAY_MTLS_DIR=$DIR/gwclient \
     "$HERE/target/debug/openbox-governance-interceptor" >"$DIR/front-desk.log" 2>&1 &

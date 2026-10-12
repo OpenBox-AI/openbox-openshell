@@ -18,6 +18,9 @@ path = "src/lib.rs"
 base64 = "0.22"
 # Must stay on the same revision as the root crate; tests/pin.rs enforces it.
 openshell-core = { version = "=0.0.0", git = "https://github.com/NVIDIA/OpenShell.git", rev = "6648bd0c290efbc41ba131ee9831ee45cd431f94", default-features = false }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic", "tls-aws-lc", "tls-roots"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 prost = "0.14"
 prost-types = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
@@ -53,4 +56,5 @@ ref_option = "allow"
 missing_fields_in_debug = "allow"
 
 [dev-dependencies]
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 tokio = { version = "1.43", features = ["test-util"] }

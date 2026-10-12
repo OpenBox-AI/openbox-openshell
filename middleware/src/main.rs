@@ -39,6 +39,8 @@
 //!   `OPENBOX_PROMPT_CAPTURE`          what Core receives for a user prompt read
 //!                                     from a model call: `text` (default),
 //!                                     `hash` (SHA-256 and length), `off`
+//!   `OTEL_EXPORTER_OTLP_ENDPOINT`     export a trace per verdict over OTLP/gRPC
+//!                                     (see [`telemetry`]); off when unset
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -57,6 +59,7 @@ use openbox_verdict_middleware::metrics::serve_admin;
 use openbox_verdict_middleware::prompt::Capture;
 use openbox_verdict_middleware::service::VerdictMiddleware;
 use openbox_verdict_middleware::store::{MemoryStore, RedisStore, SharedStore};
+use openbox_verdict_middleware::telemetry;
 use openbox_verdict_middleware::token::TokenVerifier;
 use openshell_core::proto::middleware::v1::http_response_pre_return_server::HttpResponsePreReturnServer;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddlewareServer;
@@ -102,7 +105,19 @@ fn number<T: std::str::FromStr>(key: &str, default: T) -> Result<T, String> {
 async fn main() -> ExitCode {
     // openshell-core enables aws-lc-rs next to our ring; choose explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    match run().await {
+    let telemetry = match telemetry::init("openbox-verdict-middleware") {
+        Ok(telemetry) => telemetry,
+        Err(error) => {
+            eprintln!("openbox-verdict-middleware: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = run().await;
+    // After the server stops, so the spans of the last requests are sent.
+    if let Some(telemetry) = telemetry {
+        let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
+    }
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("openbox-verdict-middleware: {error}");

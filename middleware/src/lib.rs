@@ -18,4 +18,5 @@ pub mod sequence;
 pub mod service;
 pub mod sessions;
 pub mod store;
+pub mod telemetry;
 pub mod token;
