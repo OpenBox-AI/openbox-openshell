@@ -72,6 +72,7 @@ use crate::core_client::{
 };
 use crate::metrics::{CoreCall, Metrics};
 use crate::prompt::{self, Capture};
+use crate::sequence::Sequencer;
 use crate::store::{
     MemoryStore, SharedStore, approval_key, open_tools_key, prompt_key, request_key, tool_key,
 };
@@ -80,6 +81,8 @@ use crate::store::{
 pub const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(15 * 60);
 /// How long a request waits for its response to complete its activity.
 const REQUEST_TTL: Duration = Duration::from_secs(60 * 60);
+/// Most a background Core call may hold a sandbox's queue.
+const SEQUENCED_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a tool the model asked for is tracked, open or closed.
 const TOOL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a signalled prompt turn is remembered. Conversations resent
@@ -249,6 +252,8 @@ pub struct Guard<G, S: ?Sized> {
     halted: Arc<Mutex<HashSet<String>>>,
     metrics: Arc<Metrics>,
     core_budget: Duration,
+    /// Keeps each sandbox's events in the order they happened.
+    sequence: Arc<Sequencer>,
 }
 
 impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
@@ -276,6 +281,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             capture: Capture::default(),
             sessions: Mutex::new(HashSet::new()),
             halted: Arc::new(Mutex::new(HashSet::new())),
+            sequence: Sequencer::new(SEQUENCED_CALL_TIMEOUT),
             metrics: Arc::new(Metrics::default()),
             core_budget: DEFAULT_CORE_BUDGET,
         }
@@ -357,6 +363,9 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     }
 
     async fn decide_with_core(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
+        // Everything the sandbox did before this request reaches Core first,
+        // and nothing after it until its verdict is in.
+        let _turn = self.sequence.turn(&action.sandbox_id).await;
         if let Some(result) = self.ensure_session(action).await {
             return result;
         }
@@ -459,8 +468,9 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             duration_ms: None,
         };
         let governance = Arc::clone(&self.governance);
+        let queue = sandbox_id.to_owned();
         let sandbox_id = sandbox_id.to_owned();
-        tokio::spawn(async move {
+        self.sequence.push(&queue, async move {
             if let Err(error) = governance
                 .close_activity(&sandbox_id, &activity, &outcome)
                 .await
@@ -637,7 +647,8 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         }
         let governance = Arc::clone(&self.governance);
         let store = Arc::clone(&self.store);
-        tokio::spawn(async move {
+        let queue = completion.sandbox_id.clone();
+        self.sequence.push(&queue, async move {
             let sandbox_id = &completion.sandbox_id;
             if let Err(error) = governance.complete_request(&completion).await {
                 eprintln!(
@@ -792,10 +803,10 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         }
     }
 
-    /// Closes the tools whose results a model call sends back. A result for a
-    /// tool never seen open (its reply could not be read) still records the
-    /// tool, from the call the conversation carries. The store is updated
-    /// here; Core hears in the background.
+    /// Closes the tools whose results a model call sends back, before the
+    /// model call's own activity opens. A result for a tool never seen open
+    /// (its reply could not be read) still records the tool, from the call
+    /// the conversation carries. Runs inside the model call's turn.
     async fn close_tools(&self, sandbox_id: &str, model: &agent::ModelCall) {
         let limit = self.governance.body_limit();
         let mut closing = Vec::new();
@@ -860,27 +871,24 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 Some(TOOL_TTL),
             )
             .await;
-        let governance = Arc::clone(&self.governance);
-        let sandbox_id = sandbox_id.to_owned();
-        tokio::spawn(async move {
-            for (call_id, tool, opened, outcome) in closing {
-                if !opened && let Err(error) = governance.open_activity(&sandbox_id, &tool).await {
-                    eprintln!("openbox: tool activity {} not opened: {error}", tool.id);
-                }
-                match governance
-                    .close_activity(&sandbox_id, &tool, &outcome)
-                    .await
-                {
-                    Ok(_) => eprintln!(
-                        "openbox: tool closed sandbox_id={sandbox_id} activity_id={} tool={} call_id={call_id}",
-                        tool.id, tool.kind
-                    ),
-                    Err(error) => {
-                        eprintln!("openbox: tool activity {} not closed: {error}", tool.id);
-                    }
+        for (call_id, tool, opened, outcome) in closing {
+            if !opened && let Err(error) = self.governance.open_activity(sandbox_id, &tool).await {
+                eprintln!("openbox: tool activity {} not opened: {error}", tool.id);
+            }
+            match self
+                .governance
+                .close_activity(sandbox_id, &tool, &outcome)
+                .await
+            {
+                Ok(_) => eprintln!(
+                    "openbox: tool closed sandbox_id={sandbox_id} activity_id={} tool={} call_id={call_id}",
+                    tool.id, tool.kind
+                ),
+                Err(error) => {
+                    eprintln!("openbox: tool activity {} not closed: {error}", tool.id);
                 }
             }
-        });
+        }
     }
 
     async fn ensure_session(&self, action: &Action) -> Option<HttpRequestResult> {
@@ -1069,7 +1077,12 @@ fn fallback_span(response: &ResponseSeen, activity_id: &str) -> Value {
         "name": format!("HTTP {}", response.method),
         "kind": "CLIENT",
         "stage": "started",
-        "attributes": {},
+        "attributes": {
+            "http.method": response.method,
+            "http.url": response.url,
+            "http.request.method": response.method,
+            "url.full": response.url,
+        },
         "status": {"code": "UNSET", "description": null},
         "events": [],
         "hook_type": "http_request",
@@ -1207,6 +1220,8 @@ pub(crate) mod tests {
         pub closed: Mutex<Vec<(Activity, Outcome)>>,
         /// The activity of every evaluation, in order.
         pub activities: Mutex<Vec<(Activity, bool)>>,
+        /// Every activity call as Core would store it, in arrival order.
+        pub calls: Mutex<Vec<String>>,
         /// Verdicts for prompt signals, in order; allow when empty.
         pub prompt_verdicts: Mutex<VecDeque<Verdict>>,
         pub signals: Mutex<Vec<Value>>,
@@ -1258,7 +1273,12 @@ pub(crate) mod tests {
             _: &str,
             activity: &Activity,
         ) -> Result<CoreDecision, CoreError> {
+            tokio::time::sleep(self.delay).await;
             self.opened.lock().unwrap().push(activity.id.clone());
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("started {}", activity.kind));
             Ok(decision(Verdict::Allow))
         }
         async fn evaluate_action(
@@ -1277,7 +1297,15 @@ pub(crate) mod tests {
                 .push((activity.clone(), open));
             if open {
                 self.opened.lock().unwrap().push(activity.id.clone());
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("started {}", activity.kind));
             }
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("span started in {}", activity.kind));
             let next = self
                 .verdicts
                 .lock()
@@ -1308,7 +1336,12 @@ pub(crate) mod tests {
             &self,
             completion: &Completion,
         ) -> Result<CoreDecision, CoreError> {
+            tokio::time::sleep(self.delay).await;
             self.completions.lock().unwrap().push(completion.clone());
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("span completed in {}", completion.activity.kind));
             Ok(decision(Verdict::Allow))
         }
         async fn close_activity(
@@ -1317,6 +1350,11 @@ pub(crate) mod tests {
             activity: &Activity,
             outcome: &Outcome,
         ) -> Result<CoreDecision, CoreError> {
+            tokio::time::sleep(self.delay).await;
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("completed {}", activity.kind));
             self.closed
                 .lock()
                 .unwrap()
@@ -1748,6 +1786,58 @@ pub(crate) mod tests {
         assert_eq!(
             closed[0].1.error.as_ref().unwrap()["type"],
             "GovernanceStop"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_hears_each_activity_start_to_end_in_order() {
+        // Every Core call is slow, so background events would be overtaken
+        // by the next request's verdict if nothing kept them in order.
+        let core = FakeCore {
+            delay: Duration::from_millis(15),
+            ..FakeCore::with_verdicts(&[Verdict::Allow, Verdict::Allow, Verdict::Allow])
+        };
+        let (guard, core, _) = guard(core);
+        let ask = json!([{"role": "user", "content": "summarise example.com"}]);
+        guard
+            .evaluate(&model_request("m-1", &ask), ApprovalMode::Queue)
+            .await;
+        let reply = json!({"model": "claude-x", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "fetch", "input": {"url": "http://example.com/"}}
+        ]});
+        guard
+            .complete(response("m-1", 200, reply.to_string().as_bytes()))
+            .await;
+        // The tool's request arrives at once, while the reply's events are
+        // still on their way to Core.
+        let mut fetch = evaluation("GET", "/", b"");
+        fetch.context.as_mut().unwrap().request_id = "f-1".to_owned();
+        guard
+            .evaluate(&Action::from_evaluation(&fetch), ApprovalMode::Queue)
+            .await;
+        guard.complete(response("f-1", 200, b"page")).await;
+        let back = json!([
+            {"role": "user", "content": "summarise example.com"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "fetch", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "Example"}]}
+        ]);
+        guard
+            .evaluate(&model_request("m-2", &back), ApprovalMode::Queue)
+            .await;
+        assert_eq!(
+            *core.calls.lock().unwrap(),
+            vec![
+                "started llm_call",
+                "span started in llm_call",
+                "span completed in llm_call",
+                "completed llm_call",
+                "started fetch",
+                "span started in fetch",
+                "span completed in fetch",
+                "completed fetch",
+                "started llm_call",
+                "span started in llm_call",
+            ]
         );
     }
 

@@ -845,7 +845,18 @@ pub fn started_span(
     now: SystemTime,
 ) -> Value {
     let (span_id, trace_id) = span_ids(&action.request_id);
-    let mut attributes = json!({});
+    let url = request_url(action);
+    // What the dashboard and Core's span classifier read: `http.method` and
+    // `http.url` (as the Python SDK sends them), and the current semantic
+    // convention names alongside.
+    let mut attributes = json!({
+        "http.method": action.method,
+        "http.url": url,
+        "http.request.method": action.method,
+        "url.full": url,
+        "server.address": action.host,
+        "server.port": action.port,
+    });
     let mut mcp = false;
     if let Payload::JsonRpc(calls) = &action.payload
         && let Some(call) = calls
@@ -884,7 +895,7 @@ pub fn started_span(
         "attribute_key_identifiers": ["http_method", "http_url"],
         "activity_id": activity_id,
         "http_method": action.method,
-        "http_url": request_url(action),
+        "http_url": url,
         "http_status_code": null,
         "request_headers": crate::agent::headers_object(
             action.headers.iter().map(|(name, value)| (name.as_str(), value.as_str()))
@@ -910,13 +921,18 @@ fn completed_span_event(completion: &Completion, now: SystemTime) -> Value {
     span["end_time"] = json!(end);
     span["duration_ns"] = json!(end.saturating_sub(start));
     span["http_status_code"] = json!(completion.status_code);
+    span["attributes"]["http.status_code"] = json!(completion.status_code);
+    span["attributes"]["http.response.status_code"] = json!(completion.status_code);
     span["response_headers"] = completion.response_headers.clone();
     span["response_body"] = json!(completion.response_body);
-    span["error"] = if completion.status_code >= 400 {
-        json!(format!("HTTP {}", completion.status_code))
+    // Core marks a span failed from its status, as the Python SDK sets it.
+    if completion.status_code >= 400 {
+        let failed = format!("HTTP {}", completion.status_code);
+        span["status"] = json!({"code": "ERROR", "description": failed});
+        span["error"] = json!(failed);
     } else {
-        Value::Null
-    };
+        span["error"] = Value::Null;
+    }
     hook_event(&completion.sandbox_id, &completion.activity, span, now)
 }
 
@@ -1180,7 +1196,15 @@ mod tests {
                 "span_id": span["span_id"], "trace_id": span["trace_id"], "parent_span_id": null,
                 "name": "HTTP POST", "kind": "CLIENT", "stage": "started",
                 "start_time": 2_000_000_000_u64, "end_time": null, "duration_ns": null,
-                "attributes": {}, "status": {"code": "UNSET", "description": null}, "events": [],
+                "attributes": {
+                    "http.method": "POST",
+                    "http.url": "https://mcp.example.com:8443/v1/charge?dry_run=1",
+                    "http.request.method": "POST",
+                    "url.full": "https://mcp.example.com:8443/v1/charge?dry_run=1",
+                    "server.address": "mcp.example.com",
+                    "server.port": 8443,
+                },
+                "status": {"code": "UNSET", "description": null}, "events": [],
                 "hook_type": "http_request", "semantic_type": null,
                 "attribute_key_identifiers": ["http_method", "http_url"],
                 "activity_id": "oshx-req-1",
@@ -1271,7 +1295,13 @@ mod tests {
         assert_eq!(span["duration_ns"], 2_000_000_000_u64);
         assert_eq!(span["http_status_code"], 503);
         assert_eq!(span["error"], "HTTP 503");
-        assert_eq!(span["status"]["code"], "UNSET");
+        assert_eq!(
+            span["status"],
+            json!({"code": "ERROR", "description": "HTTP 503"})
+        );
+        assert_eq!(span["attributes"]["http.status_code"], 503);
+        assert_eq!(span["attributes"]["http.response.status_code"], 503);
+        assert_eq!(span["attributes"]["http.url"], "https://mcp.example.com/");
         assert_eq!(span["response_body"], "<html>busy</html>");
         assert_eq!(span["response_headers"]["content-type"], "text/html");
         assert_eq!(span["request_headers"]["content-type"], "application/json");
