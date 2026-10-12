@@ -1,0 +1,69 @@
+{{- /* Refuse configurations the binaries would refuse at startup, or that
+       are unsafe, before anything reaches the cluster. */ -}}
+{{- $v := .Values -}}
+{{- if not $v.image.repository -}}
+{{- fail "image.repository is required: build the image from middleware/ and push it to your registry" -}}
+{{- end -}}
+{{- if not $v.openbox.url -}}
+{{- fail "openbox.url (OPENBOX_URL) is required" -}}
+{{- end -}}
+{{- if not $v.gateway.id -}}
+{{- fail "gateway.id is required: the gateway_id of the gateway's [openshell.gateway.gateway_jwt]" -}}
+{{- end -}}
+{{- if and (not $v.gateway.publicKey) (not $v.gateway.publicKeyConfigMap) -}}
+{{- fail "gateway.publicKey or gateway.publicKeyConfigMap is required: the gateway's JWT public key" -}}
+{{- end -}}
+{{- if not (has $v.credentials.identity (list "workload" "signed" "apiKey")) -}}
+{{- fail "credentials.identity must be workload, signed or apiKey" -}}
+{{- end -}}
+{{- if not $v.credentials.existingSecret -}}
+{{- if not $v.credentials.apiKey -}}
+{{- fail "credentials.apiKey or credentials.existingSecret is required" -}}
+{{- end -}}
+{{- if and (eq $v.credentials.identity "workload") (or (not $v.credentials.workloadPrivateKey) (not $v.credentials.workloadKid)) -}}
+{{- fail "credentials.identity workload needs credentials.workloadPrivateKey and credentials.workloadKid" -}}
+{{- end -}}
+{{- if and (eq $v.credentials.identity "signed") (not $v.credentials.agentPrivateKey) -}}
+{{- fail "credentials.identity signed needs credentials.agentPrivateKey" -}}
+{{- end -}}
+{{- end -}}
+{{- if and (eq $v.credentials.identity "signed") (not $v.credentials.agentDid) -}}
+{{- fail "credentials.identity signed needs credentials.agentDid" -}}
+{{- end -}}
+{{- if and $v.openbox.backendUrl (ne $v.credentials.identity "workload") -}}
+{{- fail "openbox.backendUrl (AI Inventory) needs credentials.identity workload" -}}
+{{- end -}}
+{{- if and $v.openbox.backendUrl (not $v.frontDesk.sessions) -}}
+{{- fail "openbox.backendUrl needs frontDesk.sessions: the front desk gets its workload token through OPENBOX_URL" -}}
+{{- end -}}
+{{- if not $v.tls.certManager.enabled -}}
+{{- if or (not $v.tls.doorGuard.existingSecret) (not $v.tls.frontDesk.existingSecret) -}}
+{{- fail "server TLS is required: set tls.doorGuard.existingSecret and tls.frontDesk.existingSecret, or tls.certManager.enabled" -}}
+{{- end -}}
+{{- else if not $v.tls.certManager.issuerRef.name -}}
+{{- fail "tls.certManager.issuerRef.name is required with tls.certManager.enabled" -}}
+{{- end -}}
+{{- if and $v.gateway.api.endpoint (not $v.gateway.api.mtlsSecret) -}}
+{{- fail "gateway.api.endpoint needs gateway.api.mtlsSecret (ca.crt, tls.crt, tls.key)" -}}
+{{- end -}}
+{{- if and (gt (int $v.doorGuard.replicaCount) 1) (not (include "obx.hasRedis" .)) -}}
+{{- fail "doorGuard.replicaCount > 1 needs a shared Redis (externalRedis.url, externalRedis.existingSecret or redis.enabled): approval retries and completions must be matched across replicas" -}}
+{{- end -}}
+{{- if and (gt (int $v.frontDesk.replicaCount) 1) $v.frontDesk.sessions (not (include "obx.hasRedis" .)) -}}
+{{- fail "frontDesk.replicaCount > 1 with sessions needs a shared Redis, so any replica can close a session" -}}
+{{- end -}}
+{{- if and $v.externalRedis.url (not (hasPrefix "redis://" $v.externalRedis.url)) -}}
+{{- fail "externalRedis.url must start with redis:// (the client does not speak TLS)" -}}
+{{- end -}}
+{{- if and $v.redis.enabled (or $v.externalRedis.url $v.externalRedis.existingSecret) -}}
+{{- fail "set redis.enabled or externalRedis, not both" -}}
+{{- end -}}
+{{- if not (has $v.doorGuard.promptCapture (list "text" "hash" "off")) -}}
+{{- fail "doorGuard.promptCapture must be text, hash or off" -}}
+{{- end -}}
+{{- if ge (int $v.doorGuard.coreTimeoutMs) 30000 -}}
+{{- fail "doorGuard.coreTimeoutMs must stay under the gateway's 30 s middleware timeout" -}}
+{{- end -}}
+{{- if lt (int $v.doorGuard.terminationGracePeriodSeconds) 30 -}}
+{{- fail "doorGuard.terminationGracePeriodSeconds must be at least 30: the door guard drains in-flight work on SIGTERM" -}}
+{{- end -}}

@@ -1,0 +1,76 @@
+OpenBox for OpenShell is installed. The gateway does not use it until you
+register it. Add this to the gateway TOML, then restart the gateway
+(docs/install.md has the full steps). Start OpenBox before the gateway: the
+gateway does not start while a registered service is unreachable.
+
+[[openshell.gateway.interceptors]]
+name = "openbox"
+grpc_endpoint = "https://{{ include "obx.frontDesk" . }}.{{ .Release.Namespace }}.svc:{{ .Values.frontDesk.port }}"
+tls_ca_cert_path = "<CA that issued the front desk certificate>"
+audience = "{{ .Values.frontDesk.audience }}"
+failure_policy = "fail_closed"
+binding_policy = "allowlist"
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/CreateSandbox"
+phases = ["modify_operation", "validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/UpdateConfig"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/ImportProviderProfiles"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/UpdateProviderProfiles"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors]]
+name = "openbox-inventory"
+grpc_endpoint = "https://{{ include "obx.frontDesk" . }}.{{ .Release.Namespace }}.svc:{{ .Values.frontDesk.inventoryPort }}"
+tls_ca_cert_path = "<CA that issued the front desk certificate>"
+audience = "{{ .Values.frontDesk.inventoryAudience }}"
+failure_policy = "fail_open"
+binding_policy = "allowlist"
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/CreateSandbox"
+phases = ["post_commit"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/UpdateConfig"
+phases = ["post_commit"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/DeleteSandbox"
+phases = ["post_commit"]
+
+[[openshell.supervisor.middleware]]
+name = "openbox"
+grpc_endpoint = "https://{{ include "obx.doorGuard" . }}.{{ .Release.Namespace }}.svc:{{ .Values.doorGuard.port }}"
+tls_ca_cert_path = "<CA that issued the door guard certificate>"
+audience = "{{ .Values.doorGuard.audience }}"
+max_payload_bytes = {{ .Values.doorGuard.maxPayloadBytes | int64 }}
+timeout = "30s"
+
+The door guard endpoint must resolve and be reachable from every sandbox
+supervisor, not only from the gateway. The in-cluster name above suits the
+Kubernetes compute driver. For the VM driver see "Registration endpoint per
+compute driver" in docs/install.md.
+
+Check the door guard:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "obx.doorGuard" . }} {{ .Values.doorGuard.adminPort }}
+  curl -s localhost:{{ .Values.doorGuard.adminPort }}/readyz
+{{- if not (include "obx.hasRedis" .) }}
+
+WARNING: no shared Redis. Approval retries and completions are matched in
+each process only. This is correct for one door guard replica only.
+{{- end }}
+{{- if not .Values.gateway.api.endpoint }}
+
+NOTE: no gateway.api.endpoint. HALT denies a sandbox's traffic but cannot stop
+the sandbox, and the AI Inventory is not reconciled.
+{{- end }}

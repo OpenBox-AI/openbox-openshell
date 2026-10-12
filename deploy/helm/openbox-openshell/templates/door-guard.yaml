@@ -1,0 +1,184 @@
+{{- $dg := .Values.doorGuard -}}
+{{- $component := dict "root" . "component" "door-guard" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "obx.doorGuard" . }}
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+    app.kubernetes.io/component: door-guard
+spec:
+  replicas: {{ $dg.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "obx.selector" $component | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "obx.labels" . | nindent 8 }}
+        app.kubernetes.io/component: door-guard
+        {{- with $dg.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/credentials: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $dg.adminPort | quote }}
+        prometheus.io/path: /metrics
+        {{- with $dg.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "obx.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ $dg.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: door-guard
+          image: {{ include "obx.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            {{- toYaml $dg.command | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: grpc
+              containerPort: {{ $dg.port }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ $dg.adminPort }}
+              protocol: TCP
+          env:
+            - name: OPENBOX_URL
+              value: {{ .Values.openbox.url | quote }}
+            - name: OPENBOX_MW_LISTEN
+              value: "0.0.0.0:{{ $dg.port }}"
+            - name: OPENBOX_MW_ADMIN_LISTEN
+              value: "0.0.0.0:{{ $dg.adminPort }}"
+            - name: OPENBOX_MW_TLS_CERT
+              value: /var/run/openbox/tls/tls.crt
+            - name: OPENBOX_MW_TLS_KEY
+              value: /var/run/openbox/tls/tls.key
+            - name: OPENBOX_MW_GATEWAY_ID
+              value: {{ .Values.gateway.id | quote }}
+            - name: OPENBOX_MW_GATEWAY_PUBLIC_KEY
+              value: /var/run/openbox/gateway-key/public-key.pem
+            - name: OPENBOX_MW_AUDIENCE
+              value: {{ $dg.audience | quote }}
+            - name: OPENBOX_CORE_TIMEOUT_MS
+              value: {{ $dg.coreTimeoutMs | int64 | quote }}
+            - name: OPENBOX_MW_MAX_PAYLOAD_BYTES
+              value: {{ $dg.maxPayloadBytes | int64 | quote }}
+            - name: OPENBOX_CORE_BODY_LIMIT_BYTES
+              value: {{ $dg.coreBodyLimitBytes | int64 | quote }}
+            - name: OPENBOX_APPROVAL_TTL_SECS
+              value: {{ $dg.approvalTtlSecs | int64 | quote }}
+            - name: OPENBOX_PROMPT_CAPTURE
+              value: {{ $dg.promptCapture | quote }}
+            {{- include "obx.credentialEnv" . | trim | nindent 12 }}
+            {{- if eq .Values.credentials.identity "signed" }}
+            - name: OPENBOX_AGENT_DID
+              value: {{ .Values.credentials.agentDid | quote }}
+            - name: OPENBOX_AGENT_KEY_FILE
+              value: /var/run/openbox/credentials/agent-key.pem
+            {{- end }}
+            {{- include "obx.gatewayApiEnv" . | trim | nindent 12 }}
+            {{- include "obx.redisEnv" . | trim | nindent 12 }}
+            {{- with $dg.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml $dg.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "obx.commonMounts" . | nindent 12 }}
+      volumes:
+        {{- include "obx.commonVolumes" . | nindent 8 }}
+        - name: tls
+          secret:
+            secretName: {{ include "obx.doorGuardTlsSecret" . }}
+            defaultMode: 0400
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+      {{- if $dg.topologySpread }}
+      topologySpreadConstraints:
+        {{- include "obx.topologySpread" $component | nindent 8 }}
+      {{- end }}
+      {{- with $dg.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $dg.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $dg.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "obx.doorGuard" . }}
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+    app.kubernetes.io/component: door-guard
+  {{- with $dg.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $dg.service.type }}
+  selector:
+    {{- include "obx.selector" $component | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ $dg.port }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: grpc
+    - name: metrics
+      port: {{ $dg.adminPort }}
+      targetPort: admin
+      protocol: TCP
+{{- if and $dg.podDisruptionBudget.enabled (gt (int $dg.replicaCount) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "obx.doorGuard" . }}
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+    app.kubernetes.io/component: door-guard
+spec:
+  minAvailable: {{ $dg.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "obx.selector" $component | nindent 6 }}
+{{- end }}
