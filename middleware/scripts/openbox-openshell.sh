@@ -43,6 +43,7 @@
 #   OBX_GATEWAY_PORT        default 17990 (+1 health, +2 metrics)
 #   OBX_MW_PORT             door guard, default 50351 (+1 admin)
 #   OBX_FD_PORT             front desk, default 50371 (+1 inventory)
+#   OBX_MODEL_PORT          the demo's stand-in model, default 17995
 set -eu
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -52,6 +53,7 @@ GW_PORT=${OBX_GATEWAY_PORT:-17990}
 MW_PORT=${OBX_MW_PORT:-50351}
 FD_PORT=${OBX_FD_PORT:-50371}
 INV_PORT=$((FD_PORT + 1))
+MODEL_PORT=${OBX_MODEL_PORT:-17995}
 BACKEND=${OPENBOX_BACKEND_URL:-http://localhost:3000}
 REDIS=${OPENBOX_REDIS_URL:-redis://localhost:6379/7}
 DASHBOARD=${OBX_DASHBOARD_URL:-http://localhost:3233}
@@ -144,8 +146,8 @@ up() {
   running gateway && die "already up; run '$0 down' first"
   [ -x "$PREFIX/bin/openshell-gateway" ] && [ -x "$PREFIX/libexec/openshell-driver-vm" ] ||
     die "OpenShell v0.1.2 not found in $PREFIX (set OPENSHELL_PREFIX; see verify-provider-profiles.sh)"
-  for port in "$GW_PORT" $((GW_PORT + 1)) $((GW_PORT + 2)) "$MW_PORT" $((MW_PORT + 1)) "$FD_PORT" "$INV_PORT"; do
-    free "$port" || die "port $port is in use (set OBX_GATEWAY_PORT / OBX_MW_PORT / OBX_FD_PORT)"
+  for port in "$GW_PORT" $((GW_PORT + 1)) $((GW_PORT + 2)) "$MW_PORT" $((MW_PORT + 1)) "$FD_PORT" "$INV_PORT" "$MODEL_PORT"; do
+    free "$port" || die "port $port is in use (set OBX_GATEWAY_PORT / OBX_MW_PORT / OBX_FD_PORT / OBX_MODEL_PORT)"
   done
   host_ip=${OBX_HOST_IP:-$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)}
   [ -n "$host_ip" ] || die "no host IPv4 found; set OBX_HOST_IP"
@@ -166,7 +168,7 @@ up() {
        backend will reject them. Create a bearer-only client 'openbox-core' in the
        Keycloak realm (local stack: kcadm create clients -r openbox -s clientId=openbox-core -s bearerOnly=true)." ;;
   esac
-  printf 'CORE=%s\nKID=%s\nAGENT_ID=%s\n' "$core" "$kid" "$agent_id" >"$DIR/agent"
+  printf 'CORE=%s\nKID=%s\nAGENT_ID=%s\nMODEL_PORT=%s\n' "$core" "$kid" "$agent_id" "$MODEL_PORT" >"$DIR/agent"
 
   say "== Build the door guard and front desk"
   (cd "$HERE" && cargo build -q --bin openbox-verdict-middleware --bin openbox-governance-interceptor)
@@ -195,6 +197,12 @@ up() {
     "$HERE/target/debug/openbox-governance-interceptor" >"$DIR/front-desk.log" 2>&1 &
   echo $! >"$DIR/front-desk.pid"
   wait_listen "$INV_PORT" front-desk
+
+  say "== Start the demo's stand-in model on :$MODEL_PORT"
+  stand_in_model >"$DIR/model.py"
+  python3 "$DIR/model.py" "$MODEL_PORT" >"$DIR/model.log" 2>&1 &
+  echo $! >"$DIR/model.pid"
+  wait_listen "$MODEL_PORT" model
 
   say "== Start the OpenShell gateway on :$GW_PORT"
   cat >"$DIR/gateway.toml" <<EOF
@@ -300,7 +308,17 @@ network_policies:
         access: read-write
     binaries:
       - path: /usr/bin/bash
+  model:
+    name: demo-model
+    endpoints:
+      - host: host.openshell.internal
+        port: MODEL_PORT
+        protocol: rest
+        access: read-write
+    binaries:
+      - path: /usr/bin/bash
 EOF
+  sed -i.bak "s/MODEL_PORT/$MODEL_PORT/" "$DIR/policy.yaml" && rm -f "$DIR/policy.yaml.bak"
 
   say ""
   say "OpenShell is running, governed by OpenBox."
@@ -315,27 +333,78 @@ EOF
   say "  Logs: $DIR/{door-guard,front-desk,gateway}.log    Stop: $0 down"
 }
 
+# The demo's model: a stand-in for the provider that answers like the
+# Anthropic Messages API, so the door guard reads real replies. The first
+# prompt gets a streamed reply asking for the `fetch` tool, the tool's result
+# gets a text answer, and any other prompt a text answer. Not a model: fixed
+# replies, on this machine only.
+stand_in_model() {
+  cat <<'EOF'
+import http.server, json, sys
+
+TOOL = {"type": "tool_use", "id": "toolu_demo_1", "name": "fetch", "input": {"url": "http://example.com/"}}
+
+class Model(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+        last = (body.get("messages") or [{}])[-1].get("content")
+        tool_result = isinstance(last, list) and any(b.get("type") == "tool_result" for b in last)
+        if not tool_result and "summarise" in json.dumps(last):
+            return self.stream_tool_call()
+        text = ("It is a placeholder page reserved for documentation examples." if tool_result
+                else "Documentation examples, test fixtures and tutorials.")
+        data = json.dumps({"id": "msg_demo", "type": "message", "role": "assistant", "model": "claude-demo",
+                           "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+                           "usage": {"input_tokens": 40, "output_tokens": 12}}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def stream_tool_call(self):
+        events = [
+            ("message_start", {"type": "message_start", "message": {"id": "msg_demo_1", "model": "claude-demo", "usage": {"input_tokens": 25, "output_tokens": 1}}}),
+            ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "I'll fetch the page."}}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            ("content_block_start", {"type": "content_block_start", "index": 1, "content_block": dict(TOOL, input={})}),
+            ("content_block_delta", {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": json.dumps(TOOL["input"])}}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 1}),
+            ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 18}}),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        for name, data in events:
+            self.wfile.write(f"event: {name}\ndata: {json.dumps(data)}\n\n".encode())
+            self.wfile.flush()
+
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Model).serve_forever()
+EOF
+}
+
 # Runs inside the sandbox: what an agent does, without needing a model key.
-# A user prompt goes to the model (an Anthropic Messages call; example.com
-# stands in for the provider and answers 405), the agent fetches a page, its
-# next model call resends the conversation with the result, then the user
-# asks something new.
+# The user's prompt goes to the model, which asks for the `fetch` tool; the
+# agent fetches the page and sends the result back; then the user asks
+# something new.
 demo_agent() {
   cat <<'EOF'
 post() {
-  exec 3<>/dev/tcp/example.com/80
-  printf "POST /v1/messages HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s" "${#1}" "$1" >&3
-  IFS=" " read -r _ code _ <&3; exec 3>&-; echo "model call: HTTP $code"
+  exec 3<>/dev/tcp/host.openshell.internal/MODEL_PORT
+  printf "POST /v1/messages HTTP/1.1\r\nHost: host.openshell.internal:MODEL_PORT\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s" "${#1}" "$1" >&3
+  IFS=" " read -r _ code _ <&3; cat <&3 >/dev/null; exec 3>&-; echo "model call: HTTP $code"
 }
 get() {
   exec 3<>/dev/tcp/example.com/80
   printf "GET %s HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n" "$1" >&3
-  IFS=" " read -r _ code _ <&3; exec 3>&-; echo "fetch $1: HTTP $code"
+  IFS=" " read -r _ code _ <&3; cat <&3 >/dev/null; exec 3>&-; echo "fetch $1: HTTP $code"
 }
-post '{"model":"claude-demo","messages":[{"role":"user","content":"summarise the example.com homepage"}]}'
+post '{"model":"claude-demo","stream":true,"messages":[{"role":"user","content":"summarise the example.com homepage"}]}'
 get /
-post '{"model":"claude-demo","messages":[{"role":"user","content":"summarise the example.com homepage"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"fetch","input":{"url":"http://example.com/"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"Example Domain"}]}]}'
-post '{"model":"claude-demo","messages":[{"role":"user","content":"summarise the example.com homepage"},{"role":"assistant","content":"It is a placeholder page."},{"role":"user","content":"now list three uses for it"}]}'
+post '{"model":"claude-demo","messages":[{"role":"user","content":"summarise the example.com homepage"},{"role":"assistant","content":[{"type":"text","text":"I will fetch the page."},{"type":"tool_use","id":"toolu_demo_1","name":"fetch","input":{"url":"http://example.com/"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_demo_1","content":"Example Domain. This domain is for use in documentation examples."}]}]}'
+post '{"model":"claude-demo","messages":[{"role":"user","content":"summarise the example.com homepage"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_demo_1","name":"fetch","input":{"url":"http://example.com/"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_demo_1","content":"Example Domain. This domain is for use in documentation examples."}]},{"role":"assistant","content":"It is a placeholder page reserved for documentation examples."},{"role":"user","content":"now list three uses for it"}]}'
 EOF
 }
 
@@ -355,19 +424,26 @@ demo() {
     i=$((i + 1)); [ $i -le 30 ] || break; sleep 1
   done
   say "== The agent works (inside the sandbox)"
-  os sandbox exec -n "$box" --no-tty --timeout 120 -- bash -c "$(demo_agent)" 2>&1 | sed 's/^/   /'
+  os sandbox exec -n "$box" --no-tty --timeout 120 -- bash -c "$(demo_agent | sed "s/MODEL_PORT/${MODEL_PORT:-17995}/g")" 2>&1 | sed 's/^/   /'
   say "== Delete the sandbox"
   os sandbox delete "$box" >/dev/null
   say ""
   say "Session for sandbox $id (workflow id = sandbox id):"
   say "  $DASHBOARD/agents/$AGENT_ID  -> Sessions -> the newest openshell.sandbox session"
-  say "Expected: WorkflowStarted, SignalReceived user_prompt, ActivityStarted/Completed pairs"
-  say "(POST example.com, GET example.com), a second user_prompt, WorkflowCompleted."
+  say "Expected, as the agent SDK reports a session:"
+  say "  WorkflowStarted"
+  say "  SignalReceived user_prompt"
+  say "  llm_call   (prompt in; claude-demo, 25/18 tokens, has_tool_calls out; its POST span started + completed)"
+  say "  fetch      (url in; the GET example.com span inside it; the page text out)"
+  say "  llm_call   (the answer out)"
+  say "  SignalReceived user_prompt   (the new question)"
+  say "  llm_call   (the answer out)"
+  say "  WorkflowCompleted"
   say "On the local stack, check the seal:  python3 $HERE/scripts/verify-session-seal.py $id"
 }
 
 status() {
-  for p in door-guard front-desk gateway; do
+  for p in door-guard front-desk gateway model; do
     if running $p; then say "$p: running (pid $(cat "$DIR/$p.pid"))"; else say "$p: stopped"; fi
   done
   running gateway && os sandbox list 2>/dev/null || true
@@ -379,7 +455,7 @@ down() {
       os sandbox delete "$box" >/dev/null 2>&1 && say "deleted sandbox $box"
     done
   fi
-  for p in gateway front-desk door-guard; do
+  for p in gateway front-desk door-guard model; do
     if running $p; then kill "$(cat "$DIR/$p.pid")" && say "stopped $p"; fi
     rm -f "$DIR/$p.pid"
   done

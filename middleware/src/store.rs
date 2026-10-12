@@ -50,6 +50,17 @@ pub fn prompt_key(sandbox_id: &str, turn: &str) -> String {
     format!("openbox:prompt:{sandbox_id}:{turn}")
 }
 
+/// A tool the model asked for in a sandbox: its activity and whether it is
+/// open, started in Core, or closed.
+pub fn tool_key(sandbox_id: &str, call_id: &str) -> String {
+    format!("openbox:tool:{sandbox_id}:{call_id}")
+}
+
+/// The call ids of a sandbox's open tools, oldest first.
+pub fn open_tools_key(sandbox_id: &str) -> String {
+    format!("openbox:tools:{sandbox_id}")
+}
+
 pub fn session_key(sandbox_id: &str) -> String {
     format!("openbox:session:{sandbox_id}")
 }

@@ -1,15 +1,21 @@
 //! Client for `OpenBox` Core's governance API.
 //!
 //! Each `OpenShell` sandbox is one Core session: `workflow_id` and `run_id`
-//! are the sandbox id, announced once with `WorkflowStarted`. Every evaluated
-//! request follows the SDK sequence: a plain `ActivityStarted` opens the
-//! activity, then an `ActivityStarted` hook event carries one started span
-//! that describes the HTTP or MCP call, so policy, guardrails and behavioral
-//! rules see it the same way they see SDK-instrumented traffic. Its response
-//! sends the span again, completed, and closes the activity with
-//! `ActivityCompleted` under the same `activity_id`. Each request is its own
-//! activity (`oshx-<request id>`); an approval retry reuses the activity Core
-//! holds the approval on, which the guard looks up by the action fingerprint.
+//! are the sandbox id, announced once with `WorkflowStarted`. Events follow
+//! the agent SDK's sequence and shapes:
+//!
+//! 1. a plain `ActivityStarted` opens an activity (`llm_call`, a tool, or a
+//!    request of its own) with its input and no span
+//! 2. each request in it is an `ActivityStarted` hook carrying its started
+//!    span, so policy, guardrails and behavioral rules see it the same way
+//!    they see SDK-instrumented traffic, and Core's verdict on it is the
+//!    request's
+//! 3. its response sends the span again, completed, with the response
+//! 4. `ActivityCompleted` closes the activity with its output
+//!
+//! Which activity a request belongs to is the guard's choice
+//! ([`crate::guard`]); an approval retry reuses the activity Core holds the
+//! approval on, which the guard looks up by the action fingerprint.
 //!
 //! Requests are sent as exact bytes so the optional Ed25519 request signature
 //! (`X-OpenBox-Agent-*`, required for agents with signed requests on) covers
@@ -315,30 +321,43 @@ impl CoreClient {
         self.evaluate(&payload, &key).await
     }
 
-    /// Asks Core for a verdict on one action. A new activity is opened first
-    /// with a plain `ActivityStarted`: Core stores a hook span only on an
-    /// activity whose event already exists, and evaluates but drops one sent
-    /// with the activity's first `ActivityStarted`. An approval retry reuses
-    /// an activity Core already holds, so it goes straight to the hook.
+    /// Most of a request body sent to Core in a span.
+    pub const fn body_limit(&self) -> usize {
+        self.config.body_limit_bytes
+    }
+
+    /// Opens an activity with a plain `ActivityStarted`: its input, no span.
+    /// Safe to repeat: Core replays a resent start by its idempotency key.
+    pub async fn open_activity(
+        &self,
+        sandbox_id: &str,
+        activity: &Activity,
+    ) -> Result<CoreDecision, CoreError> {
+        let payload = activity_started_event(sandbox_id, activity, SystemTime::now());
+        let key = format!("ast-{sandbox_id}-{}", activity.id);
+        self.evaluate(&payload, &idempotency_key(&key)).await
+    }
+
+    /// Asks Core for a verdict on one action: the request's started span, as
+    /// a hook on its activity. With `open`, the activity is opened first:
+    /// Core stores a hook span only on an activity whose event already
+    /// exists, and evaluates but drops one sent with the activity's first
+    /// `ActivityStarted`. A request inside an open tool, or an approval retry
+    /// on the activity Core holds, goes straight to the hook.
     pub async fn evaluate_action(
         &self,
         action: &Action,
-        activity_id: &str,
+        activity: &Activity,
+        open: bool,
+        span: &Value,
     ) -> Result<CoreDecision, CoreError> {
-        if activity_id == request_activity_id(&action.request_id) {
-            let payload = activity_event(action, activity_id, SystemTime::now());
-            let key = format!("ast-{}-{}", action.sandbox_id, action.request_id);
-            let opened = self.evaluate(&payload, &idempotency_key(&key)).await?;
+        if open {
+            let opened = self.open_activity(&action.sandbox_id, activity).await?;
             if !matches!(opened.verdict, Verdict::Allow | Verdict::Constrain) {
                 return Ok(opened);
             }
         }
-        let payload = action_event(
-            action,
-            activity_id,
-            self.config.body_limit_bytes,
-            SystemTime::now(),
-        );
+        let payload = action_event(action, activity, span, SystemTime::now());
         let key = format!("act-{}-{}", action.sandbox_id, action.request_id);
         self.evaluate(&payload, &idempotency_key(&key)).await
     }
@@ -358,24 +377,28 @@ impl CoreClient {
         self.evaluate(&payload, &idempotency_key(&key)).await
     }
 
-    /// Closes an activity when its response comes back: the request's span,
-    /// completed, then `ActivityCompleted`. A notification: the response is
-    /// already on its way to the sandbox. A span Core does not take still
-    /// lets the activity close.
-    pub async fn complete_activity(
+    /// Records a request's response: its span again, completed, as a hook on
+    /// its activity. A notification: the response is already on its way to
+    /// the sandbox.
+    pub async fn complete_request(
         &self,
         completion: &Completion,
     ) -> Result<CoreDecision, CoreError> {
-        let span = completed_span_event(completion, SystemTime::now());
+        let payload = completed_span_event(completion, SystemTime::now());
         let key = format!("acs-{}-{}", completion.sandbox_id, completion.request_id);
-        if let Err(error) = self.evaluate(&span, &idempotency_key(&key)).await {
-            eprintln!(
-                "openbox: completed span for request_id={} not recorded: {error}",
-                completion.request_id
-            );
-        }
-        let payload = completion_event(completion, SystemTime::now());
-        let key = format!("acd-{}-{}", completion.sandbox_id, completion.request_id);
+        self.evaluate(&payload, &idempotency_key(&key)).await
+    }
+
+    /// Closes an activity with `ActivityCompleted`. Safe to repeat, like
+    /// [`Self::open_activity`].
+    pub async fn close_activity(
+        &self,
+        sandbox_id: &str,
+        activity: &Activity,
+        outcome: &Outcome,
+    ) -> Result<CoreDecision, CoreError> {
+        let payload = activity_completed_event(sandbox_id, activity, outcome, SystemTime::now());
+        let key = format!("acd-{sandbox_id}-{}", activity.id);
         self.evaluate(&payload, &idempotency_key(&key)).await
     }
 
@@ -612,35 +635,71 @@ struct ApprovalResponse {
 /// A request's own activity id. Request ids are `OpenShell`'s, so trim them to
 /// what Core accepts rather than trust them.
 pub fn request_activity_id(request_id: &str) -> String {
-    let id: String = request_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(59)
-        .collect();
-    format!("oshx-{id}")
+    bounded_id("oshx-", request_id)
 }
 
-/// What the dashboard shows for an activity: the MCP tool for a tool call,
-/// otherwise the method and host. Policy and behaviour rules key on the span's
-/// semantic type, not on this.
+/// A tool's activity id, from the provider's call id (`toolu_…`, `call_…`).
+pub fn tool_activity_id(call_id: &str) -> String {
+    bounded_id("oshx-tool-", call_id)
+}
+
+fn bounded_id(prefix: &str, raw: &str) -> String {
+    let id: String = raw
+        .chars()
+        .map(|c| if c == '_' { '-' } else { c })
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(64 - prefix.len())
+        .collect();
+    format!("{prefix}{id}")
+}
+
+/// What the dashboard shows for a request that is its own activity.
+///
+/// The MCP tool for a tool call, as the agent SDK names tool activities,
+/// otherwise the method and host. Policy and behaviour rules key on the
+/// span's semantic type, not on this.
 pub fn activity_name(action: &Action) -> String {
     action.tools().first().map_or_else(
         || format!("{} {}", action.method, action.host),
-        |tool| format!("MCP {tool}"),
+        |tool| (*tool).to_owned(),
     )
 }
 
-/// A response that closes an activity.
+/// The activity type of a model call, as the agent SDK reports it.
+pub const LLM_CALL: &str = "llm_call";
+
+/// One activity in a sandbox's session, as the agent SDK reports it: a model
+/// call ([`LLM_CALL`]), a tool (named by the tool), or any other request
+/// (method and host).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activity {
+    pub id: String,
+    /// `activity_type`.
+    pub kind: String,
+    /// `activity_input`, a list.
+    pub input: Value,
+}
+
+/// How an activity ended.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Outcome {
+    pub output: Option<Value>,
+    /// `{type, message}` for a failed activity.
+    pub error: Option<Value>,
+    pub duration_ms: Option<u64>,
+}
+
+/// A governed request's response: its span, completed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Completion {
     pub sandbox_id: String,
     pub request_id: String,
-    pub activity_id: String,
-    pub activity_type: String,
-    pub method: String,
-    pub url: String,
+    pub activity: Activity,
+    /// The request's started span, as Core scored it.
+    pub span: Value,
     pub status_code: u32,
-    pub duration_ms: Option<u64>,
+    pub response_headers: Value,
+    pub response_body: Option<String>,
 }
 
 fn form_encode(fields: &[(&str, &str)]) -> String {
@@ -669,47 +728,36 @@ fn idempotency_key(raw: &str) -> String {
         .collect()
 }
 
+/// The fields every event of a sandbox's session carries.
+fn workflow_event(sandbox_id: &str, event_type: &str, now: SystemTime) -> Value {
+    json!({
+        "source": "workflow-telemetry",
+        "event_type": event_type,
+        "workflow_id": sandbox_id,
+        "run_id": sandbox_id,
+        "workflow_type": WORKFLOW_TYPE,
+        "task_queue": TASK_QUEUE,
+        "timestamp": rfc3339_micros(now),
+    })
+}
+
 fn session_event(
     sandbox_id: &str,
     sandbox_name: &str,
     input: Option<&Value>,
     now: SystemTime,
 ) -> Value {
-    let mut event = json!({
-        "source": "workflow-telemetry",
-        "event_type": "WorkflowStarted",
-        "workflow_id": sandbox_id,
-        "run_id": sandbox_id,
-        "workflow_type": WORKFLOW_TYPE,
-        "task_queue": TASK_QUEUE,
-        "timestamp": rfc3339_micros(now),
-        "span_count": 0,
-        "spans": [],
-        "hook_trigger": false,
-        "metadata": {"openshell": {"sandbox_id": sandbox_id, "sandbox": sandbox_name}},
-    });
-    if let Some(input) = input {
-        event["activity_input"] = json!([input]);
-    }
+    let mut event = workflow_event(sandbox_id, "WorkflowStarted", now);
+    event["activity_input"] = json!([input
+        .cloned()
+        .unwrap_or_else(|| json!({"name": sandbox_name}))]);
     event
 }
 
 fn session_end_event(sandbox_id: &str, duration_ms: Option<u64>, now: SystemTime) -> Value {
-    let mut event = json!({
-        "source": "workflow-telemetry",
-        "event_type": "WorkflowCompleted",
-        "workflow_id": sandbox_id,
-        "run_id": sandbox_id,
-        "workflow_type": WORKFLOW_TYPE,
-        "task_queue": TASK_QUEUE,
-        "timestamp": rfc3339_micros(now),
-        "status": "completed",
-        "activity_output": [{"reason": "sandbox deleted"}],
-        "span_count": 0,
-        "spans": [],
-        "hook_trigger": false,
-        "metadata": {"openshell": {"sandbox_id": sandbox_id}},
-    });
+    let mut event = workflow_event(sandbox_id, "WorkflowCompleted", now);
+    event["status"] = json!("completed");
+    event["workflow_output"] = json!({"reason": "sandbox deleted"});
     if let Some(duration) = duration_ms {
         #[allow(clippy::cast_precision_loss)]
         let duration = duration as f64;
@@ -719,73 +767,86 @@ fn session_end_event(sandbox_id: &str, duration_ms: Option<u64>, now: SystemTime
 }
 
 fn signal_event(sandbox_id: &str, signal_name: &str, args: &Value, now: SystemTime) -> Value {
-    json!({
-        "source": "workflow-telemetry",
-        "event_type": "SignalReceived",
-        "workflow_id": sandbox_id,
-        "run_id": sandbox_id,
-        "workflow_type": WORKFLOW_TYPE,
-        "task_queue": TASK_QUEUE,
-        "signal_name": signal_name,
-        "signal_args": [args],
-        "activity_input": [args],
-        "timestamp": rfc3339_micros(now),
-        "span_count": 0,
-        "spans": [],
-        "hook_trigger": false,
-        "metadata": {"openshell": {"sandbox_id": sandbox_id}},
-    })
+    let mut event = workflow_event(sandbox_id, "SignalReceived", now);
+    event["signal_name"] = json!(signal_name);
+    event["signal_args"] = json!([args]);
+    event
 }
 
-fn completion_event(completion: &Completion, now: SystemTime) -> Value {
-    let mut event = json!({
-        "source": "workflow-telemetry",
-        "event_type": "ActivityCompleted",
-        "workflow_id": completion.sandbox_id,
-        "run_id": completion.sandbox_id,
-        "workflow_type": WORKFLOW_TYPE,
-        "task_queue": TASK_QUEUE,
-        "activity_id": completion.activity_id,
-        "activity_type": completion.activity_type,
-        "attempt": 1,
-        "activity_output": [{
-            "status_code": completion.status_code,
-            "method": completion.method,
-            "url": completion.url,
-        }],
-        "status": if completion.status_code >= 500 { "failed" } else { "completed" },
-        "timestamp": rfc3339_micros(now),
-        "hook_trigger": false,
-        "span_count": 0,
-        "spans": [],
-        "metadata": {"openshell": {
-            "sandbox_id": completion.sandbox_id,
-            "request_id": completion.request_id,
-        }},
+fn activity_event(
+    sandbox_id: &str,
+    activity: &Activity,
+    event_type: &str,
+    now: SystemTime,
+) -> Value {
+    let mut event = workflow_event(sandbox_id, event_type, now);
+    event["activity_id"] = json!(activity.id);
+    event["activity_type"] = json!(activity.kind);
+    event["attempt"] = json!(1);
+    event["activity_input"] = activity.input.clone();
+    event
+}
+
+/// The plain `ActivityStarted` that opens an activity: its input, no span.
+fn activity_started_event(sandbox_id: &str, activity: &Activity, now: SystemTime) -> Value {
+    activity_event(sandbox_id, activity, "ActivityStarted", now)
+}
+
+fn activity_completed_event(
+    sandbox_id: &str,
+    activity: &Activity,
+    outcome: &Outcome,
+    now: SystemTime,
+) -> Value {
+    let mut event = activity_event(sandbox_id, activity, "ActivityCompleted", now);
+    event["activity_output"] = outcome.output.clone().unwrap_or(Value::Null);
+    event["status"] = json!(if outcome.error.is_some() {
+        "failed"
+    } else {
+        "completed"
     });
-    if let Some(duration) = completion.duration_ms {
+    if let Some(error) = &outcome.error {
+        event["error"] = error.clone();
+    }
+    if let Some(duration) = outcome.duration_ms {
         #[allow(clippy::cast_precision_loss)]
         let duration = duration as f64;
         event["duration_ms"] = json!(duration);
     }
+    event["span_count"] = json!(0);
+    event["spans"] = json!([]);
     event
 }
 
-fn action_event(action: &Action, activity_id: &str, body_limit: usize, now: SystemTime) -> Value {
-    let is_mcp = !action.tools().is_empty();
-    let url = request_url(action);
-    let started_ns = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let mut attributes = json!({
-        "http.request.method": action.method,
-        "url.full": url,
-        "server.address": action.host,
-        "server.port": action.port,
-        "openshell.sandbox_id": action.sandbox_id,
-        "openshell.request_id": action.request_id,
-    });
-    if let Some(binary) = &action.process_binary {
-        attributes["process.executable.path"] = json!(binary);
-    }
+/// A hook `ActivityStarted`: the activity's context and one span.
+fn hook_event(sandbox_id: &str, activity: &Activity, span: Value, now: SystemTime) -> Value {
+    let mut event = activity_event(sandbox_id, activity, "ActivityStarted", now);
+    event["activity_output"] = Value::Null;
+    event["hook_trigger"] = json!(true);
+    event["span_count"] = json!(1);
+    event["spans"] = json!([span]);
+    event
+}
+
+/// The started hook for a request: its span, before it goes out.
+fn action_event(action: &Action, activity: &Activity, span: &Value, now: SystemTime) -> Value {
+    hook_event(&action.sandbox_id, activity, span.clone(), now)
+}
+
+/// A request's span as it starts, with the agent SDK's keys.
+///
+/// Every field is present, the response ones null until it completes. The
+/// span and trace ids come from the request id, so the completed span pairs
+/// with it.
+pub fn started_span(
+    action: &Action,
+    activity_id: &str,
+    body_limit: usize,
+    now: SystemTime,
+) -> Value {
+    let (span_id, trace_id) = span_ids(&action.request_id);
+    let mut attributes = json!({});
+    let mut mcp = false;
     if let Payload::JsonRpc(calls) = &action.payload
         && let Some(call) = calls
             .iter()
@@ -794,6 +855,7 @@ fn action_event(action: &Action, activity_id: &str, body_limit: usize, now: Syst
     {
         attributes["rpc.method"] = json!(call.method);
         if let Some(tool) = &call.tool {
+            mcp = true;
             attributes["mcp.method"] = json!("callTool");
             attributes["mcp.server_id"] = json!(action.host);
             attributes["mcp.operation"] = json!(tool);
@@ -804,126 +866,72 @@ fn action_event(action: &Action, activity_id: &str, body_limit: usize, now: Syst
             );
         }
     }
-    let (span_id, trace_id) = span_ids(&action.request_id);
-    let span = json!({
+    json!({
         "span_id": span_id,
         "trace_id": trace_id,
+        "parent_span_id": null,
         "name": format!("HTTP {}", action.method),
         "kind": "CLIENT",
         "stage": "started",
-        "start_time": u64::try_from(started_ns).unwrap_or(u64::MAX),
+        "start_time": unix_nanos(now),
         "end_time": null,
+        "duration_ns": null,
         "attributes": attributes,
-        "status": {"code": "UNSET"},
+        "status": {"code": "UNSET", "description": null},
         "events": [],
-        "hook_type": if is_mcp { "mcp" } else { "http_request" },
-        "http_method": action.method,
-        "http_url": url,
-        "request_headers": {},
-        "request_body": body_text(&action.body, body_limit),
-        "http_status_code": null,
-    });
-    json!({
-        "source": "workflow-telemetry",
-        "event_type": "ActivityStarted",
-        "workflow_id": action.sandbox_id,
-        "run_id": action.sandbox_id,
-        "workflow_type": WORKFLOW_TYPE,
-        "task_queue": TASK_QUEUE,
+        "hook_type": if mcp { "mcp" } else { "http_request" },
+        "semantic_type": null,
+        "attribute_key_identifiers": ["http_method", "http_url"],
         "activity_id": activity_id,
-        "activity_type": activity_name(action),
-        "attempt": 1,
-        "activity_input": [{
-            "method": action.method,
-            "url": url,
-            "tools": action.tools(),
-            "body_bytes": action.body_bytes,
-        }],
-        "timestamp": rfc3339_micros(now),
-        "hook_trigger": true,
-        "span_count": 1,
-        "spans": [span],
-        "metadata": {"openshell": {
-            "sandbox_id": action.sandbox_id,
-            "sandbox": action.sandbox_name,
-            "request_id": action.request_id,
-            "process": action.process_binary,
-            "ancestors": action.process_ancestors,
-        }},
+        "http_method": action.method,
+        "http_url": request_url(action),
+        "http_status_code": null,
+        "request_headers": crate::agent::headers_object(
+            action.headers.iter().map(|(name, value)| (name.as_str(), value.as_str()))
+        ),
+        "request_body": body_text(&action.body, body_limit),
+        "response_headers": null,
+        "response_body": null,
+        "error": null,
     })
 }
 
-/// The plain `ActivityStarted` that opens an activity: its input, no span.
-fn activity_event(action: &Action, activity_id: &str, now: SystemTime) -> Value {
-    let mut event = action_event(action, activity_id, 0, now);
-    event["hook_trigger"] = json!(false);
-    event["span_count"] = json!(0);
-    event["spans"] = json!([]);
-    event
-}
-
-/// The request's span again, completed with its response: a hook
-/// `ActivityStarted` under the same activity, span and trace ids, stage
-/// `completed`.
+/// The request's span again, completed with its response: a hook on its
+/// activity under the same span and trace ids, with the start it was scored
+/// at.
 fn completed_span_event(completion: &Completion, now: SystemTime) -> Value {
-    let (span_id, trace_id) = span_ids(&completion.request_id);
-    let end_ns = now
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-    let duration_ns = completion
-        .duration_ms
-        .map_or(0, |ms| ms.saturating_mul(1_000_000));
-    let span = json!({
-        "span_id": span_id,
-        "trace_id": trace_id,
-        "name": format!("HTTP {}", completion.method),
-        "kind": "CLIENT",
-        "stage": "completed",
-        "start_time": end_ns.saturating_sub(duration_ns),
-        "end_time": end_ns,
-        "duration_ns": duration_ns,
-        "attributes": {
-            "http.request.method": completion.method,
-            "url.full": completion.url,
-            "http.response.status_code": completion.status_code,
-            "openshell.sandbox_id": completion.sandbox_id,
-            "openshell.request_id": completion.request_id,
-        },
-        "status": {"code": if completion.status_code >= 500 { "ERROR" } else { "OK" }},
-        "events": [],
-        "hook_type": if completion.activity_type.starts_with("MCP ") { "mcp" } else { "http_request" },
-        "http_method": completion.method,
-        "http_url": completion.url,
-        "request_headers": {},
-        "http_status_code": completion.status_code,
-    });
-    json!({
-        "source": "workflow-telemetry",
-        "event_type": "ActivityStarted",
-        "workflow_id": completion.sandbox_id,
-        "run_id": completion.sandbox_id,
-        "workflow_type": WORKFLOW_TYPE,
-        "task_queue": TASK_QUEUE,
-        "activity_id": completion.activity_id,
-        "activity_type": completion.activity_type,
-        "attempt": 1,
-        "timestamp": rfc3339_micros(now),
-        "hook_trigger": true,
-        "span_count": 1,
-        "spans": [span],
-        "metadata": {"openshell": {
-            "sandbox_id": completion.sandbox_id,
-            "request_id": completion.request_id,
-        }},
-    })
+    let end = unix_nanos(now);
+    let mut span = completion.span.clone();
+    let start = span
+        .get("start_time")
+        .and_then(Value::as_u64)
+        .unwrap_or(end);
+    span["stage"] = json!("completed");
+    span["end_time"] = json!(end);
+    span["duration_ns"] = json!(end.saturating_sub(start));
+    span["http_status_code"] = json!(completion.status_code);
+    span["response_headers"] = completion.response_headers.clone();
+    span["response_body"] = json!(completion.response_body);
+    span["error"] = if completion.status_code >= 400 {
+        json!(format!("HTTP {}", completion.status_code))
+    } else {
+        Value::Null
+    };
+    hook_event(&completion.sandbox_id, &completion.activity, span, now)
 }
 
 /// A request's span and trace ids, derived from its request id so its
 /// started and completed spans pair up, and a resent request names the same
 /// span.
-fn span_ids(request_id: &str) -> (String, String) {
+pub fn span_ids(request_id: &str) -> (String, String) {
     let digest = Sha256::digest(request_id.as_bytes());
     (hex(&digest[..8]), hex(&digest[8..24]))
+}
+
+fn unix_nanos(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+    })
 }
 
 pub fn request_url(action: &Action) -> String {
@@ -1112,130 +1120,193 @@ mod tests {
         assert_eq!(parse_rfc3339("yesterday"), None);
     }
 
+    fn activity(id: &str, kind: &str) -> Activity {
+        Activity {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            input: json!([{"prompt": "hi"}]),
+        }
+    }
+
     #[test]
     fn an_mcp_tool_call_becomes_an_mcp_hook_span() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_database","arguments":{"name":"prod"}}}"#;
         let action = Action::from_evaluation(&evaluation("POST", "/mcp", body));
-        let event = action_event(
-            &action,
-            "oshx-req-1",
-            1024,
-            UNIX_EPOCH + Duration::from_secs(1_790_674_275),
-        );
+        assert_eq!(activity_name(&action), "delete_database");
+        let tool = activity("oshx-req-1", "delete_database");
+        let now = UNIX_EPOCH + Duration::from_secs(1_790_674_275);
+        let span = started_span(&action, &tool.id, 1024, now);
+        let event = action_event(&action, &tool, &span, now);
         assert_eq!(event["event_type"], "ActivityStarted");
         assert_eq!(event["hook_trigger"], true);
+        assert_eq!(event["span_count"], 1);
         assert_eq!(event["workflow_id"], "sbx-id-1");
         assert_eq!(event["run_id"], "sbx-id-1");
-        assert_eq!(event["activity_type"], "MCP delete_database");
+        assert_eq!(event["activity_type"], "delete_database");
         assert_eq!(event["activity_id"], "oshx-req-1");
+        assert_eq!(event["activity_input"], json!([{"prompt": "hi"}]));
+        assert_eq!(event["attempt"], 1);
+        assert!(event["activity_output"].is_null());
+        assert!(event.get("metadata").is_none());
         let span = &event["spans"][0];
         assert_eq!(span["hook_type"], "mcp");
         assert_eq!(span["stage"], "started");
+        assert_eq!(span["name"], "HTTP POST");
         assert_eq!(span["http_url"], "https://mcp.example.com/mcp");
         assert_eq!(span["attributes"]["mcp.method"], "callTool");
         assert_eq!(span["attributes"]["mcp.operation"], "delete_database");
         assert_eq!(span["attributes"]["mcp.input"], r#"{"name":"prod"}"#);
         assert_eq!(span["span_id"].as_str().unwrap().len(), 16);
         assert_eq!(span["trace_id"].as_str().unwrap().len(), 32);
+        assert_eq!(span["activity_id"], "oshx-req-1");
     }
 
     #[test]
-    fn a_plain_request_becomes_an_http_hook_span_with_a_bounded_body() {
+    fn a_started_span_has_every_sdk_field() {
         let mut evaluation = evaluation("POST", "/v1/charge", b"0123456789");
         let target = evaluation.target.as_mut().unwrap();
         target.port = 8443;
         target.query = "dry_run=1".to_owned();
         let action = Action::from_evaluation(&evaluation);
-        let event = action_event(&action, "oshx-req-1", 4, UNIX_EPOCH);
-        let span = &event["spans"][0];
-        assert_eq!(event["activity_type"], "POST mcp.example.com");
-        assert_eq!(span["hook_type"], "http_request");
-        assert_eq!(
-            span["http_url"],
-            "https://mcp.example.com:8443/v1/charge?dry_run=1"
+        let span = started_span(
+            &action,
+            "oshx-req-1",
+            4,
+            UNIX_EPOCH + Duration::from_secs(2),
         );
-        assert_eq!(span["request_body"], "0123");
+        assert_eq!(
+            span,
+            json!({
+                "span_id": span["span_id"], "trace_id": span["trace_id"], "parent_span_id": null,
+                "name": "HTTP POST", "kind": "CLIENT", "stage": "started",
+                "start_time": 2_000_000_000_u64, "end_time": null, "duration_ns": null,
+                "attributes": {}, "status": {"code": "UNSET", "description": null}, "events": [],
+                "hook_type": "http_request", "semantic_type": null,
+                "attribute_key_identifiers": ["http_method", "http_url"],
+                "activity_id": "oshx-req-1",
+                "http_method": "POST",
+                "http_url": "https://mcp.example.com:8443/v1/charge?dry_run=1",
+                "http_status_code": null,
+                "request_headers": {"content-type": "application/json"},
+                "request_body": "0123",
+                "response_headers": null, "response_body": null, "error": null,
+            })
+        );
     }
 
     #[test]
-    fn an_activity_opens_without_a_span_before_its_hook() {
-        let action = Action::from_evaluation(&evaluation("GET", "/", b""));
-        let opened = activity_event(&action, "oshx-req-1", UNIX_EPOCH);
+    fn an_activity_opens_without_a_span_and_closes_with_its_output() {
+        let llm = activity("oshx-req-1", LLM_CALL);
+        let opened = activity_started_event("sbx-id-1", &llm, UNIX_EPOCH);
         assert_eq!(opened["event_type"], "ActivityStarted");
-        assert_eq!(opened["hook_trigger"], false);
-        assert_eq!(opened["span_count"], 0);
-        assert_eq!(opened["spans"], json!([]));
-        assert_eq!(opened["activity_id"], "oshx-req-1");
-        assert_eq!(opened["activity_input"][0]["method"], "GET");
+        assert!(opened.get("hook_trigger").is_none());
+        assert!(opened.get("spans").is_none());
+        assert_eq!(opened["activity_type"], "llm_call");
+        assert_eq!(opened["activity_input"], json!([{"prompt": "hi"}]));
+        assert_eq!(opened["task_queue"], "openshell");
+
+        let output = json!({"llm_model": "claude-x", "completion": "Hello"});
+        let closed = activity_completed_event(
+            "sbx-id-1",
+            &llm,
+            &Outcome {
+                output: Some(output.clone()),
+                error: None,
+                duration_ms: Some(12),
+            },
+            UNIX_EPOCH,
+        );
+        assert_eq!(closed["event_type"], "ActivityCompleted");
+        assert_eq!(closed["activity_output"], output);
+        assert_eq!(closed["status"], "completed");
+        assert_eq!(closed["duration_ms"], 12.0);
+        assert_eq!(closed["spans"], json!([]));
+        assert!(closed.get("error").is_none());
+
+        let failed = activity_completed_event(
+            "sbx-id-1",
+            &llm,
+            &Outcome {
+                error: Some(json!({"type": "HTTPError", "message": "HTTP 502"})),
+                ..Outcome::default()
+            },
+            UNIX_EPOCH,
+        );
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"]["message"], "HTTP 502");
+        assert!(failed.get("duration_ms").is_none());
     }
 
     #[test]
     fn a_response_completes_the_requests_span() {
         let action = Action::from_evaluation(&evaluation("GET", "/", b""));
-        let started = action_event(&action, "oshx-req-1", 1024, UNIX_EPOCH);
+        let fetch = activity("oshx-tool-toolu-1", "fetch");
+        let started = started_span(
+            &action,
+            &fetch.id,
+            1024,
+            UNIX_EPOCH + Duration::from_secs(1),
+        );
         let completion = Completion {
             sandbox_id: action.sandbox_id.clone(),
             request_id: action.request_id,
-            activity_id: "oshx-req-1".to_owned(),
-            activity_type: "GET mcp.example.com".to_owned(),
-            method: "GET".to_owned(),
-            url: "https://mcp.example.com/".to_owned(),
+            activity: fetch,
+            span: started.clone(),
             status_code: 503,
-            duration_ms: Some(12),
+            response_headers: json!({"content-type": "text/html"}),
+            response_body: Some("<html>busy</html>".to_owned()),
         };
-        let event = completed_span_event(&completion, UNIX_EPOCH + Duration::from_secs(1));
+        let event = completed_span_event(&completion, UNIX_EPOCH + Duration::from_secs(3));
         assert_eq!(event["event_type"], "ActivityStarted");
         assert_eq!(event["hook_trigger"], true);
-        assert_eq!(event["activity_id"], "oshx-req-1");
+        assert_eq!(event["activity_id"], "oshx-tool-toolu-1");
+        assert_eq!(event["activity_type"], "fetch");
         let span = &event["spans"][0];
         assert_eq!(span["stage"], "completed");
-        assert_eq!(span["span_id"], started["spans"][0]["span_id"]);
-        assert_eq!(span["trace_id"], started["spans"][0]["trace_id"]);
-        assert_eq!(span["end_time"], 1_000_000_000_u64);
-        assert_eq!(span["duration_ns"], 12_000_000_u64);
-        assert_eq!(span["start_time"], 988_000_000_u64);
+        assert_eq!(span["span_id"], started["span_id"]);
+        assert_eq!(span["trace_id"], started["trace_id"]);
+        // The start Core scored, kept across both stages.
+        assert_eq!(span["start_time"], 1_000_000_000_u64);
+        assert_eq!(span["end_time"], 3_000_000_000_u64);
+        assert_eq!(span["duration_ns"], 2_000_000_000_u64);
         assert_eq!(span["http_status_code"], 503);
-        assert_eq!(span["status"]["code"], "ERROR");
-        assert_eq!(span["hook_type"], "http_request");
+        assert_eq!(span["error"], "HTTP 503");
+        assert_eq!(span["status"]["code"], "UNSET");
+        assert_eq!(span["response_body"], "<html>busy</html>");
+        assert_eq!(span["response_headers"]["content-type"], "text/html");
+        assert_eq!(span["request_headers"]["content-type"], "application/json");
     }
 
     #[test]
-    fn request_activity_ids_are_bounded_and_clean() {
+    fn request_and_tool_activity_ids_are_bounded_and_clean() {
         assert_eq!(request_activity_id("4751e07a-e1a0"), "oshx-4751e07a-e1a0");
         let id = request_activity_id(&format!("{}/../\n", "a".repeat(200)));
         assert!(id.len() <= 64);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert_eq!(tool_activity_id("toolu_01AbC"), "oshx-tool-toolu-01AbC");
+        assert!(tool_activity_id(&"x".repeat(300)).len() <= 64);
     }
 
     #[test]
-    fn a_response_completes_its_activity() {
-        let completion = Completion {
-            sandbox_id: "sbx-id-1".to_owned(),
-            request_id: "req-1".to_owned(),
-            activity_id: "oshx-req-1".to_owned(),
-            activity_type: "GET example.com".to_owned(),
-            method: "GET".to_owned(),
-            url: "http://example.com/".to_owned(),
-            status_code: 200,
-            duration_ms: Some(12),
-        };
-        let event = completion_event(&completion, UNIX_EPOCH);
-        assert_eq!(event["event_type"], "ActivityCompleted");
-        assert_eq!(event["activity_id"], "oshx-req-1");
-        assert_eq!(event["activity_type"], "GET example.com");
-        assert_eq!(event["status"], "completed");
-        assert_eq!(event["duration_ms"], 12.0);
-        assert_eq!(event["activity_output"][0]["status_code"], 200);
-        let failed = completion_event(
-            &Completion {
-                status_code: 502,
-                duration_ms: None,
-                ..completion
-            },
+    fn session_and_signal_events_follow_the_sdk() {
+        let started = session_event("sbx-id-1", "my-box", None, UNIX_EPOCH);
+        assert_eq!(started["event_type"], "WorkflowStarted");
+        assert_eq!(started["activity_input"], json!([{"name": "my-box"}]));
+        assert!(started.get("spans").is_none());
+        let ended = session_end_event("sbx-id-1", Some(5), UNIX_EPOCH);
+        assert_eq!(ended["status"], "completed");
+        assert_eq!(ended["workflow_output"]["reason"], "sandbox deleted");
+        assert!(ended.get("activity_output").is_none());
+        let signal = signal_event(
+            "sbx-id-1",
+            "user_prompt",
+            &json!({"prompt": "hi"}),
             UNIX_EPOCH,
         );
-        assert_eq!(failed["status"], "failed");
-        assert!(failed.get("duration_ms").is_none());
+        assert_eq!(signal["signal_name"], "user_prompt");
+        assert_eq!(signal["signal_args"], json!([{"prompt": "hi"}]));
+        assert!(signal.get("activity_input").is_none());
+        assert!(signal.get("metadata").is_none());
     }
 
     #[test]

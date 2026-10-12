@@ -13,8 +13,20 @@
 //! middleware already comes from inside an `OpenShell` sandbox under policy, so
 //! the constraint is met and the request proceeds, with a finding recording it.
 //!
-//! Each request is its own Core activity (`oshx-<request id>`), and its
-//! response closes it ([`Guard::complete`]).
+//! Sessions follow the agent SDK's activity pattern ([`crate::agent`]):
+//!
+//! | Request                         | Activity                                    |
+//! |---------------------------------|---------------------------------------------|
+//! | a model call                    | its own `llm_call`, closed by its reply     |
+//! | an MCP `tools/call`             | its own, named by the tool                  |
+//! | any other, while a tool is open | the tool the model last asked for           |
+//! | any other                       | its own, named by method and host           |
+//!
+//! Every request is a span on its activity: started with its verdict,
+//! completed with its response ([`Guard::complete`]). A model call's reply
+//! opens the tools it asks for; the agent's next model call closes them with
+//! their results. Which tools are open lives in the shared store, so any
+//! replica routes a sandbox's requests the same way.
 //!
 //! Approvals are deny-then-retry, because `OpenShell` has no way to hold a
 //! request. When Core requires approval, the guard records `sandbox + action
@@ -50,18 +62,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use openshell_core::proto::{Decision, Finding, HttpRequestResult};
 use serde_json::{Value, json};
 
-use crate::action::Action;
+use sha2::Digest as _;
+
+use crate::action::{Action, Payload};
+use crate::agent;
 use crate::core_client::{
-    ApprovalState, Completion, CoreDecision, CoreError, Verdict, activity_name, request_activity_id,
+    Activity, ApprovalState, Completion, CoreDecision, CoreError, LLM_CALL, Outcome, Verdict,
+    activity_name, request_activity_id, request_url, span_ids, started_span, tool_activity_id,
 };
 use crate::metrics::{CoreCall, Metrics};
 use crate::prompt::{self, Capture};
-use crate::store::{MemoryStore, SharedStore, approval_key, prompt_key, request_key};
+use crate::store::{
+    MemoryStore, SharedStore, approval_key, open_tools_key, prompt_key, request_key, tool_key,
+};
 
 /// How long an approval can be matched by its retry, unless configured.
 pub const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(15 * 60);
 /// How long a request waits for its response to complete its activity.
 const REQUEST_TTL: Duration = Duration::from_secs(60 * 60);
+/// How long a tool the model asked for is tracked, open or closed.
+const TOOL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a signalled prompt turn is remembered. Conversations resent
 /// after that are signalled again, which Core replays by idempotency key.
 const PROMPT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -87,17 +107,32 @@ pub trait Governance: Send + Sync + 'static {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<CoreDecision, CoreError>;
+    /// Most of a request or response body sent to Core.
+    fn body_limit(&self) -> usize;
+    async fn open_activity(
+        &self,
+        sandbox_id: &str,
+        activity: &Activity,
+    ) -> Result<CoreDecision, CoreError>;
     async fn evaluate_action(
         &self,
         action: &Action,
-        activity_id: &str,
+        activity: &Activity,
+        open: bool,
+        span: &Value,
     ) -> Result<CoreDecision, CoreError>;
     async fn approval_state(
         &self,
         action: &Action,
         activity_id: &str,
     ) -> Result<ApprovalState, CoreError>;
-    async fn complete_activity(&self, completion: &Completion) -> Result<CoreDecision, CoreError>;
+    async fn complete_request(&self, completion: &Completion) -> Result<CoreDecision, CoreError>;
+    async fn close_activity(
+        &self,
+        sandbox_id: &str,
+        activity: &Activity,
+        outcome: &Outcome,
+    ) -> Result<CoreDecision, CoreError>;
     async fn signal(
         &self,
         sandbox_id: &str,
@@ -116,12 +151,24 @@ impl Governance for crate::core_client::CoreClient {
     ) -> Result<CoreDecision, CoreError> {
         Self::start_session(self, sandbox_id, sandbox_name).await
     }
+    fn body_limit(&self) -> usize {
+        Self::body_limit(self)
+    }
+    async fn open_activity(
+        &self,
+        sandbox_id: &str,
+        activity: &Activity,
+    ) -> Result<CoreDecision, CoreError> {
+        Self::open_activity(self, sandbox_id, activity).await
+    }
     async fn evaluate_action(
         &self,
         action: &Action,
-        activity_id: &str,
+        activity: &Activity,
+        open: bool,
+        span: &Value,
     ) -> Result<CoreDecision, CoreError> {
-        Self::evaluate_action(self, action, activity_id).await
+        Self::evaluate_action(self, action, activity, open, span).await
     }
     async fn approval_state(
         &self,
@@ -130,8 +177,16 @@ impl Governance for crate::core_client::CoreClient {
     ) -> Result<ApprovalState, CoreError> {
         Self::approval_state(self, action, activity_id).await
     }
-    async fn complete_activity(&self, completion: &Completion) -> Result<CoreDecision, CoreError> {
-        Self::complete_activity(self, completion).await
+    async fn complete_request(&self, completion: &Completion) -> Result<CoreDecision, CoreError> {
+        Self::complete_request(self, completion).await
+    }
+    async fn close_activity(
+        &self,
+        sandbox_id: &str,
+        activity: &Activity,
+        outcome: &Outcome,
+    ) -> Result<CoreDecision, CoreError> {
+        Self::close_activity(self, sandbox_id, activity, outcome).await
     }
     async fn signal(
         &self,
@@ -153,6 +208,11 @@ pub struct ResponseSeen {
     pub url: String,
     pub host: String,
     pub status_code: u32,
+    /// Response headers in wire order, as `OpenShell` shows them.
+    pub headers: Vec<(String, String)>,
+    /// The body as read, up to the capture limit; `None` when it could not
+    /// be read (bodyless, compressed, or capture off).
+    pub body: Option<Vec<u8>>,
 }
 
 /// Stops a sandbox after a HALT. Called in the background; the triggering
@@ -303,48 +363,37 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         if let Some(result) = self.signal_prompt(action).await {
             return result;
         }
+        let model = agent::model_call(action);
+        if let Some(model) = &model {
+            self.close_tools(&action.sandbox_id, model).await;
+        }
+        let Route {
+            mut activity,
+            mut open,
+            closes,
+        } = self.route(action, model.as_ref()).await;
         let approval = approval_key(&action.sandbox_id, &action.fingerprint);
-        let mut activity_id = request_activity_id(&action.request_id);
         if mode == ApprovalMode::Queue {
-            match self.store.get(&approval).await {
-                Ok(Some(held)) => match self
-                    .timed(
-                        CoreCall::Approval,
-                        self.governance.approval_state(action, &held),
-                    )
-                    .await
-                {
-                    Ok(ApprovalState::Pending { .. }) => {
-                        return deny(REASON_APPROVAL_REQUIRED, "awaiting human approval", None);
-                    }
-                    Ok(ApprovalState::Approved) => activity_id = held,
-                    Ok(ApprovalState::Gone) => {
-                        let _ = self.store.delete(&approval).await;
-                    }
-                    Ok(ApprovalState::Rejected(verdict)) => {
-                        let decision = CoreDecision {
-                            verdict,
-                            reason: Some("approval was rejected".to_owned()),
-                            governance_event_id: None,
-                            risk_score: None,
-                            approval_expires_at: None,
-                            policy_id: None,
-                        };
-                        return self.apply(action, mode, &decision);
-                    }
-                    Err(error) => return deny(REASON_UNAVAILABLE, &error.to_string(), None),
-                },
+            match self.approved_activity(action, mode, &approval).await {
+                Ok(Some(held)) => {
+                    activity.id = held;
+                    open = false;
+                }
                 Ok(None) => {}
-                Err(error) => eprintln!(
-                    "openbox: approval lookup unavailable, scoring request_id={} as a new activity: {error}",
-                    action.request_id
-                ),
+                Err(result) => return result,
             }
         }
+        let span = started_span(
+            action,
+            &activity.id,
+            self.governance.body_limit(),
+            SystemTime::now(),
+        );
         let decision = match self
             .timed(
                 CoreCall::Evaluate,
-                self.governance.evaluate_action(action, &activity_id),
+                self.governance
+                    .evaluate_action(action, &activity, open, &span),
             )
             .await
         {
@@ -355,7 +404,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             && decision.verdict == Verdict::RequireApproval
             && let Err(error) = self
                 .store
-                .set(&approval, &activity_id, Some(self.approval_ttl))
+                .set(&approval, &activity.id, Some(self.approval_ttl))
                 .await
         {
             eprintln!(
@@ -364,10 +413,16 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             );
         }
         let result = self.apply(action, mode, &decision);
+        let held = mode == ApprovalMode::Queue && decision.verdict == Verdict::RequireApproval;
+        if result.decision != Decision::Allow as i32 && closes && !held {
+            self.close_refused(&action.sandbox_id, activity.clone(), &decision);
+        }
         if result.decision == Decision::Allow as i32 {
             let record = json!({
-                "activity_id": activity_id,
-                "activity_type": activity_name(action),
+                "activity": activity_json(&activity),
+                "closes": closes,
+                "api": model.as_ref().map(|model| model.api.name()),
+                "span": span,
                 "started_ms": unix_millis(),
             });
             if let Err(error) = self
@@ -386,6 +441,88 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             }
         }
         result
+    }
+
+    /// Closes the activity of a request Core refused, as the agent SDK closes
+    /// an activity governance stopped: failed, with the verdict's reason. An
+    /// approval hold stays open for the retry that reuses it.
+    fn close_refused(&self, sandbox_id: &str, activity: Activity, decision: &CoreDecision) {
+        let outcome = Outcome {
+            output: None,
+            error: Some(json!({
+                "type": "GovernanceStop",
+                "message": decision
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| format!("Governance {:?}", decision.verdict)),
+            })),
+            duration_ms: None,
+        };
+        let governance = Arc::clone(&self.governance);
+        let sandbox_id = sandbox_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = governance
+                .close_activity(&sandbox_id, &activity, &outcome)
+                .await
+            {
+                eprintln!(
+                    "openbox: refused activity {} not closed: {error}",
+                    activity.id
+                );
+            }
+        });
+    }
+
+    /// The activity Core holds an approval on for this exact action, once a
+    /// human approved it. `Err` is the result for a retry that may not go
+    /// through: still pending, rejected, or Core unreachable.
+    async fn approved_activity(
+        &self,
+        action: &Action,
+        mode: ApprovalMode,
+        approval: &str,
+    ) -> Result<Option<String>, HttpRequestResult> {
+        let held = match self.store.get(approval).await {
+            Ok(Some(held)) => held,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                eprintln!(
+                    "openbox: approval lookup unavailable, scoring request_id={} as a new activity: {error}",
+                    action.request_id
+                );
+                return Ok(None);
+            }
+        };
+        match self
+            .timed(
+                CoreCall::Approval,
+                self.governance.approval_state(action, &held),
+            )
+            .await
+        {
+            Ok(ApprovalState::Pending { .. }) => Err(deny(
+                REASON_APPROVAL_REQUIRED,
+                "awaiting human approval",
+                None,
+            )),
+            Ok(ApprovalState::Approved) => Ok(Some(held)),
+            Ok(ApprovalState::Gone) => {
+                let _ = self.store.delete(approval).await;
+                Ok(None)
+            }
+            Ok(ApprovalState::Rejected(verdict)) => {
+                let decision = CoreDecision {
+                    verdict,
+                    reason: Some("approval was rejected".to_owned()),
+                    governance_event_id: None,
+                    risk_score: None,
+                    approval_expires_at: None,
+                    policy_id: None,
+                };
+                Err(self.apply(action, mode, &decision))
+            }
+            Err(error) => Err(deny(REASON_UNAVAILABLE, &error.to_string(), None)),
+        }
     }
 
     /// Signals a model call's new user prompt. `Some` denies the call because
@@ -432,49 +569,316 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         }
     }
 
-    /// Closes the activity a response belongs to. Runs in the background: the
-    /// response is not held for Core.
+    /// Records a response: its span, completed, and the end of its activity
+    /// unless it ran inside a tool. A model call's reply is read for the
+    /// `llm_call` output and for the tools it asks for, which open here.
+    ///
+    /// The store is updated before this returns, so the sandbox's next
+    /// request (the tool at work) is routed into the tool's activity even on
+    /// another replica. Core calls run in the background: the response is
+    /// not held for Core.
     pub async fn complete(&self, response: ResponseSeen) {
         let record = self
             .store
             .take(&request_key(&response.request_id))
             .await
             .unwrap_or_default()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-        let field = |name: &str| {
-            record
-                .as_ref()
-                .and_then(|record| record.get(name))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .unwrap_or(Value::Null);
+        let activity = record
+            .get("activity")
+            .and_then(activity_from)
+            .unwrap_or_else(|| Activity {
+                id: request_activity_id(&response.request_id),
+                kind: format!("{} {}", response.method, response.host),
+                input: json!([{"method": response.method, "url": response.url}]),
+            });
+        let closes = record
+            .get("closes")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let duration_ms = record
+            .get("started_ms")
+            .and_then(Value::as_u64)
+            .map(|started| unix_millis().saturating_sub(started));
+        let limit = self.governance.body_limit();
+        let reply = record
+            .get("api")
+            .and_then(Value::as_str)
+            .and_then(agent::Api::parse)
+            .zip(response.body.as_deref())
+            .and_then(|(api, body)| agent::parse_reply(api, body));
+        let outcome = outcome(&response, reply.as_ref(), duration_ms, limit);
         let completion = Completion {
-            activity_id: field("activity_id")
-                .unwrap_or_else(|| request_activity_id(&response.request_id)),
-            activity_type: field("activity_type")
-                .unwrap_or_else(|| format!("{} {}", response.method, response.host)),
-            duration_ms: record
-                .as_ref()
-                .and_then(|record| record.get("started_ms"))
-                .and_then(Value::as_u64)
-                .map(|started| unix_millis().saturating_sub(started)),
-            sandbox_id: response.sandbox_id,
-            request_id: response.request_id,
-            method: response.method,
-            url: response.url,
+            sandbox_id: response.sandbox_id.clone(),
+            request_id: response.request_id.clone(),
+            span: record
+                .get("span")
+                .cloned()
+                .unwrap_or_else(|| fallback_span(&response, &activity.id)),
+            activity,
             status_code: response.status_code,
+            response_headers: agent::headers_object(
+                response
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            ),
+            response_body: response
+                .body
+                .as_deref()
+                .map(|body| truncate(&String::from_utf8_lossy(body), limit)),
         };
+        let mut tools = Vec::new();
+        for call in reply.iter().flat_map(|reply| &reply.tool_calls) {
+            let tool = tool_activity(call, limit);
+            self.track_tool(&response.sandbox_id, &call.id, &tool).await;
+            tools.push((call.id.clone(), tool));
+        }
         let governance = Arc::clone(&self.governance);
+        let store = Arc::clone(&self.store);
         tokio::spawn(async move {
-            match governance.complete_activity(&completion).await {
-                Ok(_) => eprintln!(
-                    "openbox: completed request_id={} activity_id={} status={}",
-                    completion.request_id, completion.activity_id, completion.status_code
-                ),
-                Err(error) => eprintln!(
-                    "openbox: completion for request_id={} failed: {error}",
+            let sandbox_id = &completion.sandbox_id;
+            if let Err(error) = governance.complete_request(&completion).await {
+                eprintln!(
+                    "openbox: completed span for request_id={} not recorded: {error}",
                     completion.request_id
-                ),
+                );
+            }
+            if closes {
+                match governance
+                    .close_activity(sandbox_id, &completion.activity, &outcome)
+                    .await
+                {
+                    Ok(_) => eprintln!(
+                        "openbox: completed request_id={} activity_id={} status={}",
+                        completion.request_id, completion.activity.id, completion.status_code
+                    ),
+                    Err(error) => eprintln!(
+                        "openbox: activity {} for request_id={} not closed: {error}",
+                        completion.activity.id, completion.request_id
+                    ),
+                }
+            }
+            for (call_id, tool) in tools {
+                match governance.open_activity(sandbox_id, &tool).await {
+                    Ok(_) => {
+                        mark_tool(store.as_ref(), sandbox_id, &call_id, "opened").await;
+                        eprintln!(
+                            "openbox: tool opened sandbox_id={sandbox_id} activity_id={} tool={}",
+                            tool.id, tool.kind
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("openbox: tool activity {} not opened: {error}", tool.id);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Where a request belongs: a model call is its own `llm_call` activity,
+    /// an MCP tool call its own tool activity, any other request runs inside
+    /// the tool the model last asked for while one is open, and otherwise is
+    /// its own activity.
+    async fn route(&self, action: &Action, model: Option<&agent::ModelCall>) -> Route {
+        let own = |kind: String, input: Value| Route {
+            activity: Activity {
+                id: request_activity_id(&action.request_id),
+                kind,
+                input,
+            },
+            open: true,
+            closes: true,
+        };
+        if model.is_some() {
+            return own(LLM_CALL.to_owned(), json!([self.prompt_input(action)]));
+        }
+        if let Payload::JsonRpc(calls) = &action.payload
+            && let Some(call) = calls.iter().find(|call| call.tool.is_some())
+        {
+            return own(
+                activity_name(action),
+                json!([call.arguments.clone().unwrap_or_else(|| json!({}))]),
+            );
+        }
+        if let Some((tool, opened)) = self.open_tool(&action.sandbox_id).await {
+            return Route {
+                activity: tool,
+                open: !opened,
+                closes: false,
+            };
+        }
+        own(
+            activity_name(action),
+            json!([{"method": action.method, "url": request_url(action), "body_bytes": action.body_bytes}]),
+        )
+    }
+
+    /// The `llm_call` input: the user's newest prompt, as captured.
+    fn prompt_input(&self, action: &Action) -> Value {
+        let text = prompt::latest_text(action).unwrap_or_default();
+        match self.capture {
+            Capture::Text => json!({"prompt": truncate(&text, MAX_PROMPT_BYTES)}),
+            Capture::Hash => json!({
+                "prompt_sha256": hex(&sha2::Sha256::digest(text.as_bytes())),
+                "chars": text.chars().count(),
+            }),
+            Capture::Off => json!({}),
+        }
+    }
+
+    /// The tool the model asked for most recently that is still open, and
+    /// whether Core has its start.
+    async fn open_tool(&self, sandbox_id: &str) -> Option<(Activity, bool)> {
+        let open = self.open_tool_ids(sandbox_id).await;
+        for call_id in open.iter().rev() {
+            let Ok(Some(text)) = self.store.get(&tool_key(sandbox_id, call_id)).await else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let state = entry.get("state").and_then(Value::as_str);
+            if let (Some("open" | "opened"), Some(activity)) =
+                (state, entry.get("activity").and_then(activity_from))
+            {
+                return Some((activity, state == Some("opened")));
+            }
+        }
+        None
+    }
+
+    async fn open_tool_ids(&self, sandbox_id: &str) -> Vec<String> {
+        self.store
+            .get(&open_tools_key(sandbox_id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Records a tool the model asked for as open, before Core hears of it.
+    async fn track_tool(&self, sandbox_id: &str, call_id: &str, tool: &Activity) {
+        let entry = json!({
+            "activity": activity_json(tool),
+            "state": "open",
+            "started_ms": unix_millis(),
+        });
+        let mut open = self.open_tool_ids(sandbox_id).await;
+        open.retain(|id| id != call_id);
+        open.push(call_id.to_owned());
+        let written = async {
+            self.store
+                .set(
+                    &tool_key(sandbox_id, call_id),
+                    &entry.to_string(),
+                    Some(TOOL_TTL),
+                )
+                .await?;
+            self.store
+                .set(
+                    &open_tools_key(sandbox_id),
+                    &json!(open).to_string(),
+                    Some(TOOL_TTL),
+                )
+                .await
+        };
+        if let Err(error) = written.await {
+            eprintln!(
+                "openbox: tool {call_id} for sandbox_id={sandbox_id} not recorded, its requests are their own activities: {error}"
+            );
+        }
+    }
+
+    /// Closes the tools whose results a model call sends back. A result for a
+    /// tool never seen open (its reply could not be read) still records the
+    /// tool, from the call the conversation carries. The store is updated
+    /// here; Core hears in the background.
+    async fn close_tools(&self, sandbox_id: &str, model: &agent::ModelCall) {
+        let limit = self.governance.body_limit();
+        let mut closing = Vec::new();
+        for result in &model.tool_results {
+            let key = tool_key(sandbox_id, &result.id);
+            let entry = self
+                .store
+                .get(&key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+            let (tool, started_ms, opened) = match &entry {
+                Some(entry) if entry.get("state").and_then(Value::as_str) == Some("closed") => {
+                    continue;
+                }
+                Some(entry) => {
+                    let Some(tool) = entry.get("activity").and_then(activity_from) else {
+                        continue;
+                    };
+                    let opened = entry.get("state").and_then(Value::as_str) == Some("opened");
+                    (
+                        tool,
+                        entry.get("started_ms").and_then(Value::as_u64),
+                        opened,
+                    )
+                }
+                None => {
+                    let Some(call) = model.tool_call(&result.id) else {
+                        continue;
+                    };
+                    (tool_activity(call, limit), None, false)
+                }
+            };
+            let closed = json!({"activity": activity_json(&tool), "state": "closed"});
+            if let Err(error) = self
+                .store
+                .set(&key, &closed.to_string(), Some(TOOL_TTL))
+                .await
+            {
+                eprintln!("openbox: tool {} not marked closed: {error}", result.id);
+            }
+            let outcome = Outcome {
+                output: Some(bounded(&result.output, limit)),
+                error: result.is_error.then(|| {
+                    json!({"type": "ToolError", "message": truncate(&text_of(&result.output), MAX_REASON_BYTES)})
+                }),
+                duration_ms: started_ms.map(|started| unix_millis().saturating_sub(started)),
+            };
+            closing.push((result.id.clone(), tool, opened, outcome));
+        }
+        if closing.is_empty() {
+            return;
+        }
+        let mut open = self.open_tool_ids(sandbox_id).await;
+        open.retain(|id| !closing.iter().any(|(closed, ..)| closed == id));
+        let _ = self
+            .store
+            .set(
+                &open_tools_key(sandbox_id),
+                &json!(open).to_string(),
+                Some(TOOL_TTL),
+            )
+            .await;
+        let governance = Arc::clone(&self.governance);
+        let sandbox_id = sandbox_id.to_owned();
+        tokio::spawn(async move {
+            for (call_id, tool, opened, outcome) in closing {
+                if !opened && let Err(error) = governance.open_activity(&sandbox_id, &tool).await {
+                    eprintln!("openbox: tool activity {} not opened: {error}", tool.id);
+                }
+                match governance
+                    .close_activity(&sandbox_id, &tool, &outcome)
+                    .await
+                {
+                    Ok(_) => eprintln!(
+                        "openbox: tool closed sandbox_id={sandbox_id} activity_id={} tool={} call_id={call_id}",
+                        tool.id, tool.kind
+                    ),
+                    Err(error) => {
+                        eprintln!("openbox: tool activity {} not closed: {error}", tool.id);
+                    }
+                }
             }
         });
     }
@@ -577,6 +981,132 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     }
 }
 
+/// Where a request's verdict is recorded.
+struct Route {
+    activity: Activity,
+    /// The activity needs its plain `ActivityStarted` first.
+    open: bool,
+    /// The response ends the activity.
+    closes: bool,
+}
+
+fn activity_json(activity: &Activity) -> Value {
+    json!({"id": activity.id, "kind": activity.kind, "input": activity.input})
+}
+
+fn activity_from(value: &Value) -> Option<Activity> {
+    Some(Activity {
+        id: value.get("id")?.as_str()?.to_owned(),
+        kind: value.get("kind")?.as_str()?.to_owned(),
+        input: value.get("input").cloned().unwrap_or_else(|| json!([])),
+    })
+}
+
+/// A tool the model asked for, as the agent SDK reports a tool: named by the
+/// tool, its arguments as input.
+fn tool_activity(call: &agent::ToolCall, limit: usize) -> Activity {
+    Activity {
+        id: tool_activity_id(&call.id),
+        kind: call.name.clone(),
+        input: json!([bounded(&call.input, limit)]),
+    }
+}
+
+/// Moves a tracked tool from `open` to `opened` once Core has its start,
+/// unless it closed meanwhile.
+async fn mark_tool(store: &dyn SharedStore, sandbox_id: &str, call_id: &str, state: &str) {
+    let key = tool_key(sandbox_id, call_id);
+    let Ok(Some(text)) = store.get(&key).await else {
+        return;
+    };
+    let Ok(mut entry) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    if entry.get("state").and_then(Value::as_str) != Some("open") {
+        return;
+    }
+    entry["state"] = json!(state);
+    let _ = store.set(&key, &entry.to_string(), Some(TOOL_TTL)).await;
+}
+
+/// The output of a request that is its own activity: the JSON-RPC result of
+/// an MCP call, otherwise the response's status.
+fn response_output(response: &ResponseSeen, limit: usize) -> Value {
+    response
+        .body
+        .as_deref()
+        .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+        .and_then(|body| body.get("result").cloned())
+        .map_or_else(
+            || json!({"status_code": response.status_code, "method": response.method, "url": response.url}),
+            |result| bounded(&result, limit),
+        )
+}
+
+/// How a response's own activity ended: a model call's reply, an MCP
+/// call's result, or otherwise the response's status.
+fn outcome(
+    response: &ResponseSeen,
+    reply: Option<&agent::Reply>,
+    duration_ms: Option<u64>,
+    limit: usize,
+) -> Outcome {
+    Outcome {
+        output: Some(reply.map_or_else(|| response_output(response, limit), agent::Reply::output)),
+        error: (response.status_code >= 400).then(
+            || json!({"type": "HTTPError", "message": format!("HTTP {}", response.status_code)}),
+        ),
+        duration_ms,
+    }
+}
+
+/// A started span for a response whose request record was lost, so its
+/// completed span is still recorded.
+fn fallback_span(response: &ResponseSeen, activity_id: &str) -> Value {
+    json!({
+        "span_id": span_ids(&response.request_id).0,
+        "trace_id": span_ids(&response.request_id).1,
+        "name": format!("HTTP {}", response.method),
+        "kind": "CLIENT",
+        "stage": "started",
+        "attributes": {},
+        "status": {"code": "UNSET", "description": null},
+        "events": [],
+        "hook_type": "http_request",
+        "semantic_type": null,
+        "attribute_key_identifiers": ["http_method", "http_url"],
+        "activity_id": activity_id,
+        "http_method": response.method,
+        "http_url": response.url,
+        "request_headers": null,
+        "request_body": null,
+    })
+}
+
+/// A value as is when it fits `limit` serialized, otherwise its text cut to
+/// `limit`.
+fn bounded(value: &Value, limit: usize) -> Value {
+    let text = value.to_string();
+    if text.len() <= limit {
+        return value.clone();
+    }
+    Value::String(truncate(&text_of(value), limit))
+}
+
+fn text_of(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
 fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -672,6 +1202,11 @@ pub(crate) mod tests {
         pub evaluated: Mutex<Vec<String>>,
         pub polled: Mutex<Vec<String>>,
         pub completions: Mutex<Vec<Completion>>,
+        /// Activity ids opened with a plain `ActivityStarted`, in order.
+        pub opened: Mutex<Vec<String>>,
+        pub closed: Mutex<Vec<(Activity, Outcome)>>,
+        /// The activity of every evaluation, in order.
+        pub activities: Mutex<Vec<(Activity, bool)>>,
         /// Verdicts for prompt signals, in order; allow when empty.
         pub prompt_verdicts: Mutex<VecDeque<Verdict>>,
         pub signals: Mutex<Vec<Value>>,
@@ -715,14 +1250,34 @@ pub(crate) mod tests {
                 Err(()) => Err(CoreError::Transport),
             }
         }
+        fn body_limit(&self) -> usize {
+            64 * 1024
+        }
+        async fn open_activity(
+            &self,
+            _: &str,
+            activity: &Activity,
+        ) -> Result<CoreDecision, CoreError> {
+            self.opened.lock().unwrap().push(activity.id.clone());
+            Ok(decision(Verdict::Allow))
+        }
         async fn evaluate_action(
             &self,
             _: &Action,
-            activity_id: &str,
+            activity: &Activity,
+            open: bool,
+            _: &Value,
         ) -> Result<CoreDecision, CoreError> {
             tokio::time::sleep(self.delay).await;
             self.evaluate_calls.fetch_add(1, Ordering::SeqCst);
-            self.evaluated.lock().unwrap().push(activity_id.to_owned());
+            self.evaluated.lock().unwrap().push(activity.id.clone());
+            self.activities
+                .lock()
+                .unwrap()
+                .push((activity.clone(), open));
+            if open {
+                self.opened.lock().unwrap().push(activity.id.clone());
+            }
             let next = self
                 .verdicts
                 .lock()
@@ -749,11 +1304,23 @@ pub(crate) mod tests {
                 .unwrap_or(Ok(ApprovalState::Gone))
                 .map_err(|()| CoreError::Transport)
         }
-        async fn complete_activity(
+        async fn complete_request(
             &self,
             completion: &Completion,
         ) -> Result<CoreDecision, CoreError> {
             self.completions.lock().unwrap().push(completion.clone());
+            Ok(decision(Verdict::Allow))
+        }
+        async fn close_activity(
+            &self,
+            _: &str,
+            activity: &Activity,
+            outcome: &Outcome,
+        ) -> Result<CoreDecision, CoreError> {
+            self.closed
+                .lock()
+                .unwrap()
+                .push((activity.clone(), outcome.clone()));
             Ok(decision(Verdict::Allow))
         }
         async fn signal(
@@ -996,32 +1563,221 @@ pub(crate) mod tests {
             url: "https://mcp.example.com/mcp".to_owned(),
             host: "mcp.example.com".to_owned(),
             status_code,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: Some(br#"{"jsonrpc":"2.0","id":1,"result":{"paid":true}}"#.to_vec()),
         };
         guard.complete(seen("req-1", 200)).await;
         // A response for a request this replica never recorded still closes
         // the request's own activity, without a duration.
         guard.complete(seen("req-9", 503)).await;
-        for _ in 0..50 {
-            if core.completions.lock().unwrap().len() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        settle(&core, 2).await;
         let completions = core.completions.lock().unwrap();
         let first = completions
             .iter()
             .find(|c| c.request_id == "req-1")
             .unwrap();
-        assert_eq!(first.activity_id, "oshx-req-1");
-        assert_eq!(first.activity_type, "MCP pay");
-        assert!(first.duration_ms.is_some());
+        assert_eq!(first.activity.id, "oshx-req-1");
+        assert_eq!(first.activity.kind, "pay");
+        assert_eq!(first.span["stage"], "started");
+        assert_eq!(first.span["activity_id"], "oshx-req-1");
+        assert!(first.response_body.as_deref().unwrap().contains("paid"));
         let other = completions
             .iter()
             .find(|c| c.request_id == "req-9")
             .unwrap();
-        assert_eq!(other.activity_id, "oshx-req-9");
-        assert_eq!(other.activity_type, "POST mcp.example.com");
-        assert_eq!(other.duration_ms, None);
+        assert_eq!(other.activity.id, "oshx-req-9");
+        assert_eq!(other.activity.kind, "POST mcp.example.com");
+        let closed = core.closed.lock().unwrap();
+        let (_, paid) = closed.iter().find(|(a, _)| a.id == "oshx-req-1").unwrap();
+        // An MCP call's own activity ends with its JSON-RPC result.
+        assert_eq!(paid.output, Some(json!({"paid": true})));
+        assert!(paid.duration_ms.is_some());
+        let (_, failed) = closed.iter().find(|(a, _)| a.id == "oshx-req-9").unwrap();
+        assert_eq!(failed.error.as_ref().unwrap()["message"], "HTTP 503");
+        assert_eq!(failed.duration_ms, None);
+    }
+
+    /// Waits for the background Core calls to record `closed` activities.
+    async fn settle(core: &FakeCore, closed: usize) {
+        for _ in 0..100 {
+            if core.closed.lock().unwrap().len() >= closed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "expected {closed} closed activities, got {:?}",
+            core.closed.lock().unwrap()
+        );
+    }
+
+    fn model_request(request_id: &str, messages: &Value) -> Action {
+        let mut evaluation = evaluation(
+            "POST",
+            "/v1/messages",
+            json!({"model": "claude-x", "messages": messages})
+                .to_string()
+                .as_bytes(),
+        );
+        evaluation.context.as_mut().unwrap().request_id = request_id.to_owned();
+        Action::from_evaluation(&evaluation)
+    }
+
+    fn response(request_id: &str, status_code: u32, body: &[u8]) -> ResponseSeen {
+        ResponseSeen {
+            sandbox_id: "sbx-id-1".to_owned(),
+            request_id: request_id.to_owned(),
+            method: "POST".to_owned(),
+            url: "https://mcp.example.com/v1/messages".to_owned(),
+            host: "mcp.example.com".to_owned(),
+            status_code,
+            headers: Vec::new(),
+            body: Some(body.to_vec()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_follows_the_agent_sdk_pattern() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[
+            Verdict::Allow,
+            Verdict::Allow,
+            Verdict::Allow,
+        ]));
+        // The user's prompt goes to the model: an llm_call activity.
+        let ask = json!([{"role": "user", "content": "summarise example.com"}]);
+        guard
+            .evaluate(&model_request("m-1", &ask), ApprovalMode::Queue)
+            .await;
+        // The model asks for a tool.
+        let reply = json!({"model": "claude-x", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "fetch", "input": {"url": "http://example.com/"}}
+        ], "usage": {"input_tokens": 10, "output_tokens": 5}});
+        guard
+            .complete(response("m-1", 200, reply.to_string().as_bytes()))
+            .await;
+        settle(&core, 1).await;
+        // The tool's request runs inside the tool's activity.
+        let mut fetch = evaluation("GET", "/", b"");
+        fetch.context.as_mut().unwrap().request_id = "f-1".to_owned();
+        guard
+            .evaluate(&Action::from_evaluation(&fetch), ApprovalMode::Queue)
+            .await;
+        guard
+            .complete(response("f-1", 200, b"<html>Example</html>"))
+            .await;
+        // The agent sends the result back on its next model call.
+        let back = json!([
+            {"role": "user", "content": "summarise example.com"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "fetch", "input": {"url": "http://example.com/"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "Example Domain"}]}
+        ]);
+        guard
+            .evaluate(&model_request("m-2", &back), ApprovalMode::Queue)
+            .await;
+        settle(&core, 2).await;
+
+        let activities = core.activities.lock().unwrap().clone();
+        assert_eq!(activities[0].0.id, "oshx-m-1");
+        assert_eq!(activities[0].0.kind, LLM_CALL);
+        assert_eq!(
+            activities[0].0.input,
+            json!([{"prompt": "summarise example.com"}])
+        );
+        assert!(activities[0].1, "a model call opens its activity");
+        // Inside the tool: its activity, not opened again (Core has it).
+        assert_eq!(activities[1].0.id, "oshx-tool-toolu-1");
+        assert_eq!(activities[1].0.kind, "fetch");
+        assert_eq!(
+            activities[1].0.input,
+            json!([{"url": "http://example.com/"}])
+        );
+        assert!(!activities[1].1);
+        // A tool-loop model call still carries the user's prompt as input.
+        assert_eq!(activities[2].0.kind, LLM_CALL);
+        assert_eq!(
+            activities[2].0.input,
+            json!([{"prompt": "summarise example.com"}])
+        );
+
+        let closed = core.closed.lock().unwrap().clone();
+        let (llm, answered) = &closed[0];
+        assert_eq!(llm.id, "oshx-m-1");
+        assert_eq!(
+            answered.output,
+            Some(
+                json!({"llm_model": "claude-x", "input_tokens": 10, "output_tokens": 5,
+                        "total_tokens": 15, "completion": null, "has_tool_calls": true})
+            )
+        );
+        // The fetch inside the tool does not close anything of its own; the
+        // tool closes with its result.
+        let (tool, result) = &closed[1];
+        assert_eq!(tool.id, "oshx-tool-toolu-1");
+        assert_eq!(result.output, Some(json!("Example Domain")));
+        assert!(result.duration_ms.is_some());
+        assert_eq!(closed.len(), 2);
+        assert!(
+            core.opened
+                .lock()
+                .unwrap()
+                .contains(&"oshx-tool-toolu-1".to_owned())
+        );
+        // The fetch's span completed, with its response.
+        let completions = core.completions.lock().unwrap();
+        let fetched = completions.iter().find(|c| c.request_id == "f-1").unwrap();
+        assert_eq!(fetched.activity.id, "oshx-tool-toolu-1");
+        assert_eq!(
+            fetched.response_body.as_deref(),
+            Some("<html>Example</html>")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_closes_its_activity_but_an_approval_hold_does_not() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[
+            Verdict::RequireApproval,
+            Verdict::Block,
+        ]));
+        guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        settle(&core, 1).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let closed = core.closed.lock().unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].0.id, "oshx-req-2");
+        assert_eq!(
+            closed[0].1.error.as_ref().unwrap()["type"],
+            "GovernanceStop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_whose_reply_was_not_read_is_recorded_from_its_result() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow, Verdict::Allow]));
+        let back = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_7", "name": "lookup", "input": {"q": 1}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_7", "content": "found", "is_error": true}]}
+        ]);
+        guard
+            .evaluate(&model_request("m-1", &back), ApprovalMode::Queue)
+            .await;
+        settle(&core, 1).await;
+        // The same conversation resent does not record the tool again.
+        guard
+            .evaluate(&model_request("m-2", &back), ApprovalMode::Queue)
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let closed = core.closed.lock().unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].0.kind, "lookup");
+        assert_eq!(closed[0].1.error.as_ref().unwrap()["type"], "ToolError");
+        assert!(
+            core.opened
+                .lock()
+                .unwrap()
+                .contains(&"oshx-tool-toolu-7".to_owned())
+        );
     }
 
     #[tokio::test]

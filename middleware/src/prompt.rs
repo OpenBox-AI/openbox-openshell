@@ -57,6 +57,31 @@ impl Capture {
 
 /// The newest user prompt in a model call, if this is one and it has one.
 pub fn extract(action: &Action) -> Option<Prompt> {
+    let (provider, model, turns) = conversation(action)?;
+    let position = turns.len();
+    let text = turns.into_iter().last()??;
+    let turn = hex(&Sha256::digest(format!("{position}\n{text}").as_bytes())[..16]);
+    Some(Prompt {
+        provider,
+        model,
+        text,
+        turn,
+    })
+}
+
+/// The newest user turn that carries text, even when the call itself ends in
+/// tool results: what the agent is working on, which the agent SDK sends as
+/// a model call's input.
+pub fn latest_text(action: &Action) -> Option<String> {
+    let (_, _, turns) = conversation(action)?;
+    turns.into_iter().flatten().last()
+}
+
+/// A model call's provider, model and user turns.
+type Conversation = (&'static str, Option<String>, Vec<Option<String>>);
+
+/// The conversation in a model call, if this is one.
+fn conversation(action: &Action) -> Option<Conversation> {
     if action.method != "POST" {
         return None;
     }
@@ -77,15 +102,8 @@ pub fn extract(action: &Action) -> Option<Prompt> {
     } else {
         return None;
     };
-    let position = turns.len();
-    let text = turns.into_iter().last()??;
-    let turn = hex(&Sha256::digest(format!("{position}\n{text}").as_bytes())[..16]);
-    Some(Prompt {
-        provider,
-        model: body.get("model").and_then(Value::as_str).map(str::to_owned),
-        text,
-        turn,
-    })
+    let model = body.get("model").and_then(Value::as_str).map(str::to_owned);
+    Some((provider, model, turns))
 }
 
 /// The signal's arguments for a prompt, as captured.

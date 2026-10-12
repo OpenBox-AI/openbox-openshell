@@ -14,6 +14,10 @@
 //! version, labels); its duration comes from the start time the front desk
 //! keeps in the shared store, so any replica can close it.
 //!
+//! A tool the model asked for that never got its result back (the sandbox
+//! went away mid-tool) is closed before the session, so no activity is left
+//! open.
+//!
 //! Like the inventory, this runs in `post_commit` and is best effort. Core
 //! calls run in the background so a slow Core never holds up the gateway.
 
@@ -22,10 +26,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::core_client::CoreClient;
+use crate::core_client::{Activity, CoreClient, Outcome};
 use crate::interceptor::{Inventory, InventoryEvent};
 use crate::inventory::RuntimeEnvironment;
-use crate::store::{SharedStore, session_key};
+use crate::store::{SharedStore, open_tools_key, session_key, tool_key};
 
 /// The two Core calls a sandbox's lifecycle needs.
 #[tonic::async_trait]
@@ -37,6 +41,14 @@ pub trait SessionGovernance: Send + Sync + 'static {
         input: &Value,
     ) -> Result<(), String>;
     async fn end(&self, sandbox_id: &str, duration_ms: Option<u64>) -> Result<(), String>;
+    /// Closes a tool left open, opening it first when Core never heard of
+    /// it.
+    async fn close_tool(
+        &self,
+        sandbox_id: &str,
+        tool: &Activity,
+        opened: bool,
+    ) -> Result<(), String>;
 }
 
 #[tonic::async_trait]
@@ -55,6 +67,27 @@ impl SessionGovernance for CoreClient {
 
     async fn end(&self, sandbox_id: &str, duration_ms: Option<u64>) -> Result<(), String> {
         self.end_session(sandbox_id, duration_ms)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn close_tool(
+        &self,
+        sandbox_id: &str,
+        tool: &Activity,
+        opened: bool,
+    ) -> Result<(), String> {
+        if !opened {
+            self.open_activity(sandbox_id, tool)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let outcome = Outcome {
+            output: Some(json!({"reason": "sandbox deleted"})),
+            ..Outcome::default()
+        };
+        self.close_activity(sandbox_id, tool, &outcome)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -83,6 +116,46 @@ impl SessionLifecycle {
             store,
             gateway,
         }
+    }
+}
+
+impl SessionLifecycle {
+    /// Takes the sandbox's tools that are still open, marking them closed.
+    async fn open_tools(&self, sandbox_id: &str) -> Vec<(Activity, bool)> {
+        let ids: Vec<String> = self
+            .store
+            .take(&open_tools_key(sandbox_id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        let mut tools = Vec::new();
+        for call_id in ids {
+            let key = tool_key(sandbox_id, &call_id);
+            let Some(entry) = self
+                .store
+                .take(&key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            else {
+                continue;
+            };
+            let state = entry.get("state").and_then(Value::as_str);
+            let activity = entry.get("activity").and_then(|activity| {
+                Some(Activity {
+                    id: activity.get("id")?.as_str()?.to_owned(),
+                    kind: activity.get("kind")?.as_str()?.to_owned(),
+                    input: activity.get("input").cloned().unwrap_or_else(|| json!([])),
+                })
+            });
+            if let (Some("open" | "opened"), Some(activity)) = (state, activity) {
+                tools.push((activity, state == Some("opened")));
+            }
+        }
+        tools
     }
 }
 
@@ -138,8 +211,17 @@ impl Inventory for SessionLifecycle {
                         .unwrap_or_default()
                         .and_then(|started| started.parse::<u64>().ok())
                         .map(|started| unix_millis().saturating_sub(started));
+                    let tools = self.open_tools(&id).await;
                     let core = Arc::clone(&self.core);
                     tokio::spawn(async move {
+                        for (tool, opened) in tools {
+                            if let Err(error) = core.close_tool(&id, &tool, opened).await {
+                                eprintln!(
+                                    "openbox: tool activity {} left open sandbox_id={id}: {error}",
+                                    tool.id
+                                );
+                            }
+                        }
                         match core.end(&id, duration).await {
                             Ok(()) => eprintln!("openbox: session completed sandbox_id={id}"),
                             Err(error) => {
@@ -207,6 +289,76 @@ mod tests {
                 Ok(())
             }
         }
+
+        async fn close_tool(
+            &self,
+            sandbox_id: &str,
+            tool: &Activity,
+            opened: bool,
+        ) -> Result<(), String> {
+            self.calls
+                .send(format!(
+                    "close-tool {sandbox_id} {} {} opened={opened}",
+                    tool.id, tool.kind
+                ))
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_closes_tools_left_open_before_the_session() {
+        let (calls, mut received) = mpsc::unbounded_channel();
+        let store: Arc<dyn SharedStore> = Arc::new(MemoryStore::default());
+        let tool = |state: &str, id: &str| {
+            json!({"activity": {"id": format!("oshx-tool-{id}"), "kind": "fetch", "input": [{}]}, "state": state})
+                .to_string()
+        };
+        store
+            .set(&tool_key("sbx-1", "a"), &tool("opened", "a"), None)
+            .await
+            .unwrap();
+        store
+            .set(&tool_key("sbx-1", "b"), &tool("open", "b"), None)
+            .await
+            .unwrap();
+        store
+            .set(&tool_key("sbx-1", "c"), &tool("closed", "c"), None)
+            .await
+            .unwrap();
+        store
+            .set(
+                &open_tools_key("sbx-1"),
+                &json!(["a", "b", "c"]).to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let sessions = SessionLifecycle::new(
+            Arc::new(FakeInventory::default()),
+            Arc::new(FakeCore { calls, fail: false }),
+            Arc::clone(&store),
+            None,
+        );
+        sessions
+            .record(InventoryEvent::Deleted {
+                response: json!({"sandboxId": "sbx-1"}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next(&mut received).await.as_deref(),
+            Some("close-tool sbx-1 oshx-tool-a fetch opened=true")
+        );
+        assert_eq!(
+            next(&mut received).await.as_deref(),
+            Some("close-tool sbx-1 oshx-tool-b fetch opened=false")
+        );
+        assert_eq!(
+            next(&mut received).await.as_deref(),
+            Some("end sbx-1 timed=false")
+        );
+        assert!(store.get(&open_tools_key("sbx-1")).await.unwrap().is_none());
     }
 
     #[derive(Default)]

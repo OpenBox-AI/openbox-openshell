@@ -5,8 +5,11 @@
 //! A supervisor may only evaluate traffic for the sandbox its token names, so
 //! one sandbox cannot spend another's approvals or trip another's halt.
 //!
-//! The same service also answers `HttpResponsePreReturn`: it never inspects
-//! or changes a response (skip), it only closes the request's Core activity.
+//! The same service also answers `HttpResponsePreReturn`: it never changes
+//! or holds a response. Where `OpenShell` allows it, the body is read as it
+//! streams (every unit passed through unchanged, a bounded copy kept) so the
+//! request's completed span carries it and a model call's reply can be read;
+//! otherwise the response is skipped and completes without a body.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,14 +21,16 @@ use openshell_core::middleware::{HttpResponseResultStream, WebSocketResponseStre
 use openshell_core::proto::middleware::v1::http_response_pre_return_server::HttpResponsePreReturn;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Finding, HttpRequestEvaluation, HttpRequestResult, HttpResponseEvent, HttpResponseEventResult,
-    HttpResponsePreflight, HttpResponsePreflightResult, HttpResponsePreflightSkip,
+    Finding, HttpRequestEvaluation, HttpRequestResult, HttpResponseBodyMode,
+    HttpResponseBodyPassThrough, HttpResponseBodyResult, HttpResponseEvent,
+    HttpResponseEventResult, HttpResponsePreflight, HttpResponsePreflightInspect,
+    HttpResponsePreflightResult, HttpResponsePreflightSkip, HttpResponseTrailersResult,
     MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
     ValidateConfigResponse, WebSocketPreflightAction, WebSocketPreflightDecision,
-    WebSocketSessionEvent, WebSocketSessionEventResult, http_response_event,
-    http_response_event_result, http_response_preflight_result, web_socket_session_event,
-    web_socket_session_event_result,
+    WebSocketSessionEvent, WebSocketSessionEventResult, http_response_body_result,
+    http_response_body_unit, http_response_event, http_response_event_result,
+    http_response_preflight_result, web_socket_session_event, web_socket_session_event_result,
 };
 use prost_types::Struct;
 use prost_types::value::Kind;
@@ -38,6 +43,9 @@ use crate::guard::{ApprovalMode, Governance, Guard, ResponseSeen, SandboxStopper
 use crate::token::{Caller, TokenVerifier};
 
 pub const MANIFEST_NAME: &str = "openbox/verdict-middleware";
+/// Most of a response body kept for its activity. The rest still streams
+/// through to the sandbox; only the copy stops.
+const RESPONSE_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct VerdictMiddleware<G, S: ?Sized> {
     guard: Arc<Guard<G, S>>,
@@ -93,6 +101,70 @@ impl<G: Governance, S: SandboxStopper + ?Sized> VerdictMiddleware<G, S> {
     }
 }
 
+/// Answers one response's stage stream: preflight, then (when streaming)
+/// body units ending in `end_of_stream`, then trailers. The response
+/// completes when its body ends, or with what arrived if the stream stops
+/// first.
+async fn answer_response<G, S>(
+    guard: Arc<Guard<G, S>>,
+    caller: Option<Caller>,
+    mut inbound: impl tokio_stream::Stream<Item = Result<HttpResponseEvent, Status>> + Unpin,
+    sender: tokio::sync::mpsc::Sender<Result<HttpResponseEventResult, Status>>,
+) where
+    G: Governance,
+    S: SandboxStopper + ?Sized,
+{
+    let mut pending: Option<ResponseSeen> = None;
+    let mut body = Vec::new();
+    while let Some(Ok(event)) = inbound.next().await {
+        let result = match event.event {
+            Some(http_response_event::Event::Preflight(preflight)) => {
+                let seen = response_seen(&preflight);
+                if let Err(status) =
+                    VerdictMiddleware::<G, S>::check_sandbox(caller.as_ref(), &seen.sandbox_id)
+                {
+                    let _ = sender.send(Err(status)).await;
+                    break;
+                }
+                if preflight
+                    .permitted_body_modes
+                    .contains(&(HttpResponseBodyMode::StreamBytes as i32))
+                {
+                    pending = Some(seen);
+                    stream_response()
+                } else {
+                    guard.complete(seen).await;
+                    skip_response()
+                }
+            }
+            Some(http_response_event::Event::Body(unit)) => {
+                if let Some(http_response_body_unit::Payload::Data(data)) = &unit.payload {
+                    let room = RESPONSE_CAPTURE_BYTES.saturating_sub(body.len());
+                    body.extend_from_slice(&data[..data.len().min(room)]);
+                }
+                // Recorded before the last unit goes out, so the
+                // sandbox's next request finds any tool it opened.
+                if unit.end_of_stream
+                    && let Some(mut seen) = pending.take()
+                {
+                    seen.body = Some(std::mem::take(&mut body));
+                    guard.complete(seen).await;
+                }
+                pass_through(unit.sequence)
+            }
+            Some(http_response_event::Event::Trailers(_)) => keep_trailers(),
+            Some(http_response_event::Event::SessionEnd(_)) | None => break,
+        };
+        if sender.send(Ok(result)).await.is_err() {
+            break;
+        }
+    }
+    if let Some(mut seen) = pending.take() {
+        seen.body = Some(body);
+        guard.complete(seen).await;
+    }
+}
+
 /// What a response preflight says about the request it answers.
 fn response_seen(preflight: &HttpResponsePreflight) -> ResponseSeen {
     let context = preflight.context.clone().unwrap_or_default();
@@ -110,6 +182,52 @@ fn response_seen(preflight: &HttpResponsePreflight) -> ResponseSeen {
         method: target.method,
         host: target.host,
         status_code: preflight.status_code,
+        headers: preflight
+            .headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect(),
+        body: None,
+    }
+}
+
+/// Reads the body as it streams, when `OpenShell` offers that for this
+/// response: compressed, partial and bodyless responses are headers only.
+fn stream_response() -> HttpResponseEventResult {
+    HttpResponseEventResult {
+        result: Some(http_response_event_result::Result::PreflightResult(
+            HttpResponsePreflightResult {
+                action: Some(http_response_preflight_result::Action::Inspect(
+                    HttpResponsePreflightInspect {
+                        body_mode: HttpResponseBodyMode::StreamBytes as i32,
+                        header_mutations: Vec::new(),
+                    },
+                )),
+                ..HttpResponsePreflightResult::default()
+            },
+        )),
+    }
+}
+
+fn pass_through(sequence: u64) -> HttpResponseEventResult {
+    HttpResponseEventResult {
+        result: Some(http_response_event_result::Result::BodyResult(
+            HttpResponseBodyResult {
+                sequence,
+                action: Some(http_response_body_result::Action::PassThrough(
+                    HttpResponseBodyPassThrough {},
+                )),
+                ..HttpResponseBodyResult::default()
+            },
+        )),
+    }
+}
+
+fn keep_trailers() -> HttpResponseEventResult {
+    HttpResponseEventResult {
+        result: Some(http_response_event_result::Result::TrailersResult(
+            HttpResponseTrailersResult::default(),
+        )),
     }
 }
 
@@ -293,30 +411,10 @@ impl<G: Governance, S: SandboxStopper + ?Sized> HttpResponsePreReturn for Verdic
         request: Request<tonic::Streaming<HttpResponseEvent>>,
     ) -> Result<Response<Self::EvaluateStream>, Status> {
         let caller = self.caller(&request)?;
-        let mut inbound = request.into_inner();
+        let inbound = request.into_inner();
         let guard = Arc::clone(&self.guard);
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
-        tokio::spawn(async move {
-            // Skip ends this stage after preflight, so no body or trailers
-            // follow; anything else ends the stream.
-            while let Some(Ok(event)) = inbound.next().await {
-                let Some(http_response_event::Event::Preflight(preflight)) = event.event else {
-                    break;
-                };
-                let seen = response_seen(&preflight);
-                let result = match Self::check_sandbox(caller.as_ref(), &seen.sandbox_id) {
-                    Ok(()) => {
-                        guard.complete(seen).await;
-                        Ok(skip_response())
-                    }
-                    Err(status) => Err(status),
-                };
-                let failed = result.is_err();
-                if sender.send(result).await.is_err() || failed {
-                    break;
-                }
-            }
-        });
+        tokio::spawn(answer_response(guard, caller, inbound, sender));
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(receiver),
         )))
@@ -342,6 +440,160 @@ mod tests {
         let verifier = signer
             .map(|signer| TokenVerifier::from_pem(&signer.public_pem(), "gw-1", AUDIENCE).unwrap());
         VerdictMiddleware::new(guard, verifier, 1024 * 1024, None)
+    }
+
+    fn response_events(
+        modes: &[HttpResponseBodyMode],
+        units: &[(&[u8], bool)],
+    ) -> Vec<HttpResponseEvent> {
+        use openshell_core::proto::{
+            HttpRequestTarget, HttpResponseBodyUnit, HttpResponseTrailers, RequestContext,
+        };
+        let mut events = vec![HttpResponseEvent {
+            event: Some(http_response_event::Event::Preflight(
+                HttpResponsePreflight {
+                    context: Some(RequestContext {
+                        request_id: "req-1".to_owned(),
+                        sandbox_id: "sbx-id-1".to_owned(),
+                        ..RequestContext::default()
+                    }),
+                    target: Some(HttpRequestTarget {
+                        scheme: "https".to_owned(),
+                        host: "mcp.example.com".to_owned(),
+                        port: 443,
+                        method: "POST".to_owned(),
+                        path: "/mcp".to_owned(),
+                        query: String::new(),
+                    }),
+                    status_code: 200,
+                    permitted_body_modes: modes.iter().map(|mode| *mode as i32).collect(),
+                    ..HttpResponsePreflight::default()
+                },
+            )),
+        }];
+        for (sequence, (data, last)) in (1_u64..).zip(units) {
+            events.push(HttpResponseEvent {
+                event: Some(http_response_event::Event::Body(HttpResponseBodyUnit {
+                    sequence,
+                    payload: Some(http_response_body_unit::Payload::Data(data.to_vec())),
+                    end_of_stream: *last,
+                })),
+            });
+        }
+        if !units.is_empty() {
+            events.push(HttpResponseEvent {
+                event: Some(http_response_event::Event::Trailers(
+                    HttpResponseTrailers::default(),
+                )),
+            });
+        }
+        events
+    }
+
+    async fn answer(
+        core: &Arc<FakeCore>,
+        events: Vec<HttpResponseEvent>,
+    ) -> Vec<HttpResponseEventResult> {
+        let guard = Arc::new(Guard::new(
+            Arc::clone(core),
+            Arc::new(FakeStopper::default()),
+        ));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        answer_response(
+            guard,
+            None,
+            tokio_stream::iter(events.into_iter().map(Ok)),
+            sender,
+        )
+        .await;
+        let mut results = Vec::new();
+        while let Ok(result) = receiver.try_recv() {
+            results.push(result.unwrap());
+        }
+        results
+    }
+
+    async fn completed(core: &FakeCore) -> crate::core_client::Completion {
+        for _ in 0..100 {
+            if let Some(completion) = core.completions.lock().unwrap().first() {
+                return completion.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the response was never completed");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_response_passes_through_and_its_body_is_kept() {
+        let core = Arc::new(FakeCore::default());
+        let events = response_events(
+            &[
+                HttpResponseBodyMode::HeadersOnly,
+                HttpResponseBodyMode::StreamBytes,
+            ],
+            &[
+                (br#"{"jsonrpc":"2.0","#, false),
+                (br#""id":1,"result":{}}"#, false),
+                (b"", true),
+            ],
+        );
+        let results = answer(&core, events).await;
+        let kinds: Vec<String> = results
+            .iter()
+            .map(|result| match &result.result {
+                Some(http_response_event_result::Result::PreflightResult(preflight)) => {
+                    match &preflight.action {
+                        Some(http_response_preflight_result::Action::Inspect(inspect)) => {
+                            format!("inspect {}", inspect.body_mode)
+                        }
+                        other => format!("{other:?}"),
+                    }
+                }
+                Some(http_response_event_result::Result::BodyResult(body)) => match body.action {
+                    Some(http_response_body_result::Action::PassThrough(_)) => {
+                        format!("pass {}", body.sequence)
+                    }
+                    ref other => format!("{other:?}"),
+                },
+                Some(http_response_event_result::Result::TrailersResult(trailers)) => {
+                    format!("trailers {}", trailers.trailer_mutations.len())
+                }
+                None => "none".to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                format!("inspect {}", HttpResponseBodyMode::StreamBytes as i32),
+                "pass 1".to_owned(),
+                "pass 2".to_owned(),
+                "pass 3".to_owned(),
+                "trailers 0".to_owned(),
+            ]
+        );
+        let completion = completed(&core).await;
+        assert_eq!(completion.request_id, "req-1");
+        assert_eq!(
+            completion.response_body.as_deref(),
+            Some(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_offered_headers_only_is_skipped_and_completes_without_a_body() {
+        let core = Arc::new(FakeCore::default());
+        let results = answer(
+            &core,
+            response_events(&[HttpResponseBodyMode::HeadersOnly], &[]),
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0].result,
+            Some(http_response_event_result::Result::PreflightResult(preflight))
+                if matches!(preflight.action, Some(http_response_preflight_result::Action::Skip(_)))
+        ));
+        assert_eq!(completed(&core).await.response_body, None);
     }
 
     fn with_token<T>(message: T, token: &str) -> Request<T> {

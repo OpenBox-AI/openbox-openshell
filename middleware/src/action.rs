@@ -55,6 +55,9 @@ pub struct Action {
     pub path: String,
     pub query: String,
     pub content_type: Option<String>,
+    /// Request headers in wire order. `OpenShell` omits credential, routing
+    /// and hop-by-hop headers.
+    pub headers: Vec<(String, String)>,
     pub body_bytes: usize,
     pub body: Vec<u8>,
     pub payload: Payload,
@@ -116,6 +119,11 @@ impl Action {
             path: target.path,
             query: target.query,
             content_type,
+            headers: evaluation
+                .headers
+                .iter()
+                .map(|header| (header.name.clone(), header.value.clone()))
+                .collect(),
             body_bytes: evaluation.body.len(),
             body: evaluation.body.clone(),
             payload,
