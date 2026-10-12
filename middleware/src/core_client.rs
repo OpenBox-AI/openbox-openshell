@@ -41,6 +41,8 @@ const V3_BOOTSTRAP_PATH: &str = "/api/v3/auth/bootstrap";
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 const WORKFLOW_TYPE: &str = "openshell.sandbox";
 const TASK_QUEUE: &str = "openshell";
+/// `sandbox.provider` on a request's span, the name Core gives sandbox spans.
+const SANDBOX_PROVIDER: &str = "openshell";
 const SDK_IDENTIFIER: &str = concat!("openshell-middleware/rust/", env!("CARGO_PKG_VERSION"));
 
 /// A verdict as Core states it.
@@ -856,7 +858,17 @@ pub fn started_span(
         "url.full": url,
         "server.address": action.host,
         "server.port": action.port,
+        "openbox.sandbox.id": action.sandbox_id,
+        "sandbox.provider": SANDBOX_PROVIDER,
     });
+    // The process inside the sandbox that made the request, so a policy or
+    // behaviour rule can match on the program as well as the destination.
+    if let Some(binary) = &action.process_binary {
+        attributes["process.executable.path"] = json!(binary);
+    }
+    if !action.process_ancestors.is_empty() {
+        attributes["openbox.process.ancestors"] = json!(action.process_ancestors);
+    }
     let mut mcp = false;
     if let Payload::JsonRpc(calls) = &action.payload
         && let Some(call) = calls
@@ -1203,6 +1215,10 @@ mod tests {
                     "url.full": "https://mcp.example.com:8443/v1/charge?dry_run=1",
                     "server.address": "mcp.example.com",
                     "server.port": 8443,
+                    "openbox.sandbox.id": "sbx-id-1",
+                    "sandbox.provider": "openshell",
+                    "process.executable.path": "/usr/bin/python3",
+                    "openbox.process.ancestors": ["/bin/sh"],
                 },
                 "status": {"code": "UNSET", "description": null}, "events": [],
                 "hook_type": "http_request", "semantic_type": null,
@@ -1216,6 +1232,19 @@ mod tests {
                 "response_headers": null, "response_body": null, "error": null,
             })
         );
+    }
+
+    #[test]
+    fn a_span_without_a_process_has_no_lineage() {
+        let mut evaluation = evaluation("GET", "/", b"");
+        evaluation.context.as_mut().unwrap().originating_process = None;
+        let action = Action::from_evaluation(&evaluation);
+        let span = started_span(&action, "oshx-req-1", 4, UNIX_EPOCH);
+        let attributes = &span["attributes"];
+        assert!(attributes.get("process.executable.path").is_none());
+        assert!(attributes.get("openbox.process.ancestors").is_none());
+        assert_eq!(attributes["openbox.sandbox.id"], "sbx-id-1");
+        assert_eq!(attributes["sandbox.provider"], "openshell");
     }
 
     #[test]
