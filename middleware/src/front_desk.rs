@@ -130,6 +130,26 @@ pub fn required_attachment(policy: &Value) -> Value {
             }
             order
         });
+    // The author's door guard settings survive: an approval mode it accepts
+    // and the sandbox's profile. Anything else is dropped, since the door
+    // guard refuses unknown keys at policy load.
+    let authored = field(policy, "networkMiddlewares", "network_middlewares")
+        .and_then(|existing| existing.get(ATTACHMENT_KEY))
+        .and_then(|attachment| attachment.get("config"));
+    let mut config = json!({ "approval_mode": "queue" });
+    if let Some(mode) = authored
+        .and_then(|config| config.get("approval_mode"))
+        .and_then(Value::as_str)
+        .filter(|mode| matches!(*mode, "queue" | "deny"))
+    {
+        config["approval_mode"] = json!(mode);
+    }
+    if let Some(profile) = authored
+        .and_then(|config| config.get("profile"))
+        .and_then(Value::as_str)
+    {
+        config["profile"] = json!(profile);
+    }
     let mut endpoints = json!({ "include": [ALL_HOSTS] });
     let excluded = uninspectable_hosts(policy);
     if !excluded.is_empty() {
@@ -138,7 +158,7 @@ pub fn required_attachment(policy: &Value) -> Value {
     json!({
         "name": "OpenBox verdicts",
         "middleware": MIDDLEWARE_NAME,
-        "config": { "approval_mode": "queue" },
+        "config": config,
         "onError": "fail_closed",
         "endpoints": endpoints,
         "order": order,
@@ -484,6 +504,32 @@ mod tests {
         let operation = json!({"spec": {"policy": policy}});
         assert!(modify_create_sandbox(&operation).is_err());
         assert!(validate_create_sandbox(&operation).is_err());
+    }
+
+    #[test]
+    fn create_keeps_the_authors_profile_and_approval_mode() {
+        let mut authored = policy();
+        authored["networkMiddlewares"] = json!({"openbox": {
+            "middleware": "openbox",
+            "config": {"profile": "coding", "approval_mode": "deny", "tenant": "acme"},
+        }});
+        let operation = json!({"spec": {"policy": authored}});
+        let created = apply(&operation, &modify_create_sandbox(&operation).unwrap());
+        let attachment = &created["spec"]["policy"]["networkMiddlewares"]["openbox"];
+        assert_eq!(
+            attachment["config"],
+            json!({"profile": "coding", "approval_mode": "deny"})
+        );
+        assert_eq!(attachment["onError"], "fail_closed");
+        assert_eq!(validate_policy(&created["spec"]["policy"]), Ok(()));
+
+        // Without one: queue and no profile, as before.
+        let operation = json!({"spec": {"policy": policy()}});
+        let created = apply(&operation, &modify_create_sandbox(&operation).unwrap());
+        assert_eq!(
+            created["spec"]["policy"]["networkMiddlewares"]["openbox"]["config"],
+            json!({"approval_mode": "queue"})
+        );
     }
 
     #[test]

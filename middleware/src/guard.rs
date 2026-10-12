@@ -374,7 +374,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         }
         let model = agent::model_call(action);
         if let Some(model) = &model {
-            self.close_tools(&action.sandbox_id, model).await;
+            self.close_tools(action, model).await;
         }
         let Route {
             mut activity,
@@ -598,11 +598,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         let activity = record
             .get("activity")
             .and_then(activity_from)
-            .unwrap_or_else(|| Activity {
-                id: request_activity_id(&response.request_id),
-                kind: format!("{} {}", response.method, response.host),
-                input: json!([{"method": response.method, "url": response.url}]),
-            });
+            .unwrap_or_else(|| fallback_activity(&response));
         let closes = record
             .get("closes")
             .and_then(Value::as_bool)
@@ -641,7 +637,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         };
         let mut tools = Vec::new();
         for call in reply.iter().flat_map(|reply| &reply.tool_calls) {
-            let tool = tool_activity(call, limit);
+            let tool = tool_activity(call, limit, completion.activity.profile.clone());
             self.track_tool(&response.sandbox_id, &call.id, &tool).await;
             tools.push((call.id.clone(), tool));
         }
@@ -698,6 +694,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 id: request_activity_id(&action.request_id),
                 kind,
                 input,
+                profile: action.profile.clone(),
             },
             open: true,
             closes: true,
@@ -807,7 +804,8 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     /// model call's own activity opens. A result for a tool never seen open
     /// (its reply could not be read) still records the tool, from the call
     /// the conversation carries. Runs inside the model call's turn.
-    async fn close_tools(&self, sandbox_id: &str, model: &agent::ModelCall) {
+    async fn close_tools(&self, action: &Action, model: &agent::ModelCall) {
+        let sandbox_id = action.sandbox_id.as_str();
         let limit = self.governance.body_limit();
         let mut closing = Vec::new();
         for result in &model.tool_results {
@@ -838,7 +836,11 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                     let Some(call) = model.tool_call(&result.id) else {
                         continue;
                     };
-                    (tool_activity(call, limit), None, false)
+                    (
+                        tool_activity(call, limit, action.profile.clone()),
+                        None,
+                        false,
+                    )
                 }
             };
             let closed = json!({"activity": activity_json(&tool), "state": "closed"});
@@ -999,24 +1001,29 @@ struct Route {
 }
 
 fn activity_json(activity: &Activity) -> Value {
-    json!({"id": activity.id, "kind": activity.kind, "input": activity.input})
+    json!({"id": activity.id, "kind": activity.kind, "input": activity.input, "profile": activity.profile})
 }
 
-fn activity_from(value: &Value) -> Option<Activity> {
+pub(crate) fn activity_from(value: &Value) -> Option<Activity> {
     Some(Activity {
         id: value.get("id")?.as_str()?.to_owned(),
         kind: value.get("kind")?.as_str()?.to_owned(),
         input: value.get("input").cloned().unwrap_or_else(|| json!([])),
+        profile: value
+            .get("profile")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
 /// A tool the model asked for, as the agent SDK reports a tool: named by the
-/// tool, its arguments as input.
-fn tool_activity(call: &agent::ToolCall, limit: usize) -> Activity {
+/// tool, its arguments as input, in the profile of the model call.
+fn tool_activity(call: &agent::ToolCall, limit: usize, profile: Option<String>) -> Activity {
     Activity {
         id: tool_activity_id(&call.id),
         kind: call.name.clone(),
         input: json!([bounded(&call.input, limit)]),
+        profile,
     }
 }
 
@@ -1065,6 +1072,17 @@ fn outcome(
             || json!({"type": "HTTPError", "message": format!("HTTP {}", response.status_code)}),
         ),
         duration_ms,
+    }
+}
+
+/// The activity of a response whose request record was lost: its own,
+/// named by method and host. The sandbox's profile went with the record.
+fn fallback_activity(response: &ResponseSeen) -> Activity {
+    Activity {
+        id: request_activity_id(&response.request_id),
+        kind: format!("{} {}", response.method, response.host),
+        input: json!([{"method": response.method, "url": response.url}]),
+        profile: None,
     }
 }
 
@@ -1767,6 +1785,59 @@ pub(crate) mod tests {
         assert_eq!(
             fetched.response_body.as_deref(),
             Some("<html>Example</html>")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sandbox_profile_follows_a_model_call_into_its_tools() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow, Verdict::Allow]));
+        let profiled = |mut action: Action| {
+            action.profile = Some("coding".to_owned());
+            action
+        };
+        let ask = json!([{"role": "user", "content": "summarise example.com"}]);
+        guard
+            .evaluate(&profiled(model_request("m-1", &ask)), ApprovalMode::Queue)
+            .await;
+        let reply = json!({"model": "claude-x", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "fetch", "input": {"url": "http://example.com/"}}
+        ]});
+        guard
+            .complete(response("m-1", 200, reply.to_string().as_bytes()))
+            .await;
+        let mut fetch = evaluation("GET", "/", b"");
+        fetch.context.as_mut().unwrap().request_id = "f-1".to_owned();
+        guard
+            .evaluate(
+                &profiled(Action::from_evaluation(&fetch)),
+                ApprovalMode::Queue,
+            )
+            .await;
+        guard.complete(response("f-1", 200, b"page")).await;
+        settle(&core, 1).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let activities = core.activities.lock().unwrap();
+        let kinds: Vec<_> = activities.iter().map(|(a, _)| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["llm_call", "fetch"]);
+        // The tool came back from the store, which kept its profile.
+        assert!(
+            activities
+                .iter()
+                .all(|(a, _)| a.profile.as_deref() == Some("coding"))
+        );
+        let closed = core.closed.lock().unwrap();
+        assert!(!closed.is_empty());
+        assert!(
+            closed
+                .iter()
+                .all(|(a, _)| a.profile.as_deref() == Some("coding"))
+        );
+        assert!(
+            core.completions
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| c.activity.profile.as_deref() == Some("coding"))
         );
     }
 

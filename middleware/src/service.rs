@@ -244,30 +244,58 @@ fn skip_response() -> HttpResponseEventResult {
     }
 }
 
+/// The longest `profile` accepted; Core stores it with every activity.
+const MAX_PROFILE_BYTES: usize = 128;
+
+/// The middleware config a sandbox's policy sets for the door guard.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MiddlewareConfig {
+    pub approval_mode: ApprovalMode,
+    /// The sandbox's profile, sent to Core as `profile_id` so a policy can
+    /// tell one kind of sandbox from another under the same agent.
+    pub profile: Option<String>,
+}
+
 /// Parses the policy-supplied middleware config. Only known keys are accepted
 /// so a typo fails at policy load instead of silently changing behaviour.
-pub fn parse_config(config: Option<&Struct>) -> Result<ApprovalMode, String> {
+pub fn parse_config(config: Option<&Struct>) -> Result<MiddlewareConfig, String> {
+    let mut parsed = MiddlewareConfig::default();
     let Some(config) = config else {
-        return Ok(ApprovalMode::default());
+        return Ok(parsed);
     };
-    let mut mode = ApprovalMode::default();
     for (key, value) in &config.fields {
         match key.as_str() {
             "approval_mode" => {
-                mode = match value.kind.as_ref() {
+                parsed.approval_mode = match value.kind.as_ref() {
                     Some(Kind::StringValue(text)) if text == "queue" => ApprovalMode::Queue,
                     Some(Kind::StringValue(text)) if text == "deny" => ApprovalMode::Deny,
                     _ => return Err("approval_mode must be \"queue\" or \"deny\"".to_owned()),
                 };
             }
+            "profile" => {
+                parsed.profile = match value.kind.as_ref() {
+                    Some(Kind::StringValue(text))
+                        if !text.trim().is_empty()
+                            && text.len() <= MAX_PROFILE_BYTES
+                            && !text.chars().any(char::is_control) =>
+                    {
+                        Some(text.clone())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "profile must be a non-empty string of at most {MAX_PROFILE_BYTES} bytes"
+                        ));
+                    }
+                };
+            }
             other => {
                 return Err(format!(
-                    "unknown config key {other:?}; supported: approval_mode"
+                    "unknown config key {other:?}; supported: approval_mode, profile"
                 ));
             }
         }
     }
-    Ok(mode)
+    Ok(parsed)
 }
 
 #[tonic::async_trait]
@@ -355,9 +383,12 @@ impl<G: Governance, S: SandboxStopper + ?Sized> SupervisorMiddleware for Verdict
             .as_ref()
             .map_or("", |context| context.sandbox_id.as_str());
         Self::check_sandbox(caller.as_ref(), sandbox_id)?;
-        let mode = parse_config(evaluation.config.as_ref()).map_err(Status::invalid_argument)?;
-        let action = Action::from_evaluation(&evaluation);
-        Ok(Response::new(self.guard.evaluate(&action, mode).await))
+        let config = parse_config(evaluation.config.as_ref()).map_err(Status::invalid_argument)?;
+        let mut action = Action::from_evaluation(&evaluation);
+        action.profile = config.profile;
+        Ok(Response::new(
+            self.guard.evaluate(&action, config.approval_mode).await,
+        ))
     }
 
     async fn evaluate_web_socket_session(
@@ -627,11 +658,32 @@ mod tests {
 
     #[test]
     fn config_accepts_only_known_keys() {
-        assert_eq!(parse_config(None), Ok(ApprovalMode::Queue));
+        assert_eq!(parse_config(None), Ok(MiddlewareConfig::default()));
+        assert_eq!(
+            MiddlewareConfig::default().approval_mode,
+            ApprovalMode::Queue
+        );
         assert_eq!(
             parse_config(Some(&config(&[("approval_mode", "deny")]))),
-            Ok(ApprovalMode::Deny)
+            Ok(MiddlewareConfig {
+                approval_mode: ApprovalMode::Deny,
+                profile: None,
+            })
         );
+        assert_eq!(
+            parse_config(Some(&config(&[
+                ("profile", "coding"),
+                ("approval_mode", "queue")
+            ]))),
+            Ok(MiddlewareConfig {
+                approval_mode: ApprovalMode::Queue,
+                profile: Some("coding".to_owned()),
+            })
+        );
+        assert!(parse_config(Some(&config(&[("profile", " ")]))).is_err());
+        assert!(parse_config(Some(&config(&[("profile", "a\nb")]))).is_err());
+        assert!(parse_config(Some(&config(&[("profile", &"p".repeat(129))]))).is_err());
+        assert!(parse_config(Some(&config(&[("tenant", "acme")]))).is_err());
         assert!(parse_config(Some(&config(&[("approval_mode", "later")]))).is_err());
         assert!(parse_config(Some(&config(&[("approvl_mode", "queue")]))).is_err());
     }
