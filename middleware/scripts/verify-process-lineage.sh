@@ -19,11 +19,12 @@
 # touches a dev environment you already run.
 #
 # The span is read back the way the dashboard reads it: from the backend's
-# session logs, with an organisation API key (X-API-Key) that may read agent
-# sessions and logs:
+# session logs (pages count from 0), with an organisation API key
+# (X-API-Key) that may read agent sessions and logs:
 #   OBX_BACKEND_URL           the backend, e.g. https://api.<env>
 #   OBX_BACKEND_API_KEY_FILE  file with the organisation API key
-# Without them, scenarios 3-5 are reported SKIP, not PASS.
+# Without them, scenarios 3-5 are reported SKIP, not PASS, and the lineage is
+# not checked at all: scenarios 1-2 only show the request was governed.
 #
 # Optional:
 #   OPENBOX_REDIS_URL         shared store (default redis://localhost:6379/7)
@@ -83,14 +84,15 @@ until os logs "$BOX" --source sandbox 2>/dev/null | grep -q 'Settings poll'; do
 done
 
 # bash makes the request, started by sh: the lineage is bash, then sh.
+# stdin is closed: sandbox exec forwards stdin and waits for its end.
 code=$(os sandbox exec -n "$BOX" --no-tty --timeout 60 -- sh -c 'bash -c '"'"'
   exec 3<>/dev/tcp/example.com/80 || { echo "connect failed"; exit 0; }
   printf "GET /?lineage=1 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n" >&3
-  IFS=" " read -r _ code _ <&3; echo "${code:-none}"'"'" 2>&1 | tail -1 || true)
+  IFS=" " read -r _ code _ <&3; echo "${code:-none}"'"'" </dev/null 2>&1 | tail -1 || true)
 if [ "$code" = 200 ]; then
-  pass "1 a request from bash in the sandbox is allowed by Core with the lineage on its span (HTTP 200)"
+  pass "1 a request from bash in the sandbox is allowed by Core (HTTP 200)"
 else
-  fail "1 a request from bash in the sandbox is allowed by Core with the lineage on its span (got '$code')"
+  fail "1 a request from bash in the sandbox is allowed by Core (got '$code')"
 fi
 if grep -q "eval .*sandbox_id=$ID decision=allow" "$OBX_DEV_DIR/door-guard.log"; then
   pass "2 the door guard scored it with Core (allow in its log)"
@@ -105,7 +107,7 @@ else
   SESSION=
   i=0
   while [ -z "$SESSION" ] && [ $i -lt 30 ]; do
-    SESSION=$(backend "/agent/$AGENT_ID/sessions?page=1&perPage=50" 2>/dev/null | python3 -c '
+    SESSION=$(backend "/agent/$AGENT_ID/sessions?page=0&perPage=50" 2>/dev/null | python3 -c '
 import json, sys
 want = sys.argv[1]
 def walk(node):
@@ -125,7 +127,7 @@ walk(json.load(sys.stdin))' "$ID" || true)
     got=""
     i=0
     while [ -z "$got" ] && [ $i -lt 30 ]; do
-      got=$(backend "/agent/$AGENT_ID/sessions/$SESSION/logs/chronological?page=1&perPage=100" 2>/dev/null |
+      got=$(backend "/agent/$AGENT_ID/sessions/$SESSION/logs/chronological?page=0&perPage=100" 2>/dev/null |
         python3 -c '
 import json, sys
 found = []
