@@ -50,7 +50,7 @@ use openbox_verdict_middleware::core_client::{
     AgentSigner, CoreClient, CoreConfig, WorkloadIdentity,
 };
 use openbox_verdict_middleware::guard::{
-    DEFAULT_APPROVAL_TTL, DEFAULT_CORE_BUDGET, Guard, SandboxStopper,
+    DEFAULT_APPROVAL_TTL, DEFAULT_CORE_BUDGET, Governance, Guard, SandboxStopper,
 };
 use openbox_verdict_middleware::halt::{DenyOnlyStopper, GatewayStopper};
 use openbox_verdict_middleware::metrics::serve_admin;
@@ -63,6 +63,9 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::Supervi
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 const DEFAULT_AUDIENCE: &str = "urn:openshell:extension:middleware:openbox";
+/// Most the door guard waits, on shutdown, for queued Core calls. Under
+/// Kubernetes' default 30 s grace period.
+const DRAIN_LIMIT: Duration = Duration::from_secs(20);
 /// `OpenShell` sends bodies up to 4 MiB plus a protobuf envelope (it asks
 /// services to accept at least 4 MiB + 293 KiB); tonic defaults to 4 MiB.
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024 + 512 * 1024;
@@ -255,6 +258,7 @@ async fn run() -> Result<(), String> {
             .with_prompt_capture(capture),
     );
     let metrics = guard.metrics();
+    let draining = Arc::clone(&guard);
     let admin: SocketAddr = env("OPENBOX_MW_ADMIN_LISTEN")
         .unwrap_or_else(|| "127.0.0.1:9464".to_owned())
         .parse()
@@ -293,7 +297,20 @@ async fn run() -> Result<(), String> {
             shutdown_signal(),
         )
         .await
-        .map_err(|error| format!("server: {error}"))
+        .map_err(|error| format!("server: {error}"))?;
+    drain(&draining).await;
+    Ok(())
+}
+
+/// Completions and activity ends are sent in the background; send what is
+/// still queued, or Core never hears how those requests ended.
+async fn drain<G: Governance, S: SandboxStopper + ?Sized>(guard: &Guard<G, S>) {
+    if !guard.drain(DRAIN_LIMIT).await {
+        eprintln!(
+            "openbox-verdict-middleware: Core calls still queued after {} s were dropped",
+            DRAIN_LIMIT.as_secs()
+        );
+    }
 }
 
 /// Kubernetes sends SIGTERM; a terminal sends SIGINT. In-flight evaluations

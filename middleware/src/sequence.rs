@@ -82,6 +82,37 @@ impl Sequencer {
         Turn { _release: release }
     }
 
+    /// Waits, up to `limit`, until everything queued so far has been sent,
+    /// for every sandbox. For shutdown: work still queued when the process
+    /// exits is lost. Returns whether it all went out in time.
+    pub async fn drain(self: &Arc<Self>, limit: Duration) -> bool {
+        let sandboxes: Vec<String> = self
+            .queues
+            .lock()
+            .expect("sequencer lock")
+            .keys()
+            .cloned()
+            .collect();
+        let mut done = Vec::new();
+        for sandbox_id in sandboxes {
+            let (sent, reached) = oneshot::channel::<()>();
+            self.enqueue(
+                &sandbox_id,
+                Box::pin(async move {
+                    let _ = sent.send(());
+                }),
+            );
+            done.push(reached);
+        }
+        tokio::time::timeout(limit, async {
+            for reached in done {
+                let _ = reached.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     fn enqueue(self: &Arc<Self>, sandbox_id: &str, job: Job) {
         let mut queues = self.queues.lock().expect("sequencer lock");
         if let Some(queue) = queues.get(sandbox_id) {
@@ -167,5 +198,22 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(40));
         drop(sequencer.turn("slow").await);
         assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_queued_work_up_to_a_limit() {
+        let sequencer = Sequencer::new(Duration::from_secs(5));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        for sandbox in ["a", "b"] {
+            let sent = Arc::clone(&sent);
+            sequencer.push(sandbox, async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                sent.lock().unwrap().push(sandbox);
+            });
+        }
+        assert!(sequencer.drain(Duration::from_secs(1)).await);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        sequencer.push("c", std::future::pending());
+        assert!(!sequencer.drain(Duration::from_millis(20)).await);
     }
 }

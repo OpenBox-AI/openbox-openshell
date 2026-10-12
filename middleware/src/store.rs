@@ -12,6 +12,10 @@
 //! - **Prompts**: `sandbox + user turn`, once that turn's prompt is signalled,
 //!   so a conversation resent on every model call is signalled once.
 //! - **Sessions**: `sandbox id → start time`, for the session's duration.
+//! - **Pending**: `sandbox id → request ids`, each allowed request whose
+//!   completion (its span and the end of its activity) the door guard has not
+//!   sent yet, so the front desk ends a deleted sandbox's session only after
+//!   them.
 //!
 //! Every reader treats a store failure as "nothing remembered": an approval
 //! retry is then scored as a new activity (fail closed, never auto-approved),
@@ -21,7 +25,7 @@
 //! [`RedisStore`] shares this across replicas; [`MemoryStore`] is for a single
 //! replica and tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -36,6 +40,11 @@ pub trait SharedStore: Send + Sync + 'static {
     /// Reads and removes.
     async fn take(&self, key: &str) -> Result<Option<String>, String>;
     async fn delete(&self, key: &str) -> Result<(), String>;
+    /// Adds a member to the set at `key`, which lives `ttl` from now.
+    async fn add_member(&self, key: &str, member: &str, ttl: Duration) -> Result<(), String>;
+    async fn remove_member(&self, key: &str, member: &str) -> Result<(), String>;
+    /// How many members the set at `key` has; 0 when there is none.
+    async fn count_members(&self, key: &str) -> Result<u64, String>;
 }
 
 pub fn approval_key(sandbox_id: &str, fingerprint: &str) -> String {
@@ -65,10 +74,16 @@ pub fn session_key(sandbox_id: &str) -> String {
     format!("openbox:session:{sandbox_id}")
 }
 
+/// The request ids of a sandbox whose completion is still to be sent.
+pub fn pending_key(sandbox_id: &str) -> String {
+    format!("openbox:pending:{sandbox_id}")
+}
+
 /// In-process store. Expired entries are dropped when read.
 #[derive(Default)]
 pub struct MemoryStore {
     entries: Mutex<HashMap<String, (String, Option<Instant>)>>,
+    sets: Mutex<HashMap<String, (HashSet<String>, Instant)>>,
 }
 
 impl MemoryStore {
@@ -111,6 +126,39 @@ impl SharedStore for MemoryStore {
         self.entries.lock().expect("store lock").remove(key);
         Ok(())
     }
+
+    async fn add_member(&self, key: &str, member: &str, ttl: Duration) -> Result<(), String> {
+        let mut sets = self.sets.lock().expect("store lock");
+        let until = Instant::now() + ttl;
+        let (members, expires) = sets
+            .entry(key.to_owned())
+            .or_insert_with(|| (HashSet::new(), until));
+        if *expires <= Instant::now() {
+            members.clear();
+        }
+        members.insert(member.to_owned());
+        *expires = until;
+        Ok(())
+    }
+
+    async fn remove_member(&self, key: &str, member: &str) -> Result<(), String> {
+        let mut sets = self.sets.lock().expect("store lock");
+        if let Some((members, _)) = sets.get_mut(key) {
+            members.remove(member);
+            if members.is_empty() {
+                sets.remove(key);
+            }
+        }
+        Ok(())
+    }
+
+    async fn count_members(&self, key: &str) -> Result<u64, String> {
+        let sets = self.sets.lock().expect("store lock");
+        Ok(sets
+            .get(key)
+            .filter(|(_, expires)| *expires > Instant::now())
+            .map_or(0, |(members, _)| members.len() as u64))
+    }
 }
 
 /// Redis over RESP, one connection reused and reopened after any error.
@@ -126,7 +174,7 @@ pub struct RedisStore {
 
 enum Reply {
     Ok,
-    Integer,
+    Integer(i64),
     Bulk(Option<Vec<u8>>),
 }
 
@@ -231,7 +279,10 @@ async fn exchange(connection: &mut BufReader<TcpStream>, args: &[&[u8]]) -> Resu
     let line = line.trim_end_matches("\r\n");
     match line.as_bytes().first() {
         Some(b'+') => Ok(Reply::Ok),
-        Some(b':') => Ok(Reply::Integer),
+        Some(b':') => line[1..]
+            .parse()
+            .map(Reply::Integer)
+            .map_err(|_| "redis: bad integer".to_owned()),
         Some(b'-') => Err(format!("redis error: {}", &line[1..])),
         Some(b'$') => {
             let length: i64 = line[1..]
@@ -258,7 +309,7 @@ fn text(reply: Reply) -> Result<Option<String>, String> {
             .map(Some)
             .map_err(|_| "redis: value is not UTF-8".to_owned()),
         Reply::Bulk(None) => Ok(None),
-        Reply::Ok | Reply::Integer => Err("redis: expected a value".to_owned()),
+        Reply::Ok | Reply::Integer(_) => Err("redis: expected a value".to_owned()),
     }
 }
 
@@ -299,6 +350,28 @@ impl SharedStore for RedisStore {
     async fn delete(&self, key: &str) -> Result<(), String> {
         self.command(&[b"DEL", key.as_bytes()]).await.map(|_| ())
     }
+
+    async fn add_member(&self, key: &str, member: &str, ttl: Duration) -> Result<(), String> {
+        self.command(&[b"SADD", key.as_bytes(), member.as_bytes()])
+            .await?;
+        let millis = ttl.as_millis().max(1).to_string();
+        self.command(&[b"PEXPIRE", key.as_bytes(), millis.as_bytes()])
+            .await
+            .map(|_| ())
+    }
+
+    async fn remove_member(&self, key: &str, member: &str) -> Result<(), String> {
+        self.command(&[b"SREM", key.as_bytes(), member.as_bytes()])
+            .await
+            .map(|_| ())
+    }
+
+    async fn count_members(&self, key: &str) -> Result<u64, String> {
+        match self.command(&[b"SCARD", key.as_bytes()]).await? {
+            Reply::Integer(count) => Ok(u64::try_from(count).unwrap_or(0)),
+            _ => Err("redis: SCARD did not return a count".to_owned()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -318,6 +391,35 @@ mod tests {
         assert_eq!(store.get("b").await.unwrap(), None);
         assert_eq!(store.take("a").await.unwrap().as_deref(), Some("1"));
         assert_eq!(store.get("a").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn memory_store_counts_members() {
+        let store = MemoryStore::default();
+        store
+            .add_member("p", "a", Duration::from_secs(5))
+            .await
+            .unwrap();
+        store
+            .add_member("p", "b", Duration::from_secs(5))
+            .await
+            .unwrap();
+        store
+            .add_member("p", "a", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(store.count_members("p").await.unwrap(), 2);
+        store.remove_member("p", "a").await.unwrap();
+        store.remove_member("p", "missing").await.unwrap();
+        assert_eq!(store.count_members("p").await.unwrap(), 1);
+        store.remove_member("p", "b").await.unwrap();
+        assert_eq!(store.count_members("p").await.unwrap(), 0);
+        store
+            .add_member("q", "a", Duration::from_millis(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(store.count_members("q").await.unwrap(), 0);
     }
 
     #[test]
@@ -354,5 +456,18 @@ mod tests {
         assert_eq!(store.get(&key).await.unwrap().as_deref(), Some("v"));
         assert_eq!(store.take(&key).await.unwrap().as_deref(), Some("v"));
         assert_eq!(store.get(&key).await.unwrap(), None);
+        let set = format!("openbox:test:set:{}", std::process::id());
+        store
+            .add_member(&set, "a", Duration::from_secs(5))
+            .await
+            .unwrap();
+        store
+            .add_member(&set, "b", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(store.count_members(&set).await.unwrap(), 2);
+        store.remove_member(&set, "a").await.unwrap();
+        store.remove_member(&set, "b").await.unwrap();
+        assert_eq!(store.count_members(&set).await.unwrap(), 0);
     }
 }

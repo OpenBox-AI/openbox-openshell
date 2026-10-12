@@ -14,6 +14,12 @@
 //! version, labels); its duration comes from the start time the front desk
 //! keeps in the shared store, so any replica can close it.
 //!
+//! The door guard sends a request's completion (its span and the end of its
+//! activity) in the background, and a sandbox is often deleted right after its
+//! last response. So on delete the session waits, bounded, until the door
+//! guard has sent every completion it still owes ([`pending_key`]); otherwise
+//! Core hears the session end first and the last activity stays open.
+//!
 //! A tool the model asked for that never got its result back (the sandbox
 //! went away mid-tool) is closed before the session, so no activity is left
 //! open.
@@ -22,14 +28,19 @@
 //! calls run in the background so a slow Core never holds up the gateway.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
 use crate::core_client::{Activity, CoreClient, Outcome};
 use crate::interceptor::{Inventory, InventoryEvent};
 use crate::inventory::RuntimeEnvironment;
-use crate::store::{SharedStore, open_tools_key, session_key, tool_key};
+use crate::store::{SharedStore, open_tools_key, pending_key, session_key, tool_key};
+
+/// Most a deleted sandbox's session waits for the door guard's completions:
+/// one slow Core call. The wait is in the background; nothing is held for it.
+const PENDING_WAIT: Duration = Duration::from_secs(30);
+const PENDING_POLL: Duration = Duration::from_millis(250);
 
 /// The two Core calls a sandbox's lifecycle needs.
 #[tonic::async_trait]
@@ -101,6 +112,7 @@ pub struct SessionLifecycle {
     core: Arc<dyn SessionGovernance>,
     store: Arc<dyn SharedStore>,
     gateway: Option<String>,
+    pending_wait: Duration,
 }
 
 impl SessionLifecycle {
@@ -115,48 +127,72 @@ impl SessionLifecycle {
             core,
             store,
             gateway,
+            pending_wait: PENDING_WAIT,
         }
+    }
+
+    /// Replaces [`PENDING_WAIT`].
+    #[must_use]
+    pub const fn with_pending_wait(mut self, wait: Duration) -> Self {
+        self.pending_wait = wait;
+        self
     }
 }
 
-impl SessionLifecycle {
-    /// Takes the sandbox's tools that are still open, marking them closed.
-    async fn open_tools(&self, sandbox_id: &str) -> Vec<(Activity, bool)> {
-        let ids: Vec<String> = self
-            .store
-            .take(&open_tools_key(sandbox_id))
+/// Waits until the door guard has sent every completion it owes the sandbox,
+/// or `limit` passes. Returns how many it gave up on.
+async fn await_pending(store: &dyn SharedStore, sandbox_id: &str, limit: Duration) -> u64 {
+    let deadline = Instant::now() + limit;
+    loop {
+        let pending = match store.count_members(&pending_key(sandbox_id)).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                eprintln!(
+                    "openbox: pending completions for sandbox_id={sandbox_id} unknown, ending its session now: {error}"
+                );
+                return 0;
+            }
+        };
+        if pending == 0 || Instant::now() >= deadline {
+            return pending;
+        }
+        tokio::time::sleep(PENDING_POLL).await;
+    }
+}
+
+/// Takes the sandbox's tools that are still open, marking them closed.
+async fn open_tools(store: &dyn SharedStore, sandbox_id: &str) -> Vec<(Activity, bool)> {
+    let ids: Vec<String> = store
+        .take(&open_tools_key(sandbox_id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let mut tools = Vec::new();
+    for call_id in ids {
+        let Some(entry) = store
+            .take(&tool_key(sandbox_id, &call_id))
             .await
             .ok()
             .flatten()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
-        let mut tools = Vec::new();
-        for call_id in ids {
-            let key = tool_key(sandbox_id, &call_id);
-            let Some(entry) = self
-                .store
-                .take(&key)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            else {
-                continue;
-            };
-            let state = entry.get("state").and_then(Value::as_str);
-            let activity = entry.get("activity").and_then(|activity| {
-                Some(Activity {
-                    id: activity.get("id")?.as_str()?.to_owned(),
-                    kind: activity.get("kind")?.as_str()?.to_owned(),
-                    input: activity.get("input").cloned().unwrap_or_else(|| json!([])),
-                })
-            });
-            if let (Some("open" | "opened"), Some(activity)) = (state, activity) {
-                tools.push((activity, state == Some("opened")));
-            }
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        else {
+            continue;
+        };
+        let state = entry.get("state").and_then(Value::as_str);
+        let activity = entry.get("activity").and_then(|activity| {
+            Some(Activity {
+                id: activity.get("id")?.as_str()?.to_owned(),
+                kind: activity.get("kind")?.as_str()?.to_owned(),
+                input: activity.get("input").cloned().unwrap_or_else(|| json!([])),
+            })
+        });
+        if let (Some("open" | "opened"), Some(activity)) = (state, activity) {
+            tools.push((activity, state == Some("opened")));
         }
-        tools
     }
+    tools
 }
 
 fn unix_millis() -> u64 {
@@ -211,10 +247,20 @@ impl Inventory for SessionLifecycle {
                         .unwrap_or_default()
                         .and_then(|started| started.parse::<u64>().ok())
                         .map(|started| unix_millis().saturating_sub(started));
-                    let tools = self.open_tools(&id).await;
                     let core = Arc::clone(&self.core);
+                    let store = Arc::clone(&self.store);
+                    let wait = self.pending_wait;
                     tokio::spawn(async move {
-                        for (tool, opened) in tools {
+                        let left = await_pending(store.as_ref(), &id, wait).await;
+                        if left > 0 {
+                            eprintln!(
+                                "openbox: ending session sandbox_id={id} with {left} completion(s) not sent after {} s",
+                                wait.as_secs()
+                            );
+                        }
+                        // After the wait: the door guard may still have been
+                        // opening the tools the last reply asked for.
+                        for (tool, opened) in open_tools(store.as_ref(), &id).await {
                             if let Err(error) = core.close_tool(&id, &tool, opened).await {
                                 eprintln!(
                                     "openbox: tool activity {} left open sandbox_id={id}: {error}",
@@ -250,7 +296,6 @@ mod tests {
     use super::*;
     use crate::store::MemoryStore;
     use std::sync::Mutex;
-    use std::time::Duration;
     use tokio::sync::mpsc;
 
     struct FakeCore {
@@ -359,6 +404,83 @@ mod tests {
             Some("end sbx-1 timed=false")
         );
         assert!(store.get(&open_tools_key("sbx-1")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_ends_the_session_after_the_door_guards_pending_completions() {
+        let (calls, mut received) = mpsc::unbounded_channel();
+        let store: Arc<dyn SharedStore> = Arc::new(MemoryStore::default());
+        store
+            .add_member(&pending_key("sbx-1"), "req-1", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let sessions = SessionLifecycle::new(
+            Arc::new(FakeInventory::default()),
+            Arc::new(FakeCore { calls, fail: false }),
+            Arc::clone(&store),
+            None,
+        );
+        sessions
+            .record(InventoryEvent::Deleted {
+                response: json!({"sandboxId": "sbx-1"}),
+            })
+            .await
+            .unwrap();
+        // The door guard has not sent req-1's completion yet: no end.
+        assert_eq!(next(&mut received).await, None);
+        // Meanwhile its reply opened a tool, which the end must close.
+        store
+            .set(
+                &tool_key("sbx-1", "a"),
+                &json!({"activity": {"id": "oshx-tool-a", "kind": "fetch", "input": []}, "state": "opened"})
+                    .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set(&open_tools_key("sbx-1"), &json!(["a"]).to_string(), None)
+            .await
+            .unwrap();
+        store
+            .remove_member(&pending_key("sbx-1"), "req-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            next(&mut received).await.as_deref(),
+            Some("close-tool sbx-1 oshx-tool-a fetch opened=true")
+        );
+        assert_eq!(
+            next(&mut received).await.as_deref(),
+            Some("end sbx-1 timed=false")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_ends_the_session_anyway_once_the_wait_runs_out() {
+        let (calls, mut received) = mpsc::unbounded_channel();
+        let store: Arc<dyn SharedStore> = Arc::new(MemoryStore::default());
+        store
+            .add_member(&pending_key("sbx-1"), "lost", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let sessions = SessionLifecycle::new(
+            Arc::new(FakeInventory::default()),
+            Arc::new(FakeCore { calls, fail: false }),
+            store,
+            None,
+        )
+        .with_pending_wait(Duration::from_millis(300));
+        sessions
+            .record(InventoryEvent::Deleted {
+                response: json!({"sandboxId": "sbx-1"}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next(&mut received).await.as_deref(),
+            Some("end sbx-1 timed=false")
+        );
     }
 
     #[derive(Default)]

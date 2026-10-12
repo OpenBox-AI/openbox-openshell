@@ -74,7 +74,8 @@ use crate::metrics::{CoreCall, Metrics};
 use crate::prompt::{self, Capture};
 use crate::sequence::Sequencer;
 use crate::store::{
-    MemoryStore, SharedStore, approval_key, open_tools_key, prompt_key, request_key, tool_key,
+    MemoryStore, SharedStore, approval_key, open_tools_key, pending_key, prompt_key, request_key,
+    tool_key,
 };
 
 /// How long an approval can be matched by its retry, unless configured.
@@ -301,6 +302,12 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         self
     }
 
+    /// Sends what is still queued for Core, up to `limit`, before the
+    /// process exits. Returns whether it all went out.
+    pub async fn drain(&self, limit: Duration) -> bool {
+        self.sequence.drain(limit).await
+    }
+
     pub fn metrics(&self) -> Arc<Metrics> {
         Arc::clone(&self.metrics)
     }
@@ -424,9 +431,13 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         let result = self.apply(action, mode, &decision);
         let held = mode == ApprovalMode::Queue && decision.verdict == Verdict::RequireApproval;
         if result.decision != Decision::Allow as i32 && closes && !held {
-            self.close_refused(&action.sandbox_id, activity.clone(), &decision);
+            self.close_refused(action, activity.clone(), &decision)
+                .await;
         }
         if result.decision == Decision::Allow as i32 {
+            // Pending until its completion is sent, so the front desk ends the
+            // session after it.
+            mark_pending(self.store.as_ref(), &action.sandbox_id, &action.request_id).await;
             let record = json!({
                 "activity": activity_json(&activity),
                 "closes": closes,
@@ -455,7 +466,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     /// Closes the activity of a request Core refused, as the agent SDK closes
     /// an activity governance stopped: failed, with the verdict's reason. An
     /// approval hold stays open for the retry that reuses it.
-    fn close_refused(&self, sandbox_id: &str, activity: Activity, decision: &CoreDecision) {
+    async fn close_refused(&self, action: &Action, activity: Activity, decision: &CoreDecision) {
         let outcome = Outcome {
             output: None,
             error: Some(json!({
@@ -468,9 +479,11 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             duration_ms: None,
         };
         let governance = Arc::clone(&self.governance);
-        let queue = sandbox_id.to_owned();
-        let sandbox_id = sandbox_id.to_owned();
-        self.sequence.push(&queue, async move {
+        let store = Arc::clone(&self.store);
+        let sandbox_id = action.sandbox_id.clone();
+        let request_id = action.request_id.clone();
+        mark_pending(store.as_ref(), &sandbox_id, &request_id).await;
+        self.sequence.push(&action.sandbox_id, async move {
             if let Err(error) = governance
                 .close_activity(&sandbox_id, &activity, &outcome)
                 .await
@@ -480,6 +493,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                     activity.id
                 );
             }
+            clear_pending(store.as_ref(), &sandbox_id, &request_id).await;
         });
     }
 
@@ -671,20 +685,8 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                     ),
                 }
             }
-            for (call_id, tool) in tools {
-                match governance.open_activity(sandbox_id, &tool).await {
-                    Ok(_) => {
-                        mark_tool(store.as_ref(), sandbox_id, &call_id, "opened").await;
-                        eprintln!(
-                            "openbox: tool opened sandbox_id={sandbox_id} activity_id={} tool={}",
-                            tool.id, tool.kind
-                        );
-                    }
-                    Err(error) => {
-                        eprintln!("openbox: tool activity {} not opened: {error}", tool.id);
-                    }
-                }
-            }
+            open_tools(governance.as_ref(), store.as_ref(), sandbox_id, tools).await;
+            clear_pending(store.as_ref(), sandbox_id, &completion.request_id).await;
         });
     }
 
@@ -1022,6 +1024,52 @@ fn tool_activity(call: &agent::ToolCall, limit: usize) -> Activity {
 
 /// Moves a tracked tool from `open` to `opened` once Core has its start,
 /// unless it closed meanwhile.
+/// Opens in Core the tools a model's reply asked for.
+async fn open_tools<G: Governance>(
+    governance: &G,
+    store: &dyn SharedStore,
+    sandbox_id: &str,
+    tools: Vec<(String, Activity)>,
+) {
+    for (call_id, tool) in tools {
+        match governance.open_activity(sandbox_id, &tool).await {
+            Ok(_) => {
+                mark_tool(store, sandbox_id, &call_id, "opened").await;
+                eprintln!(
+                    "openbox: tool opened sandbox_id={sandbox_id} activity_id={} tool={}",
+                    tool.id, tool.kind
+                );
+            }
+            Err(error) => {
+                eprintln!("openbox: tool activity {} not opened: {error}", tool.id);
+            }
+        }
+    }
+}
+
+/// Records a request whose completion is still to be sent. Best effort: when
+/// it is lost, the front desk does not wait for that request.
+async fn mark_pending(store: &dyn SharedStore, sandbox_id: &str, request_id: &str) {
+    if let Err(error) = store
+        .add_member(&pending_key(sandbox_id), request_id, REQUEST_TTL)
+        .await
+    {
+        eprintln!(
+            "openbox: request_id={request_id} not marked pending, the session may end before it: {error}"
+        );
+    }
+}
+
+/// The request's completion has been sent, or given up on.
+async fn clear_pending(store: &dyn SharedStore, sandbox_id: &str, request_id: &str) {
+    if let Err(error) = store
+        .remove_member(&pending_key(sandbox_id), request_id)
+        .await
+    {
+        eprintln!("openbox: request_id={request_id} still marked pending: {error}");
+    }
+}
+
 async fn mark_tool(store: &dyn SharedStore, sandbox_id: &str, call_id: &str, state: &str) {
     let key = tool_key(sandbox_id, call_id);
     let Ok(Some(text)) = store.get(&key).await else {
@@ -1397,6 +1445,15 @@ pub(crate) mod tests {
         async fn delete(&self, _: &str) -> Result<(), String> {
             Err("down".to_owned())
         }
+        async fn add_member(&self, _: &str, _: &str, _: Duration) -> Result<(), String> {
+            Err("down".to_owned())
+        }
+        async fn remove_member(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("down".to_owned())
+        }
+        async fn count_members(&self, _: &str) -> Result<u64, String> {
+            Err("down".to_owned())
+        }
     }
 
     #[derive(Default)]
@@ -1633,6 +1690,39 @@ pub(crate) mod tests {
         let (_, failed) = closed.iter().find(|(a, _)| a.id == "oshx-req-9").unwrap();
         assert_eq!(failed.error.as_ref().unwrap()["message"], "HTTP 503");
         assert_eq!(failed.duration_ms, None);
+    }
+
+    #[tokio::test]
+    async fn a_request_is_pending_until_its_completion_is_sent() {
+        let core = Arc::new(slow_core(Duration::from_millis(50), &[Verdict::Allow]));
+        let store: Arc<dyn SharedStore> = Arc::new(MemoryStore::default());
+        let guard = Guard::with_store(
+            Arc::clone(&core),
+            Arc::new(FakeStopper::default()),
+            Arc::clone(&store),
+            DEFAULT_APPROVAL_TTL,
+        );
+        guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        let key = pending_key("sbx-id-1");
+        let pending = || store.count_members(&key);
+        assert_eq!(pending().await.unwrap(), 1);
+        guard
+            .complete(ResponseSeen {
+                sandbox_id: "sbx-id-1".to_owned(),
+                request_id: "req-1".to_owned(),
+                method: "POST".to_owned(),
+                url: "https://mcp.example.com/mcp".to_owned(),
+                host: "mcp.example.com".to_owned(),
+                status_code: 200,
+                headers: Vec::new(),
+                body: None,
+            })
+            .await;
+        // The completion is still going out in the background.
+        assert_eq!(pending().await.unwrap(), 1);
+        settle(&core, 1).await;
+        assert!(guard.drain(Duration::from_secs(1)).await);
+        assert_eq!(pending().await.unwrap(), 0);
     }
 
     /// Waits for the background Core calls to record `closed` activities.
