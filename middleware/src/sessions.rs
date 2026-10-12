@@ -20,6 +20,10 @@
 //! guard has sent every completion it still owes ([`pending_key`]); otherwise
 //! Core hears the session end first and the last activity stays open.
 //!
+//! On shutdown ([`SessionLifecycle::shutdown`]) that wait is cut to a short
+//! grace and every session still ending is ended before the process exits,
+//! so a sandbox deleted just before a restart still gets its end.
+//!
 //! A tool the model asked for that never got its result back (the sandbox
 //! went away mid-tool) is closed before the session, so no activity is left
 //! open.
@@ -27,8 +31,10 @@
 //! Like the inventory, this runs in `post_commit` and is best effort. Core
 //! calls run in the background so a slow Core never holds up the gateway.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::{Notify, watch};
 
 use serde_json::{Value, json};
 
@@ -41,6 +47,9 @@ use crate::store::{SharedStore, open_tools_key, pending_key, session_key, tool_k
 /// one slow Core call. The wait is in the background; nothing is held for it.
 const PENDING_WAIT: Duration = Duration::from_secs(30);
 const PENDING_POLL: Duration = Duration::from_millis(250);
+/// Once shutting down, how much longer a session waits for the door guard,
+/// which is draining its own queue at the same time.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// The two Core calls a sandbox's lifecycle needs.
 #[tonic::async_trait]
@@ -113,8 +122,30 @@ pub struct SessionLifecycle {
     store: Arc<dyn SharedStore>,
     gateway: Option<String>,
     pending_wait: Duration,
+    ending: Arc<Ending>,
 }
 
+/// The sessions being ended in the background, so shutdown can finish them.
+struct Ending {
+    count: Mutex<usize>,
+    idle: Notify,
+    /// Set on shutdown: the latest a session waits for the door guard.
+    cutoff: watch::Sender<Option<Instant>>,
+}
+
+impl Ending {
+    fn begin(&self) {
+        *self.count.lock().expect("ending lock") += 1;
+    }
+
+    fn end(&self) {
+        let mut count = self.count.lock().expect("ending lock");
+        *count -= 1;
+        if *count == 0 {
+            self.idle.notify_waiters();
+        }
+    }
+}
 impl SessionLifecycle {
     pub fn new(
         inventory: Arc<dyn Inventory>,
@@ -128,7 +159,32 @@ impl SessionLifecycle {
             store,
             gateway,
             pending_wait: PENDING_WAIT,
+            ending: Arc::new(Ending {
+                count: Mutex::new(0),
+                idle: Notify::new(),
+                cutoff: watch::Sender::new(None),
+            }),
         }
+    }
+
+    /// Ends every session still waiting for the door guard, giving it
+    /// [`SHUTDOWN_GRACE`] more (at most half of `limit`), and returns once they are all sent or
+    /// `limit` passes. Returns whether they all went out.
+    pub async fn shutdown(&self, limit: Duration) -> bool {
+        self.ending
+            .cutoff
+            .send_replace(Some(Instant::now() + SHUTDOWN_GRACE.min(limit / 2)));
+        tokio::time::timeout(limit, async {
+            loop {
+                let idle = self.ending.idle.notified();
+                if *self.ending.count.lock().expect("ending lock") == 0 {
+                    return;
+                }
+                idle.await;
+            }
+        })
+        .await
+        .is_ok()
     }
 
     /// Replaces [`PENDING_WAIT`].
@@ -140,10 +196,18 @@ impl SessionLifecycle {
 }
 
 /// Waits until the door guard has sent every completion it owes the sandbox,
-/// or `limit` passes. Returns how many it gave up on.
-async fn await_pending(store: &dyn SharedStore, sandbox_id: &str, limit: Duration) -> u64 {
+/// or `limit` passes, or the shutdown cutoff. Returns how many it gave up on.
+async fn await_pending(
+    store: &dyn SharedStore,
+    sandbox_id: &str,
+    limit: Duration,
+    mut cutoff: watch::Receiver<Option<Instant>>,
+) -> u64 {
     let deadline = Instant::now() + limit;
     loop {
+        let deadline = cutoff
+            .borrow()
+            .map_or(deadline, |cutoff| cutoff.min(deadline));
         let pending = match store.count_members(&pending_key(sandbox_id)).await {
             Ok(pending) => pending,
             Err(error) => {
@@ -156,7 +220,10 @@ async fn await_pending(store: &dyn SharedStore, sandbox_id: &str, limit: Duratio
         if pending == 0 || Instant::now() >= deadline {
             return pending;
         }
-        tokio::time::sleep(PENDING_POLL).await;
+        tokio::select! {
+            () = tokio::time::sleep(PENDING_POLL) => {}
+            _ = cutoff.changed() => {}
+        }
     }
 }
 
@@ -250,8 +317,11 @@ impl Inventory for SessionLifecycle {
                     let core = Arc::clone(&self.core);
                     let store = Arc::clone(&self.store);
                     let wait = self.pending_wait;
+                    let ending = Arc::clone(&self.ending);
+                    let cutoff = ending.cutoff.subscribe();
+                    ending.begin();
                     tokio::spawn(async move {
-                        let left = await_pending(store.as_ref(), &id, wait).await;
+                        let left = await_pending(store.as_ref(), &id, wait, cutoff).await;
                         if left > 0 {
                             eprintln!(
                                 "openbox: ending session sandbox_id={id} with {left} completion(s) not sent after {} s",
@@ -274,6 +344,7 @@ impl Inventory for SessionLifecycle {
                                 eprintln!("openbox: session end failed sandbox_id={id}: {error}");
                             }
                         }
+                        ending.end();
                     });
                 }
             }
@@ -295,7 +366,6 @@ fn text(value: &Value, pointer: &str) -> String {
 mod tests {
     use super::*;
     use crate::store::MemoryStore;
-    use std::sync::Mutex;
     use tokio::sync::mpsc;
 
     struct FakeCore {
@@ -481,6 +551,39 @@ mod tests {
             next(&mut received).await.as_deref(),
             Some("end sbx-1 timed=false")
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_a_session_still_waiting_for_the_door_guard() {
+        let (calls, mut received) = mpsc::unbounded_channel();
+        let store: Arc<dyn SharedStore> = Arc::new(MemoryStore::default());
+        store
+            .add_member(&pending_key("sbx-1"), "req-1", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let sessions = SessionLifecycle::new(
+            Arc::new(FakeInventory::default()),
+            Arc::new(FakeCore { calls, fail: false }),
+            store,
+            None,
+        );
+        sessions
+            .record(InventoryEvent::Deleted {
+                response: json!({"sandboxId": "sbx-1"}),
+            })
+            .await
+            .unwrap();
+        // The default wait is 30 s; shutdown cuts it to the grace, here half
+        // the 300 ms limit, and still sends the end.
+        let started = Instant::now();
+        assert!(sessions.shutdown(Duration::from_millis(300)).await);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            next(&mut received).await.as_deref(),
+            Some("end sbx-1 timed=false")
+        );
+        // Nothing left to end: returns at once.
+        assert!(sessions.shutdown(Duration::from_millis(1)).await);
     }
 
     #[derive(Default)]
