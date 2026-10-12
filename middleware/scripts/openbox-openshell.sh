@@ -391,15 +391,45 @@ EOF
 # something new.
 demo_agent() {
   cat <<'EOF'
+# Reads a response on fd 3 the way an HTTP client does: the status, the
+# headers, then the body by Content-Length or by chunks, or to the end of a
+# stream that has neither. OpenShell keeps the sandbox's connection open
+# after a response, so waiting for it to close would hang.
+response() {
+  IFS=" " read -r _ code _ <&3
+  len= chunked=
+  while IFS= read -r line <&3; do
+    line=${line%$'\r'}
+    [ -z "$line" ] && break
+    case ${line,,} in
+      content-length:*) len=${line#*:}; len=${len// /} ;;
+      transfer-encoding:*chunked*) chunked=1 ;;
+    esac
+  done
+  if [ -n "$chunked" ]; then
+    len=0
+    while IFS= read -r size <&3; do
+      size=${size%$'\r'}; size=$((16#${size%%;*}))
+      [ "$size" -eq 0 ] && break
+      LC_ALL=C read -r -N "$size" _ <&3; IFS= read -r _ <&3
+      len=$((len + size))
+    done
+  elif [ -n "$len" ]; then
+    [ "$len" -gt 0 ] && LC_ALL=C read -r -N "$len" _ <&3
+  else
+    cat <&3 >/dev/null
+  fi
+  exec 3>&-
+}
 post() {
   exec 3<>/dev/tcp/host.openshell.internal/MODEL_PORT
   printf "POST /v1/messages HTTP/1.1\r\nHost: host.openshell.internal:MODEL_PORT\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s" "${#1}" "$1" >&3
-  IFS=" " read -r _ code _ <&3; cat <&3 >/dev/null; exec 3>&-; echo "model call: HTTP $code"
+  response; echo "model call: HTTP $code"
 }
 get() {
   exec 3<>/dev/tcp/example.com/80
   printf "GET %s HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n" "$1" >&3
-  IFS=" " read -r _ code _ <&3; cat <&3 >/dev/null; exec 3>&-; echo "fetch $1: HTTP $code"
+  response; echo "fetch $1: HTTP $code (${len:-?} bytes)"
 }
 post '{"model":"claude-demo","stream":true,"messages":[{"role":"user","content":"summarise the example.com homepage"}]}'
 get /
