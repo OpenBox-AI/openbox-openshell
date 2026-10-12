@@ -392,12 +392,10 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 Err(result) => return result,
             }
         }
-        let span = started_span(
-            action,
-            &activity.id,
-            self.governance.body_limit(),
-            SystemTime::now(),
-        );
+        // The span and the activity's duration start here, before Core is
+        // asked, so both include the time spent waiting for the verdict.
+        let started = SystemTime::now();
+        let span = started_span(action, &activity.id, self.governance.body_limit(), started);
         let decision = match self
             .timed(
                 CoreCall::Evaluate,
@@ -432,7 +430,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 "closes": closes,
                 "api": model.as_ref().map(|model| model.api.name()),
                 "span": span,
-                "started_ms": unix_millis(),
+                "started_ms": millis(started),
             });
             if let Err(error) = self
                 .store
@@ -1121,11 +1119,13 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
+    millis(SystemTime::now())
+}
+
+fn millis(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+    })
 }
 
 fn allow(decision: &CoreDecision, label: &str) -> HttpRequestResult {
@@ -1633,6 +1633,30 @@ pub(crate) mod tests {
         let (_, failed) = closed.iter().find(|(a, _)| a.id == "oshx-req-9").unwrap();
         assert_eq!(failed.error.as_ref().unwrap()["message"], "HTTP 503");
         assert_eq!(failed.duration_ms, None);
+    }
+
+    #[tokio::test]
+    async fn a_requests_duration_includes_the_wait_for_its_verdict() {
+        let (guard, core, _) = guard(slow_core(Duration::from_millis(300), &[Verdict::Allow]));
+        guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        guard
+            .complete(ResponseSeen {
+                sandbox_id: "sbx-id-1".to_owned(),
+                request_id: "req-1".to_owned(),
+                method: "POST".to_owned(),
+                url: "https://mcp.example.com/mcp".to_owned(),
+                host: "mcp.example.com".to_owned(),
+                status_code: 200,
+                headers: Vec::new(),
+                body: None,
+            })
+            .await;
+        settle(&core, 1).await;
+        let closed = core.closed.lock().unwrap();
+        let (_, outcome) = closed.iter().find(|(a, _)| a.id == "oshx-req-1").unwrap();
+        // Core took 300 ms to decide; the activity ran at least that long,
+        // as its span says.
+        assert!(outcome.duration_ms.unwrap() >= 300, "{outcome:?}");
     }
 
     /// Waits for the background Core calls to record `closed` activities.
