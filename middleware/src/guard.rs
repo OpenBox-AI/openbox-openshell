@@ -107,6 +107,8 @@ pub const REASON_HALTED: &str = "openbox_halted";
 pub const REASON_UNAVAILABLE: &str = "openbox_unavailable";
 
 const MAX_REASON_BYTES: usize = 4 * 1024;
+/// How much of a deny reason the `openbox: eval` log line keeps.
+const MAX_LOGGED_REASON_BYTES: usize = 512;
 
 /// Time allowed for all Core calls behind one verdict: 1 s under the 30 s
 /// middleware timeout the gateway registration uses.
@@ -321,9 +323,9 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         Arc::clone(&self.metrics)
     }
 
-    /// Evaluates one request and records its result. The log line and the
-    /// `openbox.verdict` span carry identifiers and the outcome only, never
-    /// request content.
+    /// Evaluates one request and records its result. The `openbox.verdict`
+    /// span carries identifiers and the outcome only, never request content;
+    /// see [`eval_line`] for what the log line carries.
     pub async fn evaluate(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
         let started = std::time::Instant::now();
         let span = telemetry::start(
@@ -354,18 +356,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         span.span().end();
         self.metrics
             .record_result(allowed, &result.reason_code, elapsed);
-        eprintln!(
-            "openbox: eval request_id={} sandbox_id={} decision={} reason_code={} ms={}",
-            action.request_id,
-            action.sandbox_id,
-            if allowed { "allow" } else { "deny" },
-            if result.reason_code.is_empty() {
-                "-"
-            } else {
-                &result.reason_code
-            },
-            elapsed.as_millis()
-        );
+        eprintln!("{}", eval_line(action, &result, elapsed));
         result
     }
 
@@ -1312,6 +1303,32 @@ fn deny(reason_code: &str, reason: &str, decision: Option<&CoreDecision>) -> Htt
         metadata: metadata(decision),
         ..HttpRequestResult::default()
     }
+}
+
+/// The `openbox: eval` log line: identifiers and the outcome, never request
+/// content. A deny ends with the reason text the sandbox was given, so an
+/// operator can tell its causes apart (the gateway logs only the code). The
+/// text is quoted with escapes, so a newline or quote in a reason from Core
+/// cannot split or forge a log line, and capped at [`MAX_LOGGED_REASON_BYTES`].
+fn eval_line(action: &Action, result: &HttpRequestResult, elapsed: Duration) -> String {
+    let allowed = result.decision == Decision::Allow as i32;
+    let line = format!(
+        "openbox: eval request_id={} sandbox_id={} decision={} reason_code={} ms={}",
+        action.request_id,
+        action.sandbox_id,
+        if allowed { "allow" } else { "deny" },
+        if result.reason_code.is_empty() {
+            "-"
+        } else {
+            &result.reason_code
+        },
+        elapsed.as_millis()
+    );
+    if allowed || result.reason.is_empty() {
+        return line;
+    }
+    let reason = truncate(&result.reason, MAX_LOGGED_REASON_BYTES);
+    format!("{line} reason={reason:?}")
 }
 
 fn finding(label: &str, severity: &str) -> Finding {
@@ -2562,5 +2579,52 @@ pub(crate) mod tests {
         let result = deny(REASON_BLOCKED, &long, None);
         assert!(result.reason.len() <= MAX_REASON_BYTES);
         assert!(result.reason.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn a_deny_is_logged_with_its_reason() {
+        let result = deny(
+            REASON_UNAVAILABLE,
+            "OpenBox did not return a verdict within 29000 ms",
+            None,
+        );
+        let line = eval_line(&action(), &result, Duration::from_millis(29_001));
+        assert!(
+            line.ends_with(
+                " reason_code=openbox_unavailable ms=29001 \
+                 reason=\"OpenBox did not return a verdict within 29000 ms\""
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_allow_is_logged_without_a_reason() {
+        let result = HttpRequestResult {
+            decision: Decision::Allow as i32,
+            ..HttpRequestResult::default()
+        };
+        let line = eval_line(&action(), &result, Duration::from_millis(7));
+        assert!(
+            line.ends_with(" decision=allow reason_code=- ms=7"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_logged_reason_cannot_split_or_forge_the_line() {
+        let forged = "no\nopenbox: eval request_id=x decision=allow reason=\"ok\"";
+        let result = deny(
+            REASON_BLOCKED,
+            &(forged.to_owned() + &"x".repeat(4096)),
+            None,
+        );
+        let line = eval_line(&action(), &result, Duration::ZERO);
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            line.contains(r#"reason="no\nopenbox: eval request_id=x decision=allow reason=\"ok\""#),
+            "{line}"
+        );
+        assert!(line.len() < 1024, "{}", line.len());
     }
 }

@@ -13,7 +13,8 @@
 #
 #   A  Core takes 8.7 s per call (26 s per verdict): the request goes through
 #   B  Core takes 10 s per call (30 s): explicit deny openbox_unavailable at
-#      29 s, before the gateway's 30 s, so the sandbox sees OpenBox's reason
+#      29 s, before the gateway's 30 s, so the sandbox sees OpenBox's reason,
+#      and the door guard's log line carries it too (PROD-901)
 #   C  the old 450 ms door guard default with the same 9 s Core: denied at
 #      once. This is what the change fixes
 #   D  (informational, needs internet) a 25.5 s allow to example.com
@@ -268,15 +269,16 @@ fi
 start_stack 10
 request
 if [ "$CODE" = 403 ] && [ "$SECS" -ge 28 ] && [ "$SECS" -le 31 ] &&
-  last_eval | grep -q 'reason_code=openbox_unavailable'; then
-  pass "B Core 10 s per call (30 s verdict): explicit openbox_unavailable deny after ${SECS}s"
+  last_eval | grep -q 'reason_code=openbox_unavailable .* reason="OpenBox did not return a verdict within 29000 ms"'; then
+  pass "B Core 10 s per call (30 s verdict): explicit openbox_unavailable deny after ${SECS}s, reason logged"
 else
   fail "B Core 10 s per call: expected 403 openbox_unavailable at ~29 s, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
 fi
 
 start_stack 9 450
 request
-if [ "$CODE" = 403 ] && [ "$SECS" -le 5 ] && last_eval | grep -q 'reason_code=openbox_unavailable'; then
+if [ "$CODE" = 403 ] && [ "$SECS" -le 5 ] &&
+  last_eval | grep -q 'reason_code=openbox_unavailable .* reason="core unreachable or timed out"'; then
   pass "C old 450 ms budget, Core 9 s: denied after ${SECS}s (every real verdict would be)"
 else
   fail "C old 450 ms budget: expected a quick 403 openbox_unavailable, got '$CODE' after ${SECS}s [$(raw)]: $(last_eval)"
