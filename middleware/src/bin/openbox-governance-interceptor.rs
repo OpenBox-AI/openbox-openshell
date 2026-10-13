@@ -53,6 +53,9 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 const DEFAULT_AUDIENCE: &str = "urn:openshell:extension:interceptor:openbox";
 const DEFAULT_INVENTORY_AUDIENCE: &str = "urn:openshell:extension:interceptor:openbox-inventory";
+/// Most the front desk waits, on shutdown, to end sessions of sandboxes
+/// deleted just before. Under Kubernetes' default 30 s grace period.
+const SESSION_DRAIN_LIMIT: Duration = Duration::from_secs(20);
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key)
@@ -241,23 +244,26 @@ async fn run() -> Result<(), String> {
     )?;
     let core = core_from_env()?;
     let mut inventory_sink = inventory_from_env(env("OPENBOX_FD_GATEWAY_ID"), core.clone())?;
-    if let Some(core) = core {
+    let sessions = if let Some(core) = core {
         let store: Arc<dyn SharedStore> = if let Some(url) = env("OPENBOX_REDIS_URL") {
             Arc::new(RedisStore::from_url(&url, Duration::from_millis(500))?)
         } else {
             Arc::new(MemoryStore::default())
         };
-        inventory_sink = Arc::new(SessionLifecycle::new(
+        let lifecycle = Arc::new(SessionLifecycle::new(
             inventory_sink,
             core,
             store,
             env("OPENBOX_FD_GATEWAY_ID"),
         ));
+        inventory_sink = lifecycle.clone();
+        Some(lifecycle)
     } else {
         eprintln!(
             "openbox-governance-interceptor: no OPENBOX_URL; sandbox sessions are not opened or closed"
         );
-    }
+        None
+    };
     let (stop, stopped) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         let mut terminate =
@@ -286,6 +292,15 @@ async fn run() -> Result<(), String> {
             inventory_sink,
             stopped
         ),
-    )
-    .map(|_| ())
+    )?;
+    // A sandbox deleted just before shutdown still gets its session end.
+    if let Some(sessions) = sessions
+        && !sessions.shutdown(SESSION_DRAIN_LIMIT).await
+    {
+        eprintln!(
+            "openbox-governance-interceptor: sessions still ending after {} s were dropped",
+            SESSION_DRAIN_LIMIT.as_secs()
+        );
+    }
+    Ok(())
 }
