@@ -60,6 +60,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openshell_core::proto::{Decision, Finding, HttpRequestResult};
+use opentelemetry::trace::{FutureExt as _, SpanKind, Status, TraceContextExt as _};
+use opentelemetry::{Context, KeyValue};
 use serde_json::{Value, json};
 
 use sha2::Digest as _;
@@ -78,6 +80,7 @@ use crate::store::{
     MemoryStore, SharedStore, approval_key, open_tools_key, pending_key, prompt_key, request_key,
     tool_key,
 };
+use crate::telemetry;
 
 /// How long an approval can be matched by its retry when Core sends no
 /// expiry with the verdict, unless configured.
@@ -318,13 +321,37 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         Arc::clone(&self.metrics)
     }
 
-    /// Evaluates one request and records its result. The log line carries
-    /// identifiers and the outcome only, never request content.
+    /// Evaluates one request and records its result. The log line and the
+    /// `openbox.verdict` span carry identifiers and the outcome only, never
+    /// request content.
     pub async fn evaluate(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
         let started = std::time::Instant::now();
-        let result = self.decide(action, mode).await;
+        let span = telemetry::start(
+            &Context::current(),
+            "openbox.verdict",
+            SpanKind::Server,
+            vec![
+                telemetry::sandbox(&action.sandbox_id),
+                telemetry::request(&action.request_id),
+            ],
+        );
+        let result = self.decide(action, mode).with_context(span.clone()).await;
         let elapsed = started.elapsed();
         let allowed = result.decision == Decision::Allow as i32;
+        span.span().set_attribute(KeyValue::new(
+            telemetry::DECISION,
+            if allowed { "allow" } else { "deny" },
+        ));
+        if !result.reason_code.is_empty() {
+            span.span().set_attribute(KeyValue::new(
+                telemetry::REASON_CODE,
+                result.reason_code.clone(),
+            ));
+        }
+        if result.reason_code == REASON_UNAVAILABLE {
+            span.span().set_status(Status::error(REASON_UNAVAILABLE));
+        }
+        span.span().end();
         self.metrics
             .record_result(allowed, &result.reason_code, elapsed);
         eprintln!(
@@ -348,7 +375,13 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         future: impl Future<Output = Result<T, CoreError>>,
     ) -> Result<T, CoreError> {
         let started = std::time::Instant::now();
-        let outcome = future.await;
+        let name = match call {
+            CoreCall::Session => "openbox.core.session_start",
+            CoreCall::Signal => "openbox.core.prompt_signal",
+            CoreCall::Evaluate => "openbox.core.evaluate",
+            CoreCall::Approval => "openbox.core.approval_check",
+        };
+        let outcome = telemetry::call(name, Vec::new(), future).await;
         self.metrics
             .record_core(call, outcome.is_ok(), started.elapsed());
         outcome
@@ -495,18 +528,27 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         let sandbox_id = action.sandbox_id.clone();
         let request_id = action.request_id.clone();
         mark_pending(store.as_ref(), &sandbox_id, &request_id).await;
-        self.sequence.push(&action.sandbox_id, async move {
-            if let Err(error) = governance
-                .close_activity(&sandbox_id, &activity, &outcome)
+        let queue = sandbox_id.clone();
+        let job = telemetry::job(
+            "openbox.close_refused",
+            vec![telemetry::sandbox(&sandbox_id)],
+            async move {
+                if let Err(error) = telemetry::call(
+                    "openbox.core.close_activity",
+                    Vec::new(),
+                    governance.close_activity(&sandbox_id, &activity, &outcome),
+                )
                 .await
-            {
-                eprintln!(
-                    "openbox: refused activity {} not closed: {error}",
-                    activity.id
-                );
-            }
-            clear_pending(store.as_ref(), &sandbox_id, &request_id).await;
-        });
+                {
+                    eprintln!(
+                        "openbox: refused activity {} not closed: {error}",
+                        activity.id
+                    );
+                }
+                clear_pending(store.as_ref(), &sandbox_id, &request_id).await;
+            },
+        );
+        self.sequence.push(&queue, job);
     }
 
     /// The activity Core holds an approval on for this exact action, once a
@@ -667,35 +709,85 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             self.track_tool(&response.sandbox_id, &call.id, &tool).await;
             tools.push((call.id.clone(), tool));
         }
-        let governance = Arc::clone(&self.governance);
-        let store = Arc::clone(&self.store);
+        let attributes = vec![
+            telemetry::sandbox(&completion.sandbox_id),
+            telemetry::request(&completion.request_id),
+        ];
         let queue = completion.sandbox_id.clone();
-        self.sequence.push(&queue, async move {
-            let sandbox_id = &completion.sandbox_id;
-            if let Err(error) = governance.complete_request(&completion).await {
-                eprintln!(
-                    "openbox: completed span for request_id={} not recorded: {error}",
-                    completion.request_id
-                );
+        let job = Self::send_completion(
+            Arc::clone(&self.governance),
+            Arc::clone(&self.store),
+            completion,
+            closes.then_some(outcome),
+            tools,
+        );
+        self.sequence.push(
+            &queue,
+            telemetry::job("openbox.completion", attributes, job),
+        );
+    }
+
+    /// Tells Core a request completed: its span, the end of its activity
+    /// when the response closes it, and the tools its reply opened.
+    async fn send_completion(
+        governance: Arc<G>,
+        store: Arc<dyn SharedStore>,
+        completion: Completion,
+        close: Option<Outcome>,
+        tools: Vec<(String, Activity)>,
+    ) {
+        let sandbox_id = &completion.sandbox_id;
+        if let Err(error) = telemetry::call(
+            "openbox.core.complete_request",
+            Vec::new(),
+            governance.complete_request(&completion),
+        )
+        .await
+        {
+            eprintln!(
+                "openbox: completed span for request_id={} not recorded: {error}",
+                completion.request_id
+            );
+        }
+        if let Some(outcome) = close {
+            match telemetry::call(
+                "openbox.core.close_activity",
+                Vec::new(),
+                governance.close_activity(sandbox_id, &completion.activity, &outcome),
+            )
+            .await
+            {
+                Ok(_) => eprintln!(
+                    "openbox: completed request_id={} activity_id={} status={}",
+                    completion.request_id, completion.activity.id, completion.status_code
+                ),
+                Err(error) => eprintln!(
+                    "openbox: activity {} for request_id={} not closed: {error}",
+                    completion.activity.id, completion.request_id
+                ),
             }
-            if closes {
-                match governance
-                    .close_activity(sandbox_id, &completion.activity, &outcome)
-                    .await
-                {
-                    Ok(_) => eprintln!(
-                        "openbox: completed request_id={} activity_id={} status={}",
-                        completion.request_id, completion.activity.id, completion.status_code
-                    ),
-                    Err(error) => eprintln!(
-                        "openbox: activity {} for request_id={} not closed: {error}",
-                        completion.activity.id, completion.request_id
-                    ),
+        }
+        for (call_id, tool) in tools {
+            match telemetry::call(
+                "openbox.core.open_activity",
+                Vec::new(),
+                governance.open_activity(sandbox_id, &tool),
+            )
+            .await
+            {
+                Ok(_) => {
+                    mark_tool(store.as_ref(), sandbox_id, &call_id, "opened").await;
+                    eprintln!(
+                        "openbox: tool opened sandbox_id={sandbox_id} activity_id={} tool={}",
+                        tool.id, tool.kind
+                    );
+                }
+                Err(error) => {
+                    eprintln!("openbox: tool activity {} not opened: {error}", tool.id);
                 }
             }
-            open_tools(governance.as_ref(), store.as_ref(), sandbox_id, tools).await;
-            clear_pending(store.as_ref(), sandbox_id, &completion.request_id).await;
-        });
+        }
+        clear_pending(store.as_ref(), sandbox_id, &completion.request_id).await;
     }
 
     /// Where a request belongs: a model call is its own `llm_call` activity,
@@ -888,13 +980,22 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             )
             .await;
         for (call_id, tool, opened, outcome) in closing {
-            if !opened && let Err(error) = self.governance.open_activity(sandbox_id, &tool).await {
+            if !opened
+                && let Err(error) = telemetry::call(
+                    "openbox.core.open_activity",
+                    Vec::new(),
+                    self.governance.open_activity(sandbox_id, &tool),
+                )
+                .await
+            {
                 eprintln!("openbox: tool activity {} not opened: {error}", tool.id);
             }
-            match self
-                .governance
-                .close_activity(sandbox_id, &tool, &outcome)
-                .await
+            match telemetry::call(
+                "openbox.core.close_activity",
+                Vec::new(),
+                self.governance.close_activity(sandbox_id, &tool, &outcome),
+            )
+            .await
             {
                 Ok(_) => eprintln!(
                     "openbox: tool closed sandbox_id={sandbox_id} activity_id={} tool={} call_id={call_id}",
@@ -1041,31 +1142,6 @@ fn tool_activity(call: &agent::ToolCall, limit: usize, profile: Option<String>) 
     }
 }
 
-/// Moves a tracked tool from `open` to `opened` once Core has its start,
-/// unless it closed meanwhile.
-/// Opens in Core the tools a model's reply asked for.
-async fn open_tools<G: Governance>(
-    governance: &G,
-    store: &dyn SharedStore,
-    sandbox_id: &str,
-    tools: Vec<(String, Activity)>,
-) {
-    for (call_id, tool) in tools {
-        match governance.open_activity(sandbox_id, &tool).await {
-            Ok(_) => {
-                mark_tool(store, sandbox_id, &call_id, "opened").await;
-                eprintln!(
-                    "openbox: tool opened sandbox_id={sandbox_id} activity_id={} tool={}",
-                    tool.id, tool.kind
-                );
-            }
-            Err(error) => {
-                eprintln!("openbox: tool activity {} not opened: {error}", tool.id);
-            }
-        }
-    }
-}
-
 /// Records a request whose completion is still to be sent. Best effort: when
 /// it is lost, the front desk does not wait for that request.
 async fn mark_pending(store: &dyn SharedStore, sandbox_id: &str, request_id: &str) {
@@ -1089,6 +1165,8 @@ async fn clear_pending(store: &dyn SharedStore, sandbox_id: &str, request_id: &s
     }
 }
 
+/// Moves a tracked tool from `open` to `opened` once Core has its start,
+/// unless it closed meanwhile.
 async fn mark_tool(store: &dyn SharedStore, sandbox_id: &str, call_id: &str, state: &str) {
     let key = tool_key(sandbox_id, call_id);
     let Ok(Some(text)) = store.get(&key).await else {
@@ -1554,6 +1632,66 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_verdict_is_a_span_with_its_queue_wait_and_core_calls_under_it() {
+        use opentelemetry::Value as Attribute;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        let exporter = InMemorySpanExporter::default();
+        opentelemetry::global::set_tracer_provider(
+            SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build(),
+        );
+        let (guard, ..) = guard(FakeCore::with_verdicts(&[Verdict::Block]));
+        let result = guard
+            .evaluate(&request("traced-request"), ApprovalMode::Queue)
+            .await;
+        assert_eq!(result.reason_code, REASON_BLOCKED);
+        let spans = exporter.get_finished_spans().unwrap();
+        let attribute = |span: &opentelemetry_sdk::trace::SpanData, key: &str| {
+            span.attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == key)
+                .map(|attribute| attribute.value.clone())
+        };
+        let verdict = spans
+            .iter()
+            .find(|span| {
+                span.name == "openbox.verdict"
+                    && attribute(span, telemetry::REQUEST_ID)
+                        == Some(Attribute::from("traced-request"))
+            })
+            .expect("a verdict span");
+        assert_eq!(
+            attribute(verdict, telemetry::DECISION),
+            Some(Attribute::from("deny"))
+        );
+        assert_eq!(
+            attribute(verdict, telemetry::REASON_CODE),
+            Some(Attribute::from(REASON_BLOCKED))
+        );
+        assert!(attribute(verdict, telemetry::SANDBOX_ID).is_some());
+        let children: Vec<&str> = spans
+            .iter()
+            .filter(|span| span.parent_span_id == verdict.span_context.span_id())
+            .map(|span| span.name.as_ref())
+            .collect();
+        assert_eq!(
+            children,
+            [
+                "openbox.queue_wait",
+                "openbox.core.session_start",
+                "openbox.core.evaluate"
+            ]
+        );
+        // No attribute carries the request: only identifiers and the outcome.
+        for span in &spans {
+            for attribute in &span.attributes {
+                assert!(!attribute.value.as_str().contains("amount"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn allow_and_constrain_let_the_request_through() {
         let (guard, core, _) = guard(FakeCore::with_verdicts(&[
             Verdict::Allow,
@@ -1691,6 +1829,15 @@ pub(crate) mod tests {
         }
         async fn delete(&self, key: &str) -> Result<(), String> {
             self.inner.delete(key).await
+        }
+        async fn add_member(&self, key: &str, member: &str, ttl: Duration) -> Result<(), String> {
+            self.inner.add_member(key, member, ttl).await
+        }
+        async fn remove_member(&self, key: &str, member: &str) -> Result<(), String> {
+            self.inner.remove_member(key, member).await
+        }
+        async fn count_members(&self, key: &str) -> Result<u64, String> {
+            self.inner.count_members(key).await
         }
     }
 

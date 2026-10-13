@@ -26,6 +26,8 @@ use openshell_core::proto::gateway_interceptor::v1::{
     InterceptorManifest, InterceptorResult, InterceptorSelector, JsonPatch,
     ProviderProfileSnapshot, ProviderProfileSnapshotRequest, interceptor_evaluation,
 };
+use opentelemetry::trace::{FutureExt as _, SpanKind, TraceContextExt as _};
+use opentelemetry::{Context, KeyValue};
 use prost_types::value::Kind;
 use prost_types::{ListValue, Struct};
 use serde_json::Value;
@@ -33,6 +35,7 @@ use tonic::{Request, Response, Status};
 
 use crate::core_client::unix_now;
 use crate::front_desk::{self, Refusal};
+use crate::telemetry;
 use crate::token::{Caller, TokenVerifier};
 
 pub const MANIFEST_NAME: &str = "openbox/governance-interceptor";
@@ -262,6 +265,8 @@ impl<I: Inventory + ?Sized> GatewayInterceptor for FrontDesk<I> {
         ))
     }
 
+    /// Each call is an `openbox.intercept` span: the RPC, the phase and the
+    /// outcome, never the operation itself.
     async fn evaluate(
         &self,
         request: Request<InterceptorEvaluation>,
@@ -271,7 +276,47 @@ impl<I: Inventory + ?Sized> GatewayInterceptor for FrontDesk<I> {
         if evaluation.service != SERVICE {
             return Ok(Response::new(allow()));
         }
-        let result = match (evaluation.method.as_str(), evaluation.phase) {
+        let span = telemetry::start(
+            &Context::current(),
+            "openbox.intercept",
+            SpanKind::Server,
+            vec![
+                KeyValue::new("openbox.intercept.method", evaluation.method.clone()),
+                KeyValue::new(
+                    "openbox.intercept.phase",
+                    phase_name(evaluation.phase.as_ref()),
+                ),
+                KeyValue::new("openbox.intercept.role", format!("{:?}", self.role)),
+            ],
+        );
+        let method = evaluation.method.clone();
+        let result = self.intercept(evaluation).with_context(span.clone()).await;
+        span.span().set_attributes([
+            KeyValue::new("openbox.intercept.allowed", result.allowed),
+            KeyValue::new(
+                "openbox.intercept.patches",
+                i64::try_from(result.patches.len()).unwrap_or(i64::MAX),
+            ),
+        ]);
+        span.span().end();
+        eprintln!(
+            "openbox: intercept {method} allowed={} patches={} reason={}",
+            result.allowed,
+            result.patches.len(),
+            if result.reason.is_empty() {
+                "-"
+            } else {
+                &result.reason
+            }
+        );
+        Ok(Response::new(result))
+    }
+}
+
+impl<I: Inventory + ?Sized> FrontDesk<I> {
+    /// Stamps, checks or records one gateway operation.
+    async fn intercept(&self, evaluation: InterceptorEvaluation) -> InterceptorResult {
+        match (evaluation.method.as_str(), evaluation.phase) {
             ("CreateSandbox", Some(interceptor_evaluation::Phase::ModifyOperation(phase))) => {
                 let operation = struct_to_json(phase.proposed_operation.as_ref());
                 match front_desk::modify_create_sandbox(&operation) {
@@ -338,19 +383,16 @@ impl<I: Inventory + ?Sized> GatewayInterceptor for FrontDesk<I> {
                 allow()
             }
             _ => allow(),
-        };
-        eprintln!(
-            "openbox: intercept {} allowed={} patches={} reason={}",
-            evaluation.method,
-            result.allowed,
-            result.patches.len(),
-            if result.reason.is_empty() {
-                "-"
-            } else {
-                &result.reason
-            }
-        );
-        Ok(Response::new(result))
+        }
+    }
+}
+
+fn phase_name(phase: Option<&interceptor_evaluation::Phase>) -> &'static str {
+    match phase {
+        Some(interceptor_evaluation::Phase::ModifyOperation(_)) => "modify_operation",
+        Some(interceptor_evaluation::Phase::Validate(_)) => "validate",
+        Some(interceptor_evaluation::Phase::PostCommit(_)) => "post_commit",
+        None => "none",
     }
 }
 

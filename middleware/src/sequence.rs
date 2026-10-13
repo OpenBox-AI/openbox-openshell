@@ -19,6 +19,8 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::telemetry;
+
 type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// How long a sandbox's queue waits for work before it is put away.
@@ -66,7 +68,8 @@ impl Sequencer {
         );
     }
 
-    /// Waits for the sandbox's queue to reach this caller, then holds it.
+    /// Waits for the sandbox's queue to reach this caller, then holds it. The
+    /// wait is an `openbox.queue_wait` span under the current one.
     pub async fn turn(self: &Arc<Self>, sandbox_id: &str) -> Turn {
         let (ready, reached) = oneshot::channel();
         let (release, released) = oneshot::channel::<()>();
@@ -78,7 +81,12 @@ impl Sequencer {
                 }
             }),
         );
-        let _ = reached.await;
+        let _ = telemetry::within(
+            "openbox.queue_wait",
+            vec![telemetry::sandbox(sandbox_id)],
+            reached,
+        )
+        .await;
         Turn { _release: release }
     }
 

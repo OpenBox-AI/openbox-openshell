@@ -43,6 +43,7 @@ use crate::guard::activity_from;
 use crate::interceptor::{Inventory, InventoryEvent};
 use crate::inventory::RuntimeEnvironment;
 use crate::store::{SharedStore, open_tools_key, pending_key, session_key, tool_key};
+use crate::telemetry;
 
 /// Most a deleted sandbox's session waits for the door guard's completions:
 /// one slow Core call. The wait is in the background; nothing is held for it.
@@ -288,14 +289,24 @@ impl Inventory for SessionLifecycle {
                         );
                     }
                     let core = Arc::clone(&self.core);
-                    tokio::spawn(async move {
-                        match core.start(&id, &name, &input).await {
-                            Ok(()) => eprintln!("openbox: session started sandbox_id={id}"),
-                            Err(error) => {
-                                eprintln!("openbox: session start failed sandbox_id={id}: {error}");
+                    let attributes = vec![telemetry::sandbox(&id)];
+                    tokio::spawn(telemetry::job(
+                        "openbox.session.start",
+                        attributes,
+                        async move {
+                            let started = core.start(&id, &name, &input);
+                            match telemetry::call("openbox.core.session_start", Vec::new(), started)
+                                .await
+                            {
+                                Ok(()) => eprintln!("openbox: session started sandbox_id={id}"),
+                                Err(error) => {
+                                    eprintln!(
+                                        "openbox: session start failed sandbox_id={id}: {error}"
+                                    );
+                                }
                             }
-                        }
-                    });
+                        },
+                    ));
                 }
             }
             // Empty for ALREADY_ABSENT: nothing was deleted by this call.
@@ -315,32 +326,46 @@ impl Inventory for SessionLifecycle {
                     let ending = Arc::clone(&self.ending);
                     let cutoff = ending.cutoff.subscribe();
                     ending.begin();
-                    tokio::spawn(async move {
-                        let left = await_pending(store.as_ref(), &id, wait, cutoff).await;
-                        if left > 0 {
-                            eprintln!(
-                                "openbox: ending session sandbox_id={id} with {left} completion(s) not sent after {} s",
-                                wait.as_secs()
-                            );
-                        }
-                        // After the wait: the door guard may still have been
-                        // opening the tools the last reply asked for.
-                        for (tool, opened) in open_tools(store.as_ref(), &id).await {
-                            if let Err(error) = core.close_tool(&id, &tool, opened).await {
+                    let attributes = vec![telemetry::sandbox(&id)];
+                    tokio::spawn(telemetry::job(
+                        "openbox.session.end",
+                        attributes,
+                        async move {
+                            let left = await_pending(store.as_ref(), &id, wait, cutoff).await;
+                            if left > 0 {
                                 eprintln!(
-                                    "openbox: tool activity {} left open sandbox_id={id}: {error}",
-                                    tool.id
+                                    "openbox: ending session sandbox_id={id} with {left} completion(s) not sent after {} s",
+                                    wait.as_secs()
                                 );
                             }
-                        }
-                        match core.end(&id, duration).await {
-                            Ok(()) => eprintln!("openbox: session completed sandbox_id={id}"),
-                            Err(error) => {
-                                eprintln!("openbox: session end failed sandbox_id={id}: {error}");
+                            // After the wait: the door guard may still have been
+                            // opening the tools the last reply asked for.
+                            for (tool, opened) in open_tools(store.as_ref(), &id).await {
+                                let closed = core.close_tool(&id, &tool, opened);
+                                if let Err(error) =
+                                    telemetry::call("openbox.core.close_tool", Vec::new(), closed)
+                                        .await
+                                {
+                                    eprintln!(
+                                        "openbox: tool activity {} left open sandbox_id={id}: {error}",
+                                        tool.id
+                                    );
+                                }
                             }
-                        }
-                        ending.end();
-                    });
+                            let ended = core.end(&id, duration);
+                            match telemetry::call("openbox.core.session_end", Vec::new(), ended)
+                                .await
+                            {
+                                Ok(()) => eprintln!("openbox: session completed sandbox_id={id}"),
+                                Err(error) => {
+                                    eprintln!(
+                                        "openbox: session end failed sandbox_id={id}: {error}"
+                                    );
+                                }
+                            }
+                            ending.end();
+                        },
+                    ));
                 }
             }
             InventoryEvent::PolicyChanged { .. } => {}
