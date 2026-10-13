@@ -1,30 +1,259 @@
 # OpenBox for OpenShell
 
-OpenBox governance for [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell)
-sandboxes, on OpenShell v0.1.2. Two services sit next to an OpenShell gateway:
+OpenBox governance for [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell).
 
-- **Door guard** (`openbox-verdict-middleware`): OpenShell supervisor middleware.
-  Every request a sandbox makes gets an OpenBox Core verdict before it leaves,
-  and its response is recorded. A sandbox is one OpenBox session, following
-  the agent SDK's pattern (`llm_call` and tool activities, prompts as signals).
-- **Front desk** (`openbox-governance-interceptor`): gateway interceptor.
-  Attaches the door guard to every sandbox on create, refuses policy and
-  provider-profile changes that would weaken it, opens and closes the
-  sandbox's Core session, and registers sandboxes in the AI Inventory.
+If you already run AI agents in OpenShell sandboxes, this integration puts an
+OpenBox verdict in front of everything those agents send out of the sandbox:
+model calls, tool calls, web requests. Your OpenBox policies, guardrails,
+behaviour rules and approvals apply to every sandbox the gateway creates, and
+each sandbox shows up in the OpenBox dashboard as one session you can follow
+step by step.
 
-Epic: [PROD-770](https://krnl-labs.atlassian.net/browse/PROD-770). Status,
-decisions and verification live on the Jira tickets.
+You keep using OpenShell exactly as before. Nothing changes in your sandbox
+images, your agents or the `openshell` commands you run.
+
+Built for OpenShell v0.1.2.
+
+## What you get
+
+- **A verdict on every outbound request.** Before a request leaves a sandbox,
+  OpenBox decides: allow it, block it, hold it for a person to approve, or halt
+  the whole sandbox.
+- **Governance nobody can switch off from inside.** Every new sandbox is
+  attached to OpenBox automatically. A policy change that would remove or
+  weaken that attachment is refused.
+- **A readable record.** Each sandbox is one OpenBox session: the user's
+  prompts, each model call, each tool the model asked for, and the requests
+  made inside that tool, in order, with their inputs, outputs and timing.
+- **An inventory.** Every sandbox is registered in the OpenBox AI Inventory
+  and kept up to date as it changes and is deleted.
+- **Fail closed.** If OpenBox cannot give a verdict in time, the request is
+  denied with an explicit reason, never silently allowed.
+
+## How it works for you
+
+1. **Create an agent in OpenBox.** In the OpenBox dashboard, create an agent
+   with a workload identity. The dashboard gives you its credentials.
+2. **Deploy two services next to your gateway.** Install the Helm chart in
+   `deploy/helm/openbox-openshell/` with those credentials.
+3. **Register them with your gateway.** Add the block the chart prints to your
+   gateway's TOML and restart the gateway.
+4. **Create sandboxes as usual.** `openshell sandbox create ...` works as it
+   did. Each new sandbox is governed from its first request.
+5. **Write your rules in OpenBox.** Policies, guardrails and behaviour rules
+   you set on the agent apply to all its sandboxes. Approvals appear in the
+   dashboard for a person to decide.
+
+`docs/install.md` walks through each step.
+
+### What an agent in a sandbox sees
+
+| OpenBox decides | The request | The agent sees |
+|---|---|---|
+| Allow | goes out | the normal response |
+| Allow with a constraint | goes out; the constraint is recorded | the normal response |
+| Block | does not go out | HTTP 403, reason code `openbox_blocked` |
+| Require approval | does not go out yet | HTTP 403, `openbox_approval_required`. Retrying the identical request after a person approves it lets it through |
+| Halt | does not go out | HTTP 403, `openbox_halted`. The sandbox is stopped, and nothing else from it gets out |
+| No verdict in time | does not go out | HTTP 403, `openbox_unavailable` |
+
+OpenShell cannot hold a request open while a person decides, so approval is
+deny-then-retry. `docs/agent-approvals.md` is the guide to give agent authors.
+
+## Architecture
+
+The views below follow the [C4 model](https://c4model.com): the system in its
+surroundings, then the deployable pieces, then the parts inside them.
+
+### Level 1: System context
+
+Who uses OpenBox for OpenShell, and which systems it sits between.
+
+```mermaid
+flowchart TB
+    dev["<b>Agent developer</b><br/>[Person]<br/>Runs agents in OpenShell sandboxes"]
+    admin["<b>Governance admin</b><br/>[Person]<br/>Writes rules, decides approvals,<br/>reviews sessions"]
+
+    obs["<b>OpenBox for OpenShell</b><br/>[Software system]<br/>Puts an OpenBox verdict on every<br/>outbound request and keeps every<br/>sandbox governed"]
+
+    openshell["<b>OpenShell</b><br/>[External system]<br/>Gateway and sandboxes running<br/>the agents"]
+    openbox["<b>OpenBox</b><br/>[External system]<br/>Core (verdicts, sessions, approvals),<br/>dashboard, AI Inventory"]
+    dest["<b>Destinations</b><br/>[External systems]<br/>Model providers, MCP servers,<br/>web APIs"]
+
+    dev -- "creates sandboxes with<br/>the openshell CLI" --> openshell
+    admin -- "sets rules, approves,<br/>reviews in the dashboard" --> openbox
+    openshell -- "asks for a verdict on each request;<br/>reports sandbox changes" --> obs
+    obs -- "evaluates actions,<br/>records sessions" --> openbox
+    obs -- "stops halted sandboxes" --> openshell
+    openshell -- "allowed requests only" --> dest
+```
+
+### Level 2: Containers
+
+Two services, deployed together beside the OpenShell gateway.
+
+```mermaid
+flowchart LR
+    subgraph customer["Your OpenShell deployment"]
+        gateway["<b>OpenShell gateway</b><br/>[External container]"]
+        supervisor["<b>Sandbox supervisor</b><br/>[External container]<br/>one per sandbox"]
+
+        subgraph obs["OpenBox for OpenShell"]
+            fd["<b>Front desk</b><br/>[Container: Rust, gRPC]<br/>Keeps every sandbox governed;<br/>opens and closes its session"]
+            dg["<b>Door guard</b><br/>[Container: Rust, gRPC]<br/>A verdict on every request,<br/>a record of every response"]
+            redis[("<b>Shared store</b><br/>[Container: Redis]")]
+        end
+    end
+
+    openbox["<b>OpenBox</b><br/>[External system]<br/>Core, AI Inventory, identity"]
+
+    gateway -- "sandbox and<br/>policy changes" --> fd
+    supervisor -- "each request<br/>and response" --> dg
+    dg -- "verdicts,<br/>activities" --> openbox
+    fd -- "sessions,<br/>inventory" --> openbox
+    dg -. "stop a halted<br/>sandbox" .-> gateway
+    dg --- redis
+    fd --- redis
+```
+
+| Container | Talks to | Listens on | Registered with the gateway as | On failure |
+|---|---|---|---|---|
+| Door guard | OpenBox Core over HTTPS with the agent's workload identity; the gateway API over mTLS to stop a halted sandbox | `:50051` gRPC, plus an admin port for `/metrics` and health | `[[openshell.supervisor.middleware]]` named `openbox`, `timeout = "30s"` | Fail closed: requests are denied |
+| Front desk, governing | – | `:50061` gRPC | `[[openshell.gateway.interceptors]]` named `openbox` | Fail closed: sandbox creates and policy changes are refused |
+| Front desk, recording | OpenBox Core (sessions) and the AI Inventory API over HTTPS; the gateway API over mTLS to reconcile | `:50062` gRPC | `[[openshell.gateway.interceptors]]` named `openbox-inventory` | Fail open: the change still happens; the inventory catches up on reconcile |
+| Shared store | – | Redis | – | Nothing is skipped; an approval's retry may need approving again |
+
+Run two or more door guard replicas behind the shared store. With
+`fail_closed`, OpenBox availability is sandbox availability: plan for it the
+way you plan for the gateway. `docs/runbook.md` covers operating it.
+
+### Level 3: Components
+
+#### Door guard
+
+```mermaid
+flowchart LR
+    supervisor["Sandbox supervisor"]
+
+    subgraph dg["Door guard"]
+        service["<b>Middleware service</b><br/>service.rs<br/>OpenShell middleware gRPC API"]
+        token["<b>Token check</b><br/>token.rs<br/>Verifies the gateway's<br/>per-call token"]
+        action["<b>Action reader</b><br/>action.rs, agent.rs, prompt.rs<br/>What the request is: model call,<br/>tool call, or plain HTTP"]
+        guard["<b>Decision engine</b><br/>guard.rs<br/>Activity per request, verdict<br/>to allow or deny, approvals"]
+        sequence["<b>Ordering</b><br/>sequence.rs<br/>Core hears each sandbox's<br/>events in order"]
+        client["<b>Core client</b><br/>core_client.rs<br/>Governance API, workload<br/>identity, 29 s budget"]
+        halt["<b>Halt</b><br/>halt.rs<br/>Stops a halted sandbox"]
+        obsv["<b>Observability</b><br/>metrics.rs, telemetry.rs<br/>Prometheus, OpenTelemetry"]
+    end
+
+    store[("Shared store")]
+    core["OpenBox Core"]
+    gw["OpenShell gateway"]
+
+    supervisor --> service
+    service --> token
+    service --> action --> guard
+    guard --> sequence --> client --> core
+    guard --> halt --> gw
+    guard --- store
+    guard --> obsv
+```
+
+One request, start to finish:
+
+1. The supervisor sends the request (method, URL, headers, body up to the
+   registered `max_payload_bytes`) to the door guard, with a short-lived
+   gateway token.
+2. The door guard works out what the request is. A call to a model provider
+   is the agent thinking (`llm_call`); a call the model asked for is a tool;
+   anything else is plain HTTP inside the current tool.
+3. It opens that activity in the sandbox's OpenBox session and asks Core for a
+   verdict, all within one 29 s budget so the answer always beats OpenShell's
+   30 s timeout.
+4. The verdict becomes allow or deny with a reason code. A halt also stops the
+   sandbox through the gateway.
+5. When the response comes back, the door guard records it and closes the
+   activity. If the model's reply asked for tools, it opens them.
+
+#### Front desk
+
+```mermaid
+flowchart LR
+    gateway["OpenShell gateway"]
+
+    subgraph fd["Front desk"]
+        interceptor["<b>Interceptor service</b><br/>interceptor.rs<br/>OpenShell interceptor gRPC API"]
+        token["<b>Token check</b><br/>token.rs"]
+        policy["<b>Governance policy</b><br/>front_desk.rs<br/>Attach OpenBox on create;<br/>refuse weakening changes"]
+        sessions["<b>Sessions</b><br/>sessions.rs<br/>Open a sandbox's session on create,<br/>close it on delete"]
+        inventory["<b>Inventory</b><br/>inventory.rs<br/>Register sandboxes; reconcile<br/>against the gateway"]
+    end
+
+    core["OpenBox Core"]
+    backend["OpenBox backend"]
+
+    gateway --> interceptor --> token
+    interceptor --> policy
+    interceptor --> sessions --> core
+    interceptor --> inventory --> backend
+    inventory -- "list sandboxes" --> gateway
+```
+
+On every new sandbox the front desk adds an `openbox` entry to its network
+policy: every host, fail closed, after any middleware you run yourself. A
+sandbox created without `--policy` gets OpenShell's restrictive default with
+OpenBox attached. The front desk refuses:
+
+- a policy whose `openbox` entry is missing, replaced, or not fail closed
+- endpoints that would send credentials without inspection
+- automatic approval of policy changes the agent proposes for itself
+
+### Level 4: Code
+
+The crate is in `middleware/`, one module per component above. Each module
+starts with a comment saying what it owns.
+
+## What is not governed
+
+Some traffic gets an allow or deny by host and port only, without a
+per-request verdict:
+
+- raw TCP (`protocol: tcp`, for example Postgres or SSH)
+- hosts marked `tls: skip`, which OpenShell cannot inspect
+- WebSocket messages after the upgrade request (`docs/websocket.md`)
+
+Put internal systems behind HTTP or MCP to govern them per request.
+`docs/install.md` lists the remaining known limits.
+
+## Repository
 
 | Path | What |
 |---|---|
-| `middleware/` | Both services (one crate), tests, examples |
-| `middleware/scripts/openbox-openshell.sh` | Run OpenShell governed by OpenBox locally, for an agent's dashboard snippet |
-| `middleware/scripts/verify-*.sh` | Live checks against a real OpenShell gateway and OpenBox Core |
+| `middleware/` | Both services (one Rust crate), tests and examples |
 | `deploy/helm/openbox-openshell/` | Helm chart for both services |
-| `docs/install.md` | Installing on an OpenShell gateway |
-| `docs/runbook.md` | Operating it: metrics, alerts, slow verdicts, break-glass |
-| `docs/agent-approvals.md` | What an agent sees when a request needs approval |
-| `docs/websocket.md` | What is and is not governed on a WebSocket |
+| `docs/install.md` | Install on your OpenShell gateway |
+| `docs/runbook.md` | Metrics, alerts, slow verdicts, break-glass |
+| `docs/agent-approvals.md` | Approvals, for agent authors |
+| `docs/websocket.md` | What is governed on a WebSocket |
+| `middleware/scripts/openbox-openshell.sh` | Run OpenShell governed by OpenBox on one machine |
+| `middleware/scripts/verify-*.sh` | Live checks against a real gateway and OpenBox |
+
+## Try it on one machine
+
+With the OpenShell v0.1.2 binaries installed and an agent's credentials saved
+from the dashboard as `agent.env`:
+
+```sh
+middleware/scripts/openbox-openshell.sh up --agent-env agent.env
+middleware/scripts/openbox-openshell.sh demo
+middleware/scripts/openbox-openshell.sh down
+```
+
+`up` starts a local gateway with both services registered. `demo` runs a short
+agent session in a sandbox; open the agent in the OpenBox dashboard to see it.
+Set `OPENSHELL_PREFIX` to the directory holding `bin/openshell`,
+`bin/openshell-gateway` and `libexec/openshell-driver-vm`. This setup is for
+development only: it runs without TLS between the gateway and the services.
 
 ## Build and test
 
@@ -33,18 +262,3 @@ cd middleware
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
-
-## Try it
-
-```sh
-middleware/scripts/openbox-openshell.sh up --agent-env agent.env
-middleware/scripts/openbox-openshell.sh demo
-middleware/scripts/openbox-openshell.sh down
-```
-
-`agent.env` is the snippet the OpenBox dashboard shows for an agent with a
-workload identity. The script needs the OpenShell v0.1.2 release binaries
-(`OPENSHELL_PREFIX`, default `~/openshell-repro`).
-
-History before this repository is in `OpenBox-AI/openbox-sandbox`, where the
-work started under `middleware/`.
