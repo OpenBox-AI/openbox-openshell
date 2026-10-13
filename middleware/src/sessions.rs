@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::core_client::{Activity, CoreClient, Outcome};
+use crate::guard::activity_from;
 use crate::interceptor::{Inventory, InventoryEvent};
 use crate::inventory::RuntimeEnvironment;
 use crate::store::{SharedStore, open_tools_key, session_key, tool_key};
@@ -144,13 +145,7 @@ impl SessionLifecycle {
                 continue;
             };
             let state = entry.get("state").and_then(Value::as_str);
-            let activity = entry.get("activity").and_then(|activity| {
-                Some(Activity {
-                    id: activity.get("id")?.as_str()?.to_owned(),
-                    kind: activity.get("kind")?.as_str()?.to_owned(),
-                    input: activity.get("input").cloned().unwrap_or_else(|| json!([])),
-                })
-            });
+            let activity = entry.get("activity").and_then(activity_from);
             if let (Some("open" | "opened"), Some(activity)) = (state, activity) {
                 tools.push((activity, state == Some("opened")));
             }

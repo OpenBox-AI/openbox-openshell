@@ -680,6 +680,8 @@ pub struct Activity {
     pub kind: String,
     /// `activity_input`, a list.
     pub input: Value,
+    /// `profile_id`: the sandbox's profile, when its policy names one.
+    pub profile: Option<String>,
 }
 
 /// How an activity ended.
@@ -786,6 +788,9 @@ fn activity_event(
     event["activity_type"] = json!(activity.kind);
     event["attempt"] = json!(1);
     event["activity_input"] = activity.input.clone();
+    if let Some(profile) = &activity.profile {
+        event["profile_id"] = json!(profile);
+    }
     event
 }
 
@@ -1158,6 +1163,7 @@ mod tests {
             id: id.to_owned(),
             kind: kind.to_owned(),
             input: json!([{"prompt": "hi"}]),
+            profile: None,
         }
     }
 
@@ -1250,6 +1256,30 @@ mod tests {
         assert!(attributes.get("openbox.process.ancestors").is_none());
         assert_eq!(attributes["openbox.sandbox.id"], "sbx-id-1");
         assert_eq!(attributes["sandbox.provider"], "openshell");
+    }
+
+    #[test]
+    fn a_profiled_activity_sends_profile_id_on_every_event() {
+        let plain = activity("oshx-req-1", LLM_CALL);
+        assert!(
+            activity_started_event("sbx-id-1", &plain, UNIX_EPOCH)
+                .get("profile_id")
+                .is_none()
+        );
+        let profiled = Activity {
+            profile: Some("coding".to_owned()),
+            ..plain
+        };
+        let action = Action::from_evaluation(&evaluation("GET", "/", b""));
+        let span = started_span(&action, &profiled.id, 4, UNIX_EPOCH);
+        let events = [
+            activity_started_event("sbx-id-1", &profiled, UNIX_EPOCH),
+            action_event(&action, &profiled, &span, UNIX_EPOCH),
+            activity_completed_event("sbx-id-1", &profiled, &Outcome::default(), UNIX_EPOCH),
+        ];
+        for event in events {
+            assert_eq!(event["profile_id"], "coding", "{}", event["event_type"]);
+        }
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub struct Action {
     pub workspace: String,
     pub process_binary: Option<String>,
     pub process_ancestors: Vec<String>,
+    /// The sandbox's profile, from the middleware config in its policy. Sent
+    /// to Core as `profile_id` on each of its activities.
+    pub profile: Option<String>,
     pub scheme: String,
     pub host: String,
     pub port: u32,
@@ -112,6 +115,7 @@ impl Action {
             workspace: context.workspace,
             process_binary: (!process.binary.is_empty()).then_some(process.binary),
             process_ancestors: process.ancestors,
+            profile: None,
             scheme: target.scheme,
             host: target.host,
             port: target.port,
