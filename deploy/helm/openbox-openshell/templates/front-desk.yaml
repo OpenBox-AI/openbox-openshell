@@ -1,0 +1,176 @@
+{{- $fd := .Values.frontDesk -}}
+{{- $component := dict "root" . "component" "front-desk" -}}
+{{- $core := and $fd.sessions (eq .Values.credentials.identity "workload") -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "obx.frontDesk" . }}
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+    app.kubernetes.io/component: front-desk
+spec:
+  replicas: {{ $fd.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "obx.selector" $component | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "obx.labels" . | nindent 8 }}
+        app.kubernetes.io/component: front-desk
+        {{- with $fd.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/credentials: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+        {{- with $fd.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "obx.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ $fd.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: front-desk
+          image: {{ include "obx.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            {{- toYaml $fd.command | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: govern
+              containerPort: {{ $fd.port }}
+              protocol: TCP
+            - name: inventory
+              containerPort: {{ $fd.inventoryPort }}
+              protocol: TCP
+          env:
+            - name: OPENBOX_FD_LISTEN
+              value: "0.0.0.0:{{ $fd.port }}"
+            - name: OPENBOX_FD_INVENTORY_LISTEN
+              value: "0.0.0.0:{{ $fd.inventoryPort }}"
+            - name: OPENBOX_FD_TLS_CERT
+              value: /var/run/openbox/tls/tls.crt
+            - name: OPENBOX_FD_TLS_KEY
+              value: /var/run/openbox/tls/tls.key
+            - name: OPENBOX_FD_GATEWAY_ID
+              value: {{ .Values.gateway.id | quote }}
+            - name: OPENBOX_FD_GATEWAY_PUBLIC_KEY
+              value: /var/run/openbox/gateway-key/public-key.pem
+            - name: OPENBOX_FD_AUDIENCE
+              value: {{ $fd.audience | quote }}
+            - name: OPENBOX_FD_INVENTORY_AUDIENCE
+              value: {{ $fd.inventoryAudience | quote }}
+            - name: OPENBOX_FD_RECONCILE_SECS
+              value: {{ $fd.reconcileSecs | int64 | quote }}
+            {{- if $core }}
+            - name: OPENBOX_URL
+              value: {{ .Values.openbox.url | quote }}
+            {{- include "obx.credentialEnv" . | trim | nindent 12 }}
+            {{- end }}
+            {{- if .Values.openbox.backendUrl }}
+            - name: OPENBOX_BACKEND_URL
+              value: {{ .Values.openbox.backendUrl | quote }}
+            {{- end }}
+            {{- include "obx.gatewayApiEnv" . | trim | nindent 12 }}
+            {{- include "obx.redisEnv" . | trim | nindent 12 }}
+            {{- with $fd.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # The front desk has no admin listener: probe its two gRPC ports.
+          readinessProbe:
+            tcpSocket:
+              port: govern
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            tcpSocket:
+              port: inventory
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml $fd.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "obx.commonMounts" . | nindent 12 }}
+      volumes:
+        {{- include "obx.commonVolumes" . | nindent 8 }}
+        - name: tls
+          secret:
+            secretName: {{ include "obx.frontDeskTlsSecret" . }}
+            defaultMode: 0400
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+      {{- if $fd.topologySpread }}
+      topologySpreadConstraints:
+        {{- include "obx.topologySpread" $component | nindent 8 }}
+      {{- end }}
+      {{- with $fd.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $fd.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $fd.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "obx.frontDesk" . }}
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+    app.kubernetes.io/component: front-desk
+  {{- with $fd.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $fd.service.type }}
+  selector:
+    {{- include "obx.selector" $component | nindent 4 }}
+  ports:
+    - name: govern
+      port: {{ $fd.port }}
+      targetPort: govern
+      protocol: TCP
+      appProtocol: grpc
+    - name: inventory
+      port: {{ $fd.inventoryPort }}
+      targetPort: inventory
+      protocol: TCP
+      appProtocol: grpc
+{{- if and $fd.podDisruptionBudget.enabled (gt (int $fd.replicaCount) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "obx.frontDesk" . }}
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+    app.kubernetes.io/component: front-desk
+spec:
+  minAvailable: {{ $fd.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "obx.selector" $component | nindent 6 }}
+{{- end }}

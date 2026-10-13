@@ -1,0 +1,32 @@
+# Values for `helm lint` and `helm template` checks. Placeholders only: no
+# real credentials.
+image:
+  repository: registry.example.com/openbox/openbox-openshell
+  tag: "0.1.0"
+openbox:
+  url: https://core.example.com
+  backendUrl: https://api.example.com
+credentials:
+  identity: workload
+  apiKey: obx_test_placeholder
+  workloadPrivateKey: |
+    -----BEGIN PRIVATE KEY-----
+    placeholder
+    -----END PRIVATE KEY-----
+  workloadKid: test-kid
+gateway:
+  id: openshell
+  publicKey: |
+    -----BEGIN PUBLIC KEY-----
+    placeholder
+    -----END PUBLIC KEY-----
+  api:
+    endpoint: https://openshell-gateway.openshell.svc:8080
+    mtlsSecret: openbox-gateway-client
+tls:
+  doorGuard:
+    existingSecret: openbox-door-guard-tls
+  frontDesk:
+    existingSecret: openbox-front-desk-tls
+externalRedis:
+  url: redis://redis.openbox.svc:6379/0

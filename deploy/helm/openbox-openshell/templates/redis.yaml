@@ -1,0 +1,106 @@
+{{- if .Values.redis.enabled }}
+{{- $component := dict "root" . "component" "redis" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "obx.redis" . }}
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "obx.selector" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "obx.labels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          # Entries are short-lived and expire on their own; nothing is
+          # written to disk.
+          args:
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            {{- if .Values.redis.password }}
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            {{- end }}
+          {{- if .Values.redis.password }}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "obx.redis" . }}-password
+                  key: password
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "obx.redis" . }}
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "obx.selector" $component | nindent 4 }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+{{- if .Values.redis.password }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "obx.redis" . }}-password
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  password: {{ .Values.redis.password | quote }}
+{{- end }}
+{{- end }}

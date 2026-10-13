@@ -1,0 +1,242 @@
+# OpenBox for OpenShell. Two services, one image:
+#   - the door guard (openbox-verdict-middleware): an OpenBox verdict on every
+#     request a sandbox makes, its response recorded
+#   - the front desk (openbox-governance-interceptor): attaches the door guard
+#     to every new sandbox, refuses changes that weaken it, records sandboxes
+#
+# Every value below maps to an environment variable the binaries read. The
+# variable is named in the comment. docs/install.md walks through an install.
+
+# -- The container image. It must hold both binaries on PATH. We do not
+# publish one yet: build it from middleware/ and push it to your registry.
+image:
+  repository: ""
+  tag: ""          # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# -- OpenBox Core and the OpenBox backend.
+openbox:
+  # OPENBOX_URL. Core's base URL, e.g. https://core.example.com. Required.
+  url: ""
+  # OPENBOX_BACKEND_URL (front desk). The backend that records sandboxes in
+  # the AI Inventory. Empty: inventory events are only logged.
+  backendUrl: ""
+
+# -- The agent's credentials, from the OpenBox dashboard. The door guard and
+# the front desk act as this agent.
+credentials:
+  # How the services prove they are the agent:
+  #   workload  the agent's workload identity (RSA key + kid); Core v3 API.
+  #             Needed for front desk sessions and the AI Inventory.
+  #   signed    request signing with the agent's DID key (agents with
+  #             "Require signed requests" on); door guard only, so the
+  #             front desk opens no sessions and records no inventory.
+  #   apiKey    the API key alone; door guard only, as for `signed`.
+  identity: workload
+  # Use a Secret you manage instead of the values below. Keys:
+  #   api-key         the agent's obx_ API key       (OPENBOX_API_KEY_FILE)
+  #   workload.pem    the workload private key, PEM  (OPENBOX_WORKLOAD_KEY_FILE)
+  #   workload-kid    the key's kid                  (OPENBOX_WORKLOAD_KID)
+  #   agent-key.pem   the DID signing key, PEM       (OPENBOX_AGENT_KEY_FILE)
+  existingSecret: ""
+  apiKey: ""
+  workloadPrivateKey: ""
+  # The kid Core's /api/v3/auth/bootstrap returns for the agent.
+  workloadKid: ""
+  # OPENBOX_AGENT_DID, for identity: signed.
+  agentDid: ""
+  agentPrivateKey: ""
+
+# -- The OpenShell gateway these services serve.
+gateway:
+  # OPENBOX_MW_GATEWAY_ID / OPENBOX_FD_GATEWAY_ID. Extension tokens must be
+  # issued by openshell-gateway:<id>. Required.
+  id: ""
+  # OPENBOX_MW_GATEWAY_PUBLIC_KEY / OPENBOX_FD_GATEWAY_PUBLIC_KEY. The
+  # gateway's Ed25519 JWT signing public key, PEM. Give it inline, or name a
+  # ConfigMap holding it under `public-key.pem`. Required.
+  publicKey: ""
+  publicKeyConfigMap: ""
+  # OPENBOX_GATEWAY_ENDPOINT and OPENBOX_GATEWAY_MTLS_DIR. The gateway API,
+  # with an mTLS client credential for OpenBox. The door guard uses it to
+  # stop a halted sandbox; the front desk uses it to reconcile the AI
+  # Inventory. Without it HALT still denies all traffic but cannot stop the
+  # sandbox, and missed inventory events stay missed.
+  api:
+    endpoint: ""
+    # A Secret with ca.crt (the gateway CA), tls.crt and tls.key (the client
+    # certificate the gateway issued for OpenBox).
+    mtlsSecret: ""
+
+# -- Server TLS for both services. The gateway and the sandbox supervisors
+# check these certificates against the registration's tls_ca_cert_path, so
+# issue them from a CA the gateway is configured to trust (for example the
+# gateway's own CA). The names must match the endpoints you register.
+tls:
+  doorGuard:
+    # A kubernetes.io/tls Secret (tls.crt, tls.key).
+    # OPENBOX_MW_TLS_CERT / OPENBOX_MW_TLS_KEY.
+    existingSecret: ""
+  frontDesk:
+    # OPENBOX_FD_TLS_CERT / OPENBOX_FD_TLS_KEY.
+    existingSecret: ""
+  # Or let cert-manager issue both, from an Issuer that signs with the CA
+  # the gateway trusts. Needs cert-manager in the cluster.
+  certManager:
+    enabled: false
+    issuerRef:
+      name: ""
+      kind: Issuer
+      group: cert-manager.io
+    duration: 2160h
+    renewBefore: 360h
+    # Names added to both certificates, e.g. an external hostname.
+    extraDnsNames: []
+
+# -- Shared store. With more than one door guard replica, approval retries
+# and response completions must be matched through Redis (OPENBOX_REDIS_URL),
+# or a retry landing on another replica asks for approval again. The front
+# desk keeps each sandbox session's start time there. The client speaks plain
+# TCP with an optional password (redis://[:password@]host[:port][/db]); it
+# does not speak TLS.
+externalRedis:
+  url: ""
+  # Or a Secret holding the URL.
+  existingSecret: ""
+  existingSecretKey: redis-url
+# A single Redis in this release, for evaluation. Not highly available; a
+# restart loses pending approvals (their retries then ask for approval again,
+# never skip it). Use externalRedis in production.
+redis:
+  enabled: false
+  image:
+    repository: redis
+    tag: 7.4.2-alpine
+    pullPolicy: IfNotPresent
+  # Optional; sets requirepass.
+  password: ""
+  database: 0
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+# -- The door guard: openbox-verdict-middleware.
+doorGuard:
+  # Two or more, with a shared Redis. The gateway registers it fail closed,
+  # so while no replica answers, sandboxes cannot reach the network.
+  replicaCount: 2
+  command: ["openbox-verdict-middleware"]
+  # OPENBOX_MW_LISTEN, as 0.0.0.0:<port>.
+  port: 50051
+  # OPENBOX_MW_ADMIN_LISTEN, as 0.0.0.0:<port>: /healthz, /readyz, /metrics.
+  adminPort: 9464
+  # OPENBOX_MW_AUDIENCE. Must equal the gateway registration's `audience`
+  # (OpenShell's default for a registration named "openbox").
+  audience: urn:openshell:extension:middleware:openbox
+  # OPENBOX_CORE_TIMEOUT_MS. All Core calls behind one verdict share this
+  # budget. Keep it under the registration's timeout ("30s") so a slow Core
+  # gives an explicit openbox_unavailable deny, not the gateway's own error.
+  coreTimeoutMs: 29000
+  # OPENBOX_MW_MAX_PAYLOAD_BYTES. Largest body the door guard accepts.
+  # Match the registration's max_payload_bytes.
+  maxPayloadBytes: 1048576
+  # OPENBOX_CORE_BODY_LIMIT_BYTES. How much of a body is sent to Core.
+  coreBodyLimitBytes: 65536
+  # OPENBOX_APPROVAL_TTL_SECS. How long an approval's retry can match it,
+  # when Core sends no expiry with the verdict.
+  approvalTtlSecs: 900
+  # OPENBOX_PROMPT_CAPTURE. What Core receives for a user prompt: text,
+  # hash (SHA-256 and length) or off.
+  promptCapture: text
+  # Seconds Kubernetes waits after SIGTERM. The door guard stops taking
+  # calls, finishes the ones in flight, and sends what it still owes Core.
+  terminationGracePeriodSeconds: 30
+  extraEnv: []
+  podAnnotations: {}
+  podLabels: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Spread replicas over nodes. Set to [] to leave scheduling alone.
+  topologySpread: true
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  service:
+    type: ClusterIP
+    annotations: {}
+
+# -- The front desk: openbox-governance-interceptor. One process serves two
+# gateway registrations: "openbox" (fail closed) and "openbox-inventory"
+# (fail open).
+frontDesk:
+  # The gateway registers the governing listener fail closed, so while no
+  # replica answers, sandboxes cannot be created or reconfigured.
+  replicaCount: 2
+  command: ["openbox-governance-interceptor"]
+  # OPENBOX_FD_LISTEN, as 0.0.0.0:<port>. Registration "openbox".
+  port: 50061
+  # OPENBOX_FD_INVENTORY_LISTEN, as 0.0.0.0:<port>. Registration
+  # "openbox-inventory".
+  inventoryPort: 50062
+  # OPENBOX_FD_AUDIENCE and OPENBOX_FD_INVENTORY_AUDIENCE. OpenShell's
+  # defaults for registrations with those names.
+  audience: urn:openshell:extension:interceptor:openbox
+  inventoryAudience: urn:openshell:extension:interceptor:openbox-inventory
+  # Open each sandbox's Core session on create and complete it on delete.
+  # Sets OPENBOX_URL for the front desk; needs credentials.identity: workload.
+  sessions: true
+  # OPENBOX_FD_RECONCILE_SECS. AI Inventory reconciliation interval.
+  reconcileSecs: 60
+  terminationGracePeriodSeconds: 30
+  extraEnv: []
+  podAnnotations: {}
+  podLabels: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpread: true
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  service:
+    type: ClusterIP
+    annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]

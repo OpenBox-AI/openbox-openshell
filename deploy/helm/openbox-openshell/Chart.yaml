@@ -1,0 +1,16 @@
+apiVersion: v2
+name: openbox-openshell
+description: >-
+  OpenBox for OpenShell: the door guard (openbox-verdict-middleware) and the
+  front desk (openbox-governance-interceptor), for an existing OpenShell
+  v0.1.2 gateway.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - openbox
+  - openshell
+home: https://github.com/OpenBox-AI/openbox-sandbox
+sources:
+  - https://github.com/OpenBox-AI/openbox-sandbox/tree/main/middleware
