@@ -34,8 +34,11 @@
 //!                                     response completions are matched through
 //!                                     it. Without it they are matched in process,
 //!                                     which is only correct for one replica.
-//!   `OPENBOX_APPROVAL_TTL_SECS`       how long an approval's retry can match it,
-//!                                     default 900
+//!   `OPENBOX_APPROVAL_TTL_SECS`       how long an approval's retry can match it
+//!                                     when Core sends no expiry with the
+//!                                     verdict, default 900. Otherwise Core's
+//!                                     expiry (the agent's `approval_wait_time`)
+//!                                     is used.
 //!   `OPENBOX_PROMPT_CAPTURE`          what Core receives for a user prompt read
 //!                                     from a model call: `text` (default),
 //!                                     `hash` (SHA-256 and length), `off`
