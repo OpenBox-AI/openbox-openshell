@@ -173,7 +173,9 @@ up() {
   say "== Build the door guard and front desk"
   (cd "$HERE" && cargo build -q --bin openbox-verdict-middleware --bin openbox-governance-interceptor)
   creds="OPENBOX_URL=$core OPENBOX_API_KEY_FILE=$DIR/creds/api-key OPENBOX_WORKLOAD_KEY_FILE=$DIR/creds/workload.pem OPENBOX_WORKLOAD_KID=$kid OPENBOX_REDIS_URL=$REDIS"
-  inventory=
+  # "-" turns the inventory off: the front desk must not see the variable
+  # at all, and the caller may have exported it.
+  inventory="-u OPENBOX_BACKEND_URL"
   [ "$BACKEND" = - ] || inventory="OPENBOX_BACKEND_URL=$BACKEND"
 
   # The gateway's certificates first: the front desk reconciles over the
@@ -191,7 +193,7 @@ up() {
     "$HERE/target/debug/openbox-verdict-middleware" >"$DIR/door-guard.log" 2>&1 &
   echo $! >"$DIR/door-guard.pid"
   wait_listen "$MW_PORT" door-guard
-  env $creds $inventory OPENBOX_FD_INSECURE=1 OPENBOX_FD_LISTEN=127.0.0.1:$FD_PORT \
+  env $inventory $creds OPENBOX_FD_INSECURE=1 OPENBOX_FD_LISTEN=127.0.0.1:$FD_PORT \
     OPENBOX_FD_INVENTORY_LISTEN=127.0.0.1:$INV_PORT OPENBOX_FD_GATEWAY_ID=$GATEWAY_NAME \
     OPENBOX_GATEWAY_ENDPOINT=https://localhost:$GW_PORT OPENBOX_GATEWAY_MTLS_DIR=$DIR/gwclient \
     "$HERE/target/debug/openbox-governance-interceptor" >"$DIR/front-desk.log" 2>&1 &
