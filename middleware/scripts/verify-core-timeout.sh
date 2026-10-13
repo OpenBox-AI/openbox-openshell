@@ -290,15 +290,15 @@ else
   echo "INFO  D example.com, 25.5 s allow: got '$CODE' after ${SECS}s (not the idle drop; see the door guard log)"
 fi
 
-# E: the D evaluation (two calls, ~17 s) is visible in the latency histogram, not lumped
-# into +Inf above a 10 s top bucket.
+# E: the D evaluation (three calls, ~25.5 s) is visible in the latency histogram, not
+# lumped into +Inf above a 10 s top bucket.
 M=$(curl -s "http://127.0.0.1:$((MW_PORT + 1))/metrics")
-b15=$(echo "$M" | awk -F' ' '/^openbox_mw_evaluation_duration_seconds_bucket\{le="15"\}/{print $2}')
-b20=$(echo "$M" | awk -F' ' '/^openbox_mw_evaluation_duration_seconds_bucket\{le="20"\}/{print $2}')
-if [ "$b15" = 0 ] && [ "$b20" = 1 ]; then
-  pass "E /metrics: the ~17 s evaluation falls in the 15-20 s bucket"
+b25=$(echo "$M" | awk -F' ' '/^openbox_mw_evaluation_duration_seconds_bucket\{le="25"\}/{print $2}')
+b30=$(echo "$M" | awk -F' ' '/^openbox_mw_evaluation_duration_seconds_bucket\{le="30"\}/{print $2}')
+if [ "$b25" = 0 ] && [ "$b30" = 1 ]; then
+  pass "E /metrics: the ~25.5 s evaluation falls in the 25-30 s bucket"
 else
-  fail "E /metrics: expected le=15 0 and le=20 1, got le=15 '$b15' le=20 '$b20'"
+  fail "E /metrics: expected le=25 0 and le=30 1, got le=25 '$b25' le=30 '$b30'"
 fi
 
 echo "== Door guard verdicts"
