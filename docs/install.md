@@ -43,15 +43,18 @@ You need:
   to reconcile the AI Inventory. Without it, HALT still denies all of the
   sandbox's traffic but cannot stop the sandbox.
 
-## 1. Build the image
+## 1. The image
 
-We do not publish an image yet. Build both binaries and put them on `PATH` in
-one image:
+Each release publishes `ghcr.io/openbox-ai/openbox-openshell:<version>` for
+`linux/amd64` and `linux/arm64`, holding both binaries. The chart uses it by
+default, at the tag matching the chart's version, so there is nothing to build.
+
+To run your own build instead, build the repository's `Dockerfile`, push it to
+your registry, and set `image.repository` and `image.tag`:
 
 ```bash
-cd middleware
-cargo build --release --locked \
-  --bin openbox-verdict-middleware --bin openbox-governance-interceptor
+docker build -t <registry>/openbox-openshell:<tag> .
+docker push <registry>/openbox-openshell:<tag>
 ```
 
 The chart runs the image as UID 65532 with a read-only root filesystem. Neither
@@ -77,8 +80,8 @@ cert-manager Issuer that signs with that CA.
 ## 3. Install the chart
 
 ```bash
-helm install openbox deploy/helm/openbox-openshell -n openbox --create-namespace \
-  --set image.repository=<registry>/openbox-openshell \
+helm install openbox oci://ghcr.io/openbox-ai/charts/openbox-openshell \
+  --version <version> -n openbox --create-namespace \
   --set openbox.url=<Core URL> \
   --set openbox.backendUrl=<backend URL> \
   --set credentials.existingSecret=openbox-agent \
@@ -93,7 +96,8 @@ helm install openbox deploy/helm/openbox-openshell -n openbox --create-namespace
 
 `openbox-agent` holds `api-key`, `workload.pem` and `workload-kid`.
 `openbox-gateway-client` holds `ca.crt`, `tls.crt` and `tls.key`.
-`deploy/helm/openbox-openshell/values.yaml` documents every value and the
+`helm show values oci://ghcr.io/openbox-ai/charts/openbox-openshell` (the
+chart's `values.yaml`) documents every value and the
 environment variable it sets.
 
 The chart refuses settings the binaries would refuse at startup. It also
@@ -367,4 +371,3 @@ Ours, or OpenShell's design:
   domains (OpenAI, Anthropic, Google, OpenRouter). A model behind a proxy shows
   as plain HTTP, though the door guard still records it as `llm_call`.
 - OCSF events do not carry `request_id` (see above).
-- No published container image yet.

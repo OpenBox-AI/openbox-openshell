@@ -1,0 +1,263 @@
+# Release. To cut one:
+#   1. Set `version` and `appVersion` in deploy/helm/openbox-openshell/Chart.yaml
+#      and `version` in middleware/Cargo.toml to X.Y.Z (or X.Y.Z-rc.N), run
+#      `cargo update -p openbox-verdict-middleware` in middleware/ so Cargo.lock
+#      follows, and merge.
+#   2. git tag vX.Y.Z <merge commit> && git push origin vX.Y.Z
+#
+# A tag publishes
+#   image  ghcr.io/openbox-ai/openbox-openshell:X.Y.Z   linux/amd64 + linux/arm64,
+#          with SBOM and provenance attestations, signed with cosign (keyless)
+#   chart  oci://ghcr.io/openbox-ai/charts/openbox-openshell --version X.Y.Z, signed
+#   a GitHub Release, marked as a prerelease for X.Y.Z-rc.N
+# X.Y follows the newest stable patch; latest follows the newest stable release.
+#
+# On a pull request that touches what a release ships, and on a manual run, the
+# same jobs run as a dry run: both images are built and smoke-tested, the chart
+# is linted and packaged, and nothing is pushed.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/release.yml
+      - middleware/**
+      - deploy/helm/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  IMAGE: ghcr.io/openbox-ai/openbox-openshell
+  CHART_REPO: ghcr.io/openbox-ai/charts
+  CHART_DIR: deploy/helm/openbox-openshell
+  PUBLISH: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  versions:
+    name: Versions
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      latest: ${{ steps.v.outputs.latest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          chart=$(sed -n 's/^version: *//p' "$CHART_DIR/Chart.yaml")
+          app=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/p' "$CHART_DIR/Chart.yaml")
+          crate=$(sed -n '0,/^version = /s/^version = "\(.*\)"/\1/p' middleware/Cargo.toml)
+          echo "chart=$chart appVersion=$app crate=$crate"
+          if [ "$chart" != "$app" ] || [ "$chart" != "$crate" ]; then
+            echo "::error::Chart.yaml version/appVersion and Cargo.toml version differ"
+            exit 1
+          fi
+          version=$chart
+          if [ "$PUBLISH" = true ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$version" ]; then
+              echo "::error::tag v$tag does not match the version in Chart.yaml and Cargo.toml ($version)"
+              exit 1
+            fi
+          fi
+          case "$version" in *-*) pre=true ;; *) pre=false ;; esac
+          newest=$(git tag -l 'v*.*.*' | grep -v -- - | sed 's/^v//' | sort -V | tail -1)
+          latest=false
+          if [ "$pre" = false ] && [ "$version" = "$newest" ]; then latest=true; fi
+          echo "version=$version prerelease=$pre latest=$latest"
+          { echo "version=$version"; echo "prerelease=$pre"; echo "latest=$latest"; } >> "$GITHUB_OUTPUT"
+
+  image:
+    name: Image (${{ matrix.platform }})
+    needs: versions
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - if: env.PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # Publish: push by digest; the manifest job tags the multi-arch index.
+          # Dry run: load into the runner's Docker for the smoke test.
+          outputs: ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || format('type=docker,name={0}:dry-run', env.IMAGE) }}
+          provenance: ${{ env.PUBLISH == 'true' && 'mode=max' || 'false' }}
+          sbom: ${{ env.PUBLISH == 'true' }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+      - name: Smoke test both binaries
+        env:
+          REF: ${{ env.PUBLISH == 'true' && format('{0}@{1}', env.IMAGE, steps.build.outputs.digest) || format('{0}:dry-run', env.IMAGE) }}
+        run: |
+          # Unconfigured, each binary must refuse to start and name what is
+          # missing. A stub or a broken binary says nothing.
+          if [ "$PUBLISH" = true ]; then docker pull -q "$REF"; fi
+          dg=$(docker run --rm "$REF" 2>&1 || true)
+          fd=$(docker run --rm --entrypoint openbox-governance-interceptor "$REF" 2>&1 || true)
+          printf 'door guard: %s\nfront desk: %s\n' "$dg" "$fd"
+          grep -q 'OPENBOX_URL is required' <<<"$dg"
+          grep -q 'is required' <<<"$fd"
+          test "$(docker image inspect "$REF" --format '{{.Config.User}}')" = 65532:65532
+      - if: env.PUBLISH == 'true'
+        run: |
+          mkdir -p digests
+          d="${{ steps.build.outputs.digest }}"
+          touch "digests/${d#sha256:}"
+      - if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.runner }}
+          path: digests/*
+          retention-days: 1
+
+  manifest:
+    name: Image manifest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [versions, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless cosign signing
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Tag and sign the multi-arch image
+        working-directory: digests
+        env:
+          VERSION: ${{ needs.versions.outputs.version }}
+          PRERELEASE: ${{ needs.versions.outputs.prerelease }}
+          LATEST: ${{ needs.versions.outputs.latest }}
+        run: |
+          tags=(-t "$IMAGE:$VERSION")
+          if [ "$PRERELEASE" = false ]; then tags+=(-t "$IMAGE:${VERSION%.*}"); fi
+          if [ "$LATEST" = true ]; then tags+=(-t "$IMAGE:latest"); fi
+          sources=()
+          for d in *; do sources+=("$IMAGE@sha256:$d"); done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          cosign sign --yes "$IMAGE@$digest"
+          echo "Signed $IMAGE:$VERSION ($digest), tags: ${tags[*]}" >> "$GITHUB_STEP_SUMMARY"
+
+  chart:
+    name: Chart
+    needs: [versions, manifest]
+    # On a tag, only after the image is published. On a dry run the manifest
+    # job is skipped, and the chart is still linted and packaged.
+    if: >-
+      always() && needs.versions.result == 'success' &&
+      (needs.manifest.result == 'success' ||
+       (needs.manifest.result == 'skipped' && !startsWith(github.ref, 'refs/tags/')))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - run: helm lint "$CHART_DIR" -f "$CHART_DIR/ci/test-values.yaml"
+      - run: helm package "$CHART_DIR" -d dist
+      - if: env.PUBLISH == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Push and sign the chart
+        if: env.PUBLISH == 'true'
+        env:
+          VERSION: ${{ needs.versions.outputs.version }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$TOKEN" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
+          out=$(helm push "dist/openbox-openshell-$VERSION.tgz" "oci://$CHART_REPO" 2>&1)
+          echo "$out"
+          digest=$(echo "$out" | sed -n 's/^Digest: //p')
+          cosign sign --yes "$CHART_REPO/openbox-openshell@$digest"
+          echo "Signed chart $CHART_REPO/openbox-openshell:$VERSION ($digest)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: chart
+          path: dist/*.tgz
+
+  release:
+    name: GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [versions, chart]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: chart
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.versions.outputs.version }}
+          PRERELEASE: ${{ needs.versions.outputs.prerelease }}
+        run: |
+          id='^https://github.com/OpenBox-AI/openbox-openshell/\.github/workflows/release\.yml@refs/tags/v'
+          cat > notes.md <<EOF
+          ## Install
+
+          \`\`\`sh
+          helm install openbox oci://$CHART_REPO/openbox-openshell --version $VERSION \\
+            -n openbox -f openbox-values.yaml --set-file gateway.publicKey=<public_key_path>
+          \`\`\`
+
+          Image: \`$IMAGE:$VERSION\` (linux/amd64, linux/arm64). The README's quick start has the full steps.
+
+          ## Verify
+
+          \`\`\`sh
+          cosign verify $IMAGE:$VERSION \\
+            --certificate-identity-regexp '$id' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          cosign verify $CHART_REPO/openbox-openshell:$VERSION \\
+            --certificate-identity-regexp '$id' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          \`\`\`
+          EOF
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" dist/*.tgz "${flags[@]}" \
+            -R "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md --generate-notes --verify-tag

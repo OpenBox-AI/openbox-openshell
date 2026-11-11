@@ -2,7 +2,7 @@
        are unsafe, before anything reaches the cluster. */ -}}
 {{- $v := .Values -}}
 {{- if not $v.image.repository -}}
-{{- fail "image.repository is required: build the image from middleware/ and push it to your registry" -}}
+{{- fail "image.repository is required: leave it unset for ghcr.io/openbox-ai/openbox-openshell, or name the registry holding your own build" -}}
 {{- end -}}
 {{- if not $v.openbox.url -}}
 {{- fail "openbox.url (OPENBOX_URL) is required" -}}
