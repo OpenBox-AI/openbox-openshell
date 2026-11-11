@@ -1,6 +1,6 @@
 //! Small shared state the door guard and the front desk keep between calls.
 //!
-//! Three kinds of entry, all short and non-secret:
+//! Five kinds of entry, all short and non-secret:
 //!
 //! - **Approvals**: `sandbox + action fingerprint → activity id`, written when
 //!   Core requires approval, so the identical retry (on any replica) asks Core
