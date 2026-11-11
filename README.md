@@ -262,3 +262,7 @@ cd middleware
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
