@@ -79,7 +79,7 @@ ID=$(os sandbox get "$BOX" -o json |
 # A request still waiting on a verdict when the sandbox's first settings poll
 # reloads its policy is dropped; let it settle first.
 i=0
-until os logs "$BOX" --source sandbox 2>/dev/null | grep -q 'Settings poll'; do
+until os logs "$BOX" --source sandbox 2>/dev/null | grep -qE 'Settings poll|Acknowledged initial policy revision'; do
   i=$((i + 1)); [ $i -le 30 ] || break; sleep 1
 done
 

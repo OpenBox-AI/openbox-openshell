@@ -139,7 +139,7 @@ done
 echo "== Sandbox $BOX"
 os sandbox create --name "$BOX" --policy "$DIR/policy.yaml" --detach --no-tty --no-auto-providers >/dev/null
 i=0
-until os logs "$BOX" --source sandbox 2>/dev/null | grep -q 'Settings poll'; do
+until os logs "$BOX" --source sandbox 2>/dev/null | grep -qE 'Settings poll|Acknowledged initial policy revision'; do
   i=$((i + 1)); [ $i -le 90 ] || { echo "sandbox did not come up" >&2; exit 1; }
   sleep 2
 done

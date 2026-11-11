@@ -99,7 +99,7 @@ else
   fail "1 the sandbox's effective policy keeps profile: $PROFILE on the OpenBox attachment"
 fi
 i=0
-until os logs "$BOX" --source sandbox 2>/dev/null | grep -q 'Settings poll'; do
+until os logs "$BOX" --source sandbox 2>/dev/null | grep -qE 'Settings poll|Acknowledged initial policy revision'; do
   i=$((i + 1)); [ $i -le 30 ] || break; sleep 1
 done
 
