@@ -40,7 +40,8 @@ FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57
 LABEL org.opencontainers.image.source="https://github.com/OpenBox-AI/openbox-openshell" \
       org.opencontainers.image.title="openbox-openshell" \
       org.opencontainers.image.description="OpenBox governance for NVIDIA OpenShell: the door guard and the front desk" \
-      org.opencontainers.image.vendor="OpenBox"
+      org.opencontainers.image.vendor="OpenBox" \
+      org.opencontainers.image.licenses="MIT"
 COPY --from=build /out/ /usr/local/bin/
 USER 65532:65532
 EXPOSE 50051 50061 50062 9464
