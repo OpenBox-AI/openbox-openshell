@@ -2032,8 +2032,12 @@ pub(crate) mod tests {
     }
 
     /// Waits for the background Core calls to record `closed` activities.
+    /// Returns as soon as they are there; the deadline only bounds a failure,
+    /// and is wide enough for a fake Core that takes hundreds of milliseconds
+    /// per call on a busy CI runner.
     async fn settle(core: &FakeCore, closed: usize) {
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
             if core.closed.lock().unwrap().len() >= closed {
                 return;
             }
