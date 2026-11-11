@@ -644,10 +644,8 @@ mod tests {
         let github = json!({"profile": {"id": "github", "endpoints": [
             {"host": "api.github.com", "port": 443, "protocol": "rest"}
         ]}});
-        let refused = validate_import_provider_profiles(
-            &json!({"profiles": [github, copilot]}),
-        )
-        .unwrap_err();
+        let refused =
+            validate_import_provider_profiles(&json!({"profiles": [github, copilot]})).unwrap_err();
         assert!(
             refused.0.contains("telemetry.enterprise.githubcopilot.com"),
             "{refused:?}"
