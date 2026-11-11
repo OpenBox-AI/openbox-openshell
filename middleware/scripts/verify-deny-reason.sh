@@ -6,7 +6,7 @@
 #
 # agent.env is the dashboard's snippet for an agent with a workload identity
 # (see openbox-openshell.sh). Runs against the OpenBox Core it names, with a
-# real OpenShell v0.1.2 gateway and sandbox brought up by openbox-openshell.sh:
+# real OpenShell v0.1.8 gateway and sandbox brought up by openbox-openshell.sh:
 #
 #   1  a request the agent's Core allows: decision=allow, no reason=
 #   2  the door guard restarted with an API key Core does not know, so Core

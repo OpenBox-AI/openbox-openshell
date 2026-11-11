@@ -1,6 +1,6 @@
 # Install OpenBox for OpenShell
 
-This guide adds OpenBox governance to an OpenShell v0.1.2 gateway you already
+This guide adds OpenBox governance to an OpenShell v0.1.8 gateway you already
 run. When it is done, every sandbox the gateway creates sends its HTTP traffic
 through an OpenBox verdict, and nobody can turn that off from the sandbox
 policy.
@@ -19,7 +19,7 @@ It starts everything on one machine without TLS.
 
 You need:
 
-- An OpenShell v0.1.2 gateway with extension tokens on. That is the
+- An OpenShell v0.1.8 gateway with extension tokens on. That is the
   `[openshell.gateway.gateway_jwt]` section of the gateway TOML. Note its
   `gateway_id` and the PEM file at `public_key_path`. Both services check
   every call against them.
@@ -333,7 +333,7 @@ rotated daily, three files kept). Ship those with your log agent.
 Ship the pod logs.
 
 Join the two on the sandbox id and time. We planned to key this on
-`request_id`, but OpenShell v0.1.2 does not put the request id in its OCSF
+`request_id`, but OpenShell v0.1.8 does not put the request id in its OCSF
 events: each event's `metadata.uid` is its own random id. OCSF's
 `container.uid` names the sandbox. Until OpenShell carries the request id,
 `request_id` joins the door guard's log with OpenBox Core, not with OCSF.
