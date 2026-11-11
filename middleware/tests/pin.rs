@@ -1,24 +1,39 @@
-//! The middleware and the sandbox service must speak the same `OpenShell`
-//! contract, so both crates pin the same upstream revision.
+//! Both services speak the `OpenShell` contract of one upstream revision. The
+//! manifest pins it, and the lockfile must resolve every `OpenShell` crate at
+//! that same revision, so a stale lockfile cannot change the contract quietly.
 
-fn openshell_revs(manifest: &str) -> Vec<String> {
+const OPENSHELL_GIT: &str = "github.com/NVIDIA/OpenShell.git";
+
+fn manifest_revs(manifest: &str) -> Vec<String> {
     manifest
         .lines()
-        .filter(|line| line.contains("github.com/NVIDIA/OpenShell.git"))
+        .filter(|line| line.contains(OPENSHELL_GIT))
         .filter_map(|line| line.split("rev = \"").nth(1))
         .filter_map(|rest| rest.split('"').next())
         .map(str::to_owned)
         .collect()
 }
 
+fn lock_revs(lock: &str) -> Vec<String> {
+    lock.lines()
+        .filter(|line| line.starts_with("source = ") && line.contains(OPENSHELL_GIT))
+        .filter_map(|line| line.split('#').nth(1))
+        .filter_map(|rest| rest.split('"').next())
+        .map(str::to_owned)
+        .collect()
+}
+
 #[test]
-fn openshell_pin_matches_the_sandbox_service() {
+fn openshell_pin_is_one_revision_and_locked() {
     let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let ours = openshell_revs(&std::fs::read_to_string(here.join("Cargo.toml")).unwrap());
-    let root = openshell_revs(&std::fs::read_to_string(here.join("../Cargo.toml")).unwrap());
-    assert!(!ours.is_empty() && !root.is_empty());
+    let read = |name: &str| std::fs::read_to_string(here.join(name)).unwrap();
+    let pinned = manifest_revs(&read("Cargo.toml"));
+    let locked = lock_revs(&read("Cargo.lock"));
+
+    assert!(!pinned.is_empty(), "no OpenShell dependency in Cargo.toml");
+    assert!(!locked.is_empty(), "no OpenShell crate in Cargo.lock");
     assert!(
-        ours.iter().chain(&root).all(|rev| rev == &root[0]),
-        "{ours:?} vs {root:?}"
+        pinned.iter().chain(&locked).all(|rev| rev == &pinned[0]),
+        "Cargo.toml pins {pinned:?}, Cargo.lock resolves {locked:?}"
     );
 }
