@@ -415,3 +415,7 @@ cargo test --locked
 To build the image yourself, run `docker build -t openbox-openshell .` from
 the repository root, push it to your registry, and install the chart with
 `--set image.repository=<registry>/openbox-openshell --set image.tag=<tag>`.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
