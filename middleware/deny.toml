@@ -12,7 +12,8 @@ ignore = [
 [licenses]
 version = 2
 confidence-threshold = 0.8
-# Keep the explicit allow list stable for this private runtime workspace.
+# Third-party licences we accept: all permissive and compatible with this
+# crate's MIT licence. Keep the list explicit.
 unused-allowed-license = "allow"
 allow = [
   "Apache-2.0",
@@ -26,8 +27,9 @@ allow = [
 exceptions = []
 
 [licenses.private]
-# Workspace crates are proprietary and explicitly non-publishable. Third-party
-# dependencies remain subject to the allow list above.
+# Our own crate is MIT and not published to crates.io (publish = false), so it
+# is not checked against the list. Third-party dependencies remain subject to
+# the allow list above.
 ignore = true
 
 [bans]
