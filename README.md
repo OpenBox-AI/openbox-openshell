@@ -14,6 +14,127 @@ images, your agents or the `openshell` commands you run.
 
 Built for OpenShell v0.1.2.
 
+## Quick start
+
+Install the published Helm chart next to your gateway. You do not need to
+clone this repository or build anything.
+
+**You need**
+
+- An OpenShell v0.1.2 gateway on Kubernetes, with extension tokens on (the
+  `[openshell.gateway.gateway_jwt]` section of its TOML). Note its
+  `gateway_id` and the PEM file at `public_key_path`.
+- An agent in the OpenBox dashboard with a workload identity. The dashboard
+  gives you `OPENBOX_API_URL`, `OPENBOX_API_KEY` and
+  `OPENBOX_WORKLOAD_PRIVATE_KEY`.
+- [cert-manager](https://cert-manager.io) in the cluster, to issue the two
+  services' TLS certificates. Already have certificates? See
+  [Bring your own certificates](docs/install.md#2-issue-the-server-certificates).
+- A Redis every replica can reach. For a first look, the chart can run one
+  (`redis.enabled: true` below).
+- Helm 3.8 or later.
+
+**1. Store the agent's credentials.** Save the dashboard's private key as
+`workload.pem`, ask Core for the key's `kid`, and put the three values in a
+Secret:
+
+```sh
+curl -fsS -H "Authorization: Bearer $OPENBOX_API_KEY" \
+  "$OPENBOX_API_URL/api/v3/auth/bootstrap"        # prints "kid": "..."
+
+kubectl create namespace openbox
+kubectl -n openbox create secret generic openbox-agent \
+  --from-literal=api-key="$OPENBOX_API_KEY" \
+  --from-file=workload.pem=workload.pem \
+  --from-literal=workload-kid=<kid>
+```
+
+**2. Create a CA for OpenBox.** The gateway and the sandbox supervisors check
+both services' certificates against a CA you name in the gateway's TOML. This
+makes a dedicated one with cert-manager and saves its certificate as
+`openbox-ca.pem`:
+
+```sh
+kubectl -n openbox apply -f - <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: {name: openbox-selfsigned}
+spec: {selfSigned: {}}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: openbox-ca}
+spec:
+  isCA: true
+  commonName: OpenBox for OpenShell CA
+  secretName: openbox-ca
+  duration: 87600h
+  privateKey: {algorithm: ECDSA, size: 256}
+  issuerRef: {name: openbox-selfsigned, kind: Issuer}
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: {name: openbox-ca}
+spec: {ca: {secretName: openbox-ca}}
+EOF
+
+kubectl -n openbox wait --for=condition=Ready certificate/openbox-ca
+kubectl -n openbox get secret openbox-ca -o jsonpath='{.data.ca\.crt}' \
+  | base64 -d > openbox-ca.pem
+```
+
+**3. Install the chart.** Save this as `openbox-values.yaml`:
+
+```yaml
+openbox:
+  url: https://<OpenBox Core URL>
+  backendUrl: https://<OpenBox backend URL>   # AI Inventory
+credentials:
+  existingSecret: openbox-agent
+gateway:
+  id: <gateway_id>
+tls:
+  certManager:
+    enabled: true
+    issuerRef: {name: openbox-ca}
+redis:
+  enabled: true        # evaluation only; use externalRedis.url in production
+```
+
+```sh
+helm install openbox oci://ghcr.io/openbox-ai/charts/openbox-openshell \
+  --version 0.1.0 -n openbox -f openbox-values.yaml \
+  --set-file gateway.publicKey=<public_key_path>
+
+kubectl -n openbox wait --for=condition=Available deploy --all --timeout=3m
+```
+
+The chart refuses a configuration the services would refuse at startup, and
+tells you which value is missing. `helm show values
+oci://ghcr.io/openbox-ai/charts/openbox-openshell` lists every value.
+
+**4. Register OpenBox with the gateway.** `helm install` prints three TOML
+blocks with your Service names filled in. Add them to the gateway's TOML, set
+each `tls_ca_cert_path` to where the gateway can read `openbox-ca.pem`, and
+restart the gateway. OpenBox must be running first: the gateway does not start
+while a registered service is unreachable.
+
+**5. Create a sandbox as usual, and check it is governed.**
+
+```sh
+openshell sandbox create --name check --policy policy.yaml
+openshell policy get check --full | grep 'middleware: openbox'
+```
+
+Requests from the sandbox now get an OpenBox verdict, and the sandbox shows up
+as a session on the agent in the OpenBox dashboard. Write your policies,
+guardrails and behaviour rules on that agent; they apply to all its sandboxes.
+
+**Next:** `docs/install.md` covers the gateway API client certificate (needed
+to stop a halted sandbox), bringing your own certificates, the VM compute
+driver, and SIEM forwarding. `docs/agent-approvals.md` is the guide to give agent authors.
+No Kubernetes? See [Try it on one machine](#try-it-on-one-machine).
+
 ## What you get
 
 - **A verdict on every outbound request.** Before a request leaves a sandbox,
@@ -30,23 +151,7 @@ Built for OpenShell v0.1.2.
 - **Fail closed.** If OpenBox cannot give a verdict in time, the request is
   denied with an explicit reason, never silently allowed.
 
-## How it works for you
-
-1. **Create an agent in OpenBox.** In the OpenBox dashboard, create an agent
-   with a workload identity. The dashboard gives you its credentials.
-2. **Deploy two services next to your gateway.** Install the Helm chart in
-   `deploy/helm/openbox-openshell/` with those credentials.
-3. **Register them with your gateway.** Add the block the chart prints to your
-   gateway's TOML and restart the gateway.
-4. **Create sandboxes as usual.** `openshell sandbox create ...` works as it
-   did. Each new sandbox is governed from its first request.
-5. **Write your rules in OpenBox.** Policies, guardrails and behaviour rules
-   you set on the agent apply to all its sandboxes. Approvals appear in the
-   dashboard for a person to decide.
-
-`docs/install.md` walks through each step.
-
-### What an agent in a sandbox sees
+## What an agent in a sandbox sees
 
 | OpenBox decides | The request | The agent sees |
 |---|---|---|
@@ -230,7 +335,9 @@ Put internal systems behind HTTP or MCP to govern them per request.
 | Path | What |
 |---|---|
 | `middleware/` | Both services (one Rust crate), tests and examples |
+| `Dockerfile` | The image: both services, distroless, UID 65532 |
 | `deploy/helm/openbox-openshell/` | Helm chart for both services |
+| `.github/workflows/` | CI, and the release that publishes the image and chart |
 | `docs/install.md` | Install on your OpenShell gateway |
 | `docs/runbook.md` | Metrics, alerts, slow verdicts, break-glass |
 | `docs/agent-approvals.md` | Approvals, for agent authors |
@@ -255,10 +362,56 @@ Set `OPENSHELL_PREFIX` to the directory holding `bin/openshell`,
 `bin/openshell-gateway` and `libexec/openshell-driver-vm`. This setup is for
 development only: it runs without TLS between the gateway and the services.
 
+## Releases
+
+Each release publishes:
+
+| What | Where |
+|---|---|
+| Image, `linux/amd64` and `linux/arm64` | `ghcr.io/openbox-ai/openbox-openshell:<version>` |
+| Helm chart | `oci://ghcr.io/openbox-ai/charts/openbox-openshell --version <version>` |
+| Notes and the packaged chart | [GitHub Releases](https://github.com/OpenBox-AI/openbox-openshell/releases) |
+
+The chart's version, its `appVersion` and the image tag are always the same,
+so a chart installs the image it was released with. A stable release also
+moves `<major>.<minor>`, and the newest stable release moves `latest`.
+Release candidates (`X.Y.Z-rc.N`) move neither and are marked as prereleases.
+
+The image and the chart are signed with [cosign](https://docs.sigstore.dev)
+by the release workflow, and the image carries an SBOM and build provenance.
+Check a release before you install it:
+
+```sh
+cosign verify ghcr.io/openbox-ai/openbox-openshell:<version> \
+  --certificate-identity-regexp '^https://github.com/OpenBox-AI/openbox-openshell/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The same command with `ghcr.io/openbox-ai/charts/openbox-openshell:<version>`
+checks the chart.
+
+To cut a release:
+
+1. Set `version` and `appVersion` in `deploy/helm/openbox-openshell/Chart.yaml`
+   and `version` in `middleware/Cargo.toml` to the new version, and run
+   `cargo update -p openbox-verdict-middleware` in `middleware/` so
+   `Cargo.lock` follows.
+2. Merge, then push a `v<version>` tag on `main`.
+
+The release workflow refuses a tag that does not match all three. It also runs
+as a dry run on every pull request that touches what a release ships: both
+images are built and smoke-tested, and the chart is packaged, with nothing
+pushed.
+
 ## Build and test
 
 ```sh
 cd middleware
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
+
+To build the image yourself, run `docker build -t openbox-openshell .` from
+the repository root, push it to your registry, and install the chart with
+`--set image.repository=<registry>/openbox-openshell --set image.tag=<tag>`.

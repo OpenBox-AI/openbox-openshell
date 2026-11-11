@@ -7,10 +7,11 @@
 # Every value below maps to an environment variable the binaries read. The
 # variable is named in the comment. docs/install.md walks through an install.
 
-# -- The container image. It must hold both binaries on PATH. We do not
-# publish one yet: build it from middleware/ and push it to your registry.
+# -- The container image, holding both binaries on PATH. Published for
+# linux/amd64 and linux/arm64 with every release. To run your own build, push
+# the repository's Dockerfile to your registry and set repository and tag.
 image:
-  repository: ""
+  repository: ghcr.io/openbox-ai/openbox-openshell
   tag: ""          # defaults to the chart's appVersion
   pullPolicy: IfNotPresent
 imagePullSecrets: []

@@ -1,0 +1,65 @@
+name: CI
+
+# The image is built and smoke-tested for both platforms by release.yml's dry
+# run, on every pull request that touches what a release ships.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: middleware
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Installs the toolchain rust-toolchain.toml names.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: middleware
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  chart:
+    name: Helm chart
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - run: helm lint deploy/helm/openbox-openshell -f deploy/helm/openbox-openshell/ci/test-values.yaml
+      - run: helm template ci deploy/helm/openbox-openshell -f deploy/helm/openbox-openshell/ci/test-values.yaml > /dev/null
+      # The published defaults alone must render once the required values are given.
+      - run: |
+          helm template ci deploy/helm/openbox-openshell \
+            --set openbox.url=https://core.example.com \
+            --set credentials.existingSecret=openbox-agent \
+            --set gateway.id=openshell \
+            --set gateway.publicKey=placeholder \
+            --set tls.doorGuard.existingSecret=dg \
+            --set tls.frontDesk.existingSecret=fd \
+            --set externalRedis.url=redis://redis:6379/0 \
+            | grep -q 'image: "\?ghcr.io/openbox-ai/openbox-openshell:'
+      # The quick start's cert-manager path must render too.
+      - run: |
+          helm template ci deploy/helm/openbox-openshell \
+            --set openbox.url=https://core.example.com \
+            --set credentials.existingSecret=openbox-agent \
+            --set gateway.id=openshell \
+            --set gateway.publicKey=placeholder \
+            --set tls.certManager.enabled=true \
+            --set tls.certManager.issuerRef.name=openbox-ca \
+            --set redis.enabled=true \
+            | grep -q 'kind: Certificate'
