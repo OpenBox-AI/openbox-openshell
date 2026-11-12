@@ -33,6 +33,19 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Advisories, licences, bans and sources, against middleware/deny.toml.
+      # A new RustSec advisory can fail this on a PR that touched nothing:
+      # update the crate, or add a dated, reasoned ignore to deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: middleware/Cargo.toml
+          command: check
+
   chart:
     name: Helm chart
     runs-on: ubuntu-24.04
