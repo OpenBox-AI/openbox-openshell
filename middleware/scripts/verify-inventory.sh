@@ -7,7 +7,7 @@
 #     middleware/scripts/verify-inventory.sh
 #
 # Runs against a real OpenBox stack (backend with PROD-827, Core) and starts
-# its own OpenShell v0.1.2 gateway (VM driver) with its own state, ports and
+# its own OpenShell v0.1.8 gateway (VM driver) with its own state, ports and
 # CLI config. The front desk runs its inventory registration only (post_commit,
 # fail open) and reconciles over the gateway API with the gateway's local
 # client certificate.
@@ -23,7 +23,7 @@
 #   OBX_PSQL                command that runs one SQL query against the
 #                           backend database and prints unaligned rows
 #                           (default: the local stack's Postgres on Colima)
-#   OPENSHELL_PREFIX        OpenShell v0.1.2 install (default ~/openshell-repro)
+#   OPENSHELL_PREFIX        OpenShell v0.1.8 install (default ~/openshell-repro)
 #   OBX_GATEWAY_PORT        default 17790 (+1 health, +2 metrics)
 #   OBX_FD_PORT             default 50171 (+1 inventory)
 #   KEEP=1                  keep the work dir
@@ -125,7 +125,7 @@ for port in "$GW_PORT" $((GW_PORT + 1)) $((GW_PORT + 2)) "$FD_PORT" "$INV_PORT";
   free "$port" || { echo "port $port is in use; set OBX_GATEWAY_PORT / OBX_FD_PORT"; exit 1; }
 done
 [ -x "$PREFIX/bin/openshell-gateway" ] && [ -x "$PREFIX/libexec/openshell-driver-vm" ] ||
-  { echo "set OPENSHELL_PREFIX to an OpenShell v0.1.2 install (see verify-provider-profiles.sh)"; exit 1; }
+  { echo "set OPENSHELL_PREFIX to an OpenShell v0.1.8 install (see verify-provider-profiles.sh)"; exit 1; }
 
 echo "== OpenBox stack"
 curl -fsS -o /dev/null "$BACKEND/health" || { echo "backend not reachable at $BACKEND"; exit 1; }

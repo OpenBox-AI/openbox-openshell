@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 base64 = "0.22"
 # Must stay on the same revision as the root crate; tests/pin.rs enforces it.
-openshell-core = { version = "=0.0.0", git = "https://github.com/NVIDIA/OpenShell.git", rev = "6648bd0c290efbc41ba131ee9831ee45cd431f94", default-features = false }
+openshell-core = { version = "=0.0.0", git = "https://github.com/NVIDIA/OpenShell.git", rev = "f3d976590d3eb1379690a2abaf0f0e26c21d487d", default-features = false }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic", "tls-aws-lc", "tls-roots"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
