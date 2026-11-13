@@ -29,6 +29,7 @@ uses these codes:
 | `openbox_blocked` | OpenBox policy forbids this action. | Do not retry. Choose another approach or report it. |
 | `openbox_halted` | OpenBox halted this sandbox. | Stop. Every later request is denied too. |
 | `openbox_unavailable` | OpenBox gave no verdict (Core unreachable or slower than 29 s). | Retry with backoff. Nothing was approved. |
+| `openbox_response_blocked` | The request went out, but its response carried data the sandbox policy keeps out. | Do not retry: the request already ran. Report it. |
 | `openbox_pending` | OpenBox is still deciding (only when the operator turned on `pending`). | Retry the identical request after a second or two; the verdict is waiting for it. |
 
 If `error` is `middleware_failed` instead, the door guard did not answer at

@@ -1583,6 +1583,32 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         )
     }
 
+    /// Records what a WebSocket message carried in the sandbox's session:
+    /// the kinds found, never the message. Queued in order with the
+    /// sandbox's other events; the message is not held for it.
+    pub fn record_message(
+        &self,
+        sandbox_id: &str,
+        sequence: u64,
+        counts: &std::collections::BTreeMap<String, u64>,
+    ) {
+        let governance = Arc::clone(&self.governance);
+        let args = json!({"findings": counts, "sequence": sequence});
+        let sandbox = sandbox_id.to_owned();
+        let turn = format!("ws-{sequence}-{}", unix_now());
+        self.sequence.push(
+            sandbox_id,
+            telemetry::job("openbox.websocket_findings", vec![telemetry::sandbox(sandbox_id)], async move {
+                if let Err(error) = governance
+                    .signal(&sandbox, "websocket_message", &args, &turn)
+                    .await
+                {
+                    eprintln!("openbox: websocket findings for sandbox_id={sandbox} not recorded: {error}");
+                }
+            }),
+        );
+    }
+
     /// Resumes a halted sandbox (R5.4): clears this replica's halt, tells
     /// the other replicas through the shared store, and asks Core to clear
     /// the halt it holds for the session. The sandbox itself is started
@@ -2254,7 +2280,7 @@ pub(crate) mod tests {
             args: &Value,
             _: &str,
         ) -> Result<CoreDecision, CoreError> {
-            assert_eq!(signal_name, "user_prompt");
+            assert!(matches!(signal_name, "user_prompt" | "websocket_message"));
             self.sent.lock().unwrap().push(args.to_string());
             self.signals.lock().unwrap().push(args.clone());
             let verdict = self
