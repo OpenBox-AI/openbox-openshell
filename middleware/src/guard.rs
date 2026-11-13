@@ -68,6 +68,7 @@ use sha2::Digest as _;
 
 use crate::action::{Action, Payload};
 use crate::agent;
+use crate::capture;
 use crate::core_client::{
     Activity, ApprovalState, Completion, CoreDecision, CoreError, LLM_CALL, Outcome, Verdict,
     activity_name, request_activity_id, request_url, span_ids, started_span, tool_activity_id,
@@ -257,7 +258,12 @@ pub struct Guard<G, S: ?Sized> {
     stopper: Arc<S>,
     store: Arc<dyn SharedStore>,
     approval_ttl: Duration,
+    /// What Core receives of a user prompt, unless a sandbox policy says
+    /// otherwise.
     capture: Capture,
+    /// What Core receives of request and response bodies, tool arguments and
+    /// results, and model replies, unless a sandbox policy says otherwise.
+    body_capture: Capture,
     sessions: Mutex<HashSet<String>>,
     /// Local cache only: Core latches a halted session, so a replica that
     /// missed the halt still gets `halt` for the sandbox's next request.
@@ -291,6 +297,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             store,
             approval_ttl,
             capture: Capture::default(),
+            body_capture: Capture::default(),
             sessions: Mutex::new(HashSet::new()),
             halted: Arc::new(Mutex::new(HashSet::new())),
             sequence: Sequencer::new(SEQUENCED_CALL_TIMEOUT),
@@ -306,11 +313,30 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         self
     }
 
-    /// What Core receives for a user prompt (default: the text).
+    /// What Core receives for a user prompt (default: findings).
     #[must_use]
     pub const fn with_prompt_capture(mut self, capture: Capture) -> Self {
         self.capture = capture;
         self
+    }
+
+    /// What Core receives of bodies, tool arguments and results, and model
+    /// replies (default: findings).
+    #[must_use]
+    pub const fn with_body_capture(mut self, capture: Capture) -> Self {
+        self.body_capture = capture;
+        self
+    }
+
+    /// The capture for a request's content: the sandbox policy's, for its
+    /// host, over the deployment's.
+    fn body_mode(&self, action: &Action) -> Capture {
+        action.capture.mode_for(&action.host, self.body_capture)
+    }
+
+    /// The capture for a model call's prompt, chosen the same way.
+    fn prompt_mode(&self, action: &Action) -> Capture {
+        action.capture.mode_for(&action.host, self.capture)
     }
 
     /// Sends what is still queued for Core, up to `limit`, before the
@@ -432,7 +458,13 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         // The span and the activity's duration start here, before Core is
         // asked, so both include the time spent waiting for the verdict.
         let started = SystemTime::now();
-        let span = started_span(action, &activity.id, self.governance.body_limit(), started);
+        let span = started_span(
+            action,
+            &activity.id,
+            self.governance.body_limit(),
+            self.body_mode(action),
+            started,
+        );
         let decision = match self
             .timed(
                 CoreCall::Evaluate,
@@ -480,6 +512,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 "api": model.as_ref().map(|model| model.api.name()),
                 "span": span,
                 "started_ms": millis(started),
+                "capture": self.body_mode(action).name(),
             });
             if let Err(error) = self
                 .store
@@ -597,7 +630,8 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     /// Signals a model call's new user prompt. `Some` denies the call because
     /// Core did not allow the prompt.
     async fn signal_prompt(&self, action: &Action) -> Option<HttpRequestResult> {
-        if self.capture == Capture::Off {
+        let capture = self.prompt_mode(action);
+        if capture == Capture::Off {
             return None;
         }
         let prompt = prompt::extract(action)?;
@@ -608,7 +642,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             // Core's idempotency key still keeps a resent turn to one signal.
             Err(error) => eprintln!("openbox: prompt lookup unavailable: {error}"),
         }
-        let args = prompt::signal_args(&prompt, self.capture, MAX_PROMPT_BYTES);
+        let args = prompt::signal_args(&prompt, capture, MAX_PROMPT_BYTES);
         match self
             .timed(
                 CoreCall::Signal,
@@ -667,13 +701,20 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             .and_then(Value::as_u64)
             .map(|started| unix_millis().saturating_sub(started));
         let limit = self.governance.body_limit();
+        // The response is captured as its request was: the sandbox policy's
+        // choice went with the request record.
+        let capture = record
+            .get("capture")
+            .and_then(Value::as_str)
+            .and_then(Capture::parse)
+            .unwrap_or(self.body_capture);
         let reply = record
             .get("api")
             .and_then(Value::as_str)
             .and_then(agent::Api::parse)
             .zip(response.body.as_deref())
             .and_then(|(api, body)| agent::parse_reply(api, body));
-        let outcome = outcome(&response, reply.as_ref(), duration_ms, limit);
+        let outcome = outcome(&response, reply.as_ref(), duration_ms, limit, capture);
         let completion = Completion {
             sandbox_id: response.sandbox_id.clone(),
             request_id: response.request_id.clone(),
@@ -692,11 +733,11 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             response_body: response
                 .body
                 .as_deref()
-                .map(|body| truncate(&String::from_utf8_lossy(body), limit)),
+                .map_or(Value::Null, |body| capture::span_body(body, capture, limit)),
         };
         let mut tools = Vec::new();
         for call in reply.iter().flat_map(|reply| &reply.tool_calls) {
-            let tool = tool_activity(call, limit, completion.activity.profile.clone());
+            let tool = tool_activity(call, limit, capture, completion.activity.profile.clone());
             self.track_tool(&response.sandbox_id, &call.id, &tool).await;
             tools.push((call.id.clone(), tool));
         }
@@ -802,9 +843,14 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         if let Payload::JsonRpc(calls) = &action.payload
             && let Some(call) = calls.iter().find(|call| call.tool.is_some())
         {
+            let arguments = call.arguments.clone().unwrap_or_else(|| json!({}));
             return own(
                 activity_name(action),
-                json!([call.arguments.clone().unwrap_or_else(|| json!({}))]),
+                json!([capture::value(
+                    &arguments,
+                    self.body_mode(action),
+                    self.governance.body_limit()
+                )]),
             );
         }
         if let Some((tool, opened)) = self.open_tool(&action.sandbox_id).await {
@@ -823,11 +869,16 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     /// The `llm_call` input: the user's newest prompt, as captured.
     fn prompt_input(&self, action: &Action) -> Value {
         let text = prompt::latest_text(action).unwrap_or_default();
-        match self.capture {
+        match self.prompt_mode(action) {
             Capture::Text => json!({"prompt": truncate(&text, MAX_PROMPT_BYTES)}),
             Capture::Hash => json!({
                 "prompt_sha256": hex(&sha2::Sha256::digest(text.as_bytes())),
                 "chars": text.chars().count(),
+            }),
+            Capture::Findings => json!({
+                "prompt_sha256": hex(&sha2::Sha256::digest(text.as_bytes())),
+                "chars": text.chars().count(),
+                "findings": capture::findings(&text),
             }),
             Capture::Off => json!({}),
         }
@@ -904,6 +955,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     async fn close_tools(&self, action: &Action, model: &agent::ModelCall) {
         let sandbox_id = action.sandbox_id.as_str();
         let limit = self.governance.body_limit();
+        let capture = self.body_mode(action);
         let mut closing = Vec::new();
         for result in &model.tool_results {
             let key = tool_key(sandbox_id, &result.id);
@@ -934,7 +986,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                         continue;
                     };
                     (
-                        tool_activity(call, limit, action.profile.clone()),
+                        tool_activity(call, limit, capture, action.profile.clone()),
                         None,
                         false,
                     )
@@ -948,13 +1000,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             {
                 eprintln!("openbox: tool {} not marked closed: {error}", result.id);
             }
-            let outcome = Outcome {
-                output: Some(bounded(&result.output, limit)),
-                error: result.is_error.then(|| {
-                    json!({"type": "ToolError", "message": truncate(&text_of(&result.output), MAX_REASON_BYTES)})
-                }),
-                duration_ms: started_ms.map(|started| unix_millis().saturating_sub(started)),
-            };
+            let outcome = tool_outcome(result, started_ms, limit, capture);
             closing.push((result.id.clone(), tool, opened, outcome));
         }
         if closing.is_empty() {
@@ -1124,11 +1170,16 @@ pub(crate) fn activity_from(value: &Value) -> Option<Activity> {
 
 /// A tool the model asked for, as the agent SDK reports a tool: named by the
 /// tool, its arguments as input, in the profile of the model call.
-fn tool_activity(call: &agent::ToolCall, limit: usize, profile: Option<String>) -> Activity {
+fn tool_activity(
+    call: &agent::ToolCall,
+    limit: usize,
+    capture: Capture,
+    profile: Option<String>,
+) -> Activity {
     Activity {
         id: tool_activity_id(&call.id),
         kind: call.name.clone(),
-        input: json!([bounded(&call.input, limit)]),
+        input: json!([capture::value(&call.input, capture, limit)]),
         profile,
     }
 }
@@ -1175,7 +1226,7 @@ async fn mark_tool(store: &dyn SharedStore, sandbox_id: &str, call_id: &str, sta
 
 /// The output of a request that is its own activity: the JSON-RPC result of
 /// an MCP call, otherwise the response's status.
-fn response_output(response: &ResponseSeen, limit: usize) -> Value {
+fn response_output(response: &ResponseSeen, limit: usize, capture: Capture) -> Value {
     response
         .body
         .as_deref()
@@ -1183,8 +1234,42 @@ fn response_output(response: &ResponseSeen, limit: usize) -> Value {
         .and_then(|body| body.get("result").cloned())
         .map_or_else(
             || json!({"status_code": response.status_code, "method": response.method, "url": response.url}),
-            |result| bounded(&result, limit),
+            |result| capture::value(&result, capture, limit),
         )
+}
+
+/// How a tool ended, from the result the agent sent back to its model.
+fn tool_outcome(
+    result: &agent::ToolResult,
+    started_ms: Option<u64>,
+    limit: usize,
+    capture: Capture,
+) -> Outcome {
+    Outcome {
+        output: Some(capture::value(&result.output, capture, limit)),
+        error: result.is_error.then(|| {
+            // The error text is the tool's output: content.
+            let message = if capture == Capture::Text {
+                truncate(&text_of(&result.output), MAX_REASON_BYTES)
+            } else {
+                "tool reported an error".to_owned()
+            };
+            json!({"type": "ToolError", "message": message})
+        }),
+        duration_ms: started_ms.map(|started| unix_millis().saturating_sub(started)),
+    }
+}
+
+/// A model call's `llm_call` output: its metadata as is, its completion
+/// text as captured.
+fn reply_output(reply: &agent::Reply, limit: usize, capture: Capture) -> Value {
+    let mut output = reply.output();
+    if let Some(completion) = &reply.completion
+        && capture != Capture::Text
+    {
+        output["completion"] = capture::text(completion, capture, limit);
+    }
+    output
 }
 
 /// How a response's own activity ended: a model call's reply, an MCP
@@ -1194,9 +1279,13 @@ fn outcome(
     reply: Option<&agent::Reply>,
     duration_ms: Option<u64>,
     limit: usize,
+    capture: Capture,
 ) -> Outcome {
     Outcome {
-        output: Some(reply.map_or_else(|| response_output(response, limit), agent::Reply::output)),
+        output: Some(reply.map_or_else(
+            || response_output(response, limit, capture),
+            |reply| reply_output(reply, limit, capture),
+        )),
         error: (response.status_code >= 400).then(
             || json!({"type": "HTTPError", "message": format!("HTTP {}", response.status_code)}),
         ),
@@ -1241,16 +1330,6 @@ fn fallback_span(response: &ResponseSeen, activity_id: &str) -> Value {
         "request_headers": null,
         "request_body": null,
     })
-}
-
-/// A value as is when it fits `limit` serialized, otherwise its text cut to
-/// `limit`.
-fn bounded(value: &Value, limit: usize) -> Value {
-    let text = value.to_string();
-    if text.len() <= limit {
-        return value.clone();
-    }
-    Value::String(truncate(&text_of(value), limit))
 }
 
 fn text_of(value: &Value) -> String {
@@ -1411,6 +1490,9 @@ pub(crate) mod tests {
         /// Verdicts for prompt signals, in order; allow when empty.
         pub prompt_verdicts: Mutex<VecDeque<Verdict>>,
         pub signals: Mutex<Vec<Value>>,
+        /// Everything each call carried that could hold content, as Core
+        /// would receive it: activities, spans, outcomes, signal arguments.
+        pub sent: Mutex<Vec<String>>,
     }
 
     fn decision(verdict: Verdict) -> CoreDecision {
@@ -1460,6 +1542,7 @@ pub(crate) mod tests {
             activity: &Activity,
         ) -> Result<CoreDecision, CoreError> {
             tokio::time::sleep(self.delay).await;
+            self.sent.lock().unwrap().push(format!("{activity:?}"));
             self.opened.lock().unwrap().push(activity.id.clone());
             self.calls
                 .lock()
@@ -1472,9 +1555,13 @@ pub(crate) mod tests {
             _: &Action,
             activity: &Activity,
             open: bool,
-            _: &Value,
+            span: &Value,
         ) -> Result<CoreDecision, CoreError> {
             tokio::time::sleep(self.delay).await;
+            self.sent
+                .lock()
+                .unwrap()
+                .push(format!("{activity:?} {span}"));
             self.evaluate_calls.fetch_add(1, Ordering::SeqCst);
             self.evaluated.lock().unwrap().push(activity.id.clone());
             self.activities
@@ -1526,6 +1613,7 @@ pub(crate) mod tests {
             completion: &Completion,
         ) -> Result<CoreDecision, CoreError> {
             tokio::time::sleep(self.delay).await;
+            self.sent.lock().unwrap().push(format!("{completion:?}"));
             self.completions.lock().unwrap().push(completion.clone());
             self.calls
                 .lock()
@@ -1540,6 +1628,10 @@ pub(crate) mod tests {
             outcome: &Outcome,
         ) -> Result<CoreDecision, CoreError> {
             tokio::time::sleep(self.delay).await;
+            self.sent
+                .lock()
+                .unwrap()
+                .push(format!("{activity:?} {outcome:?}"));
             self.calls
                 .lock()
                 .unwrap()
@@ -1558,6 +1650,7 @@ pub(crate) mod tests {
             _: &str,
         ) -> Result<CoreDecision, CoreError> {
             assert_eq!(signal_name, "user_prompt");
+            self.sent.lock().unwrap().push(args.to_string());
             self.signals.lock().unwrap().push(args.clone());
             let verdict = self
                 .prompt_verdicts
@@ -1957,7 +2050,14 @@ pub(crate) mod tests {
         assert_eq!(first.activity.kind, "pay");
         assert_eq!(first.span["stage"], "started");
         assert_eq!(first.span["activity_id"], "oshx-req-1");
-        assert!(first.response_body.as_deref().unwrap().contains("paid"));
+        // By default Core gets the response's digest and findings, not its
+        // bytes.
+        let body: Value = serde_json::from_str(first.response_body.as_str().unwrap()).unwrap();
+        assert!(body["sha256"].is_string());
+        assert_eq!(
+            body["shape"],
+            json!({"jsonrpc": "string", "id": "number", "result": {"paid": "boolean"}})
+        );
         let other = completions
             .iter()
             .find(|c| c.request_id == "req-9")
@@ -1966,8 +2066,11 @@ pub(crate) mod tests {
         assert_eq!(other.activity.kind, "POST mcp.example.com");
         let closed = core.closed.lock().unwrap();
         let (_, paid) = closed.iter().find(|(a, _)| a.id == "oshx-req-1").unwrap();
-        // An MCP call's own activity ends with its JSON-RPC result.
-        assert_eq!(paid.output, Some(json!({"paid": true})));
+        // An MCP call's own activity ends with its JSON-RPC result, captured.
+        assert_eq!(
+            paid.output.as_ref().unwrap()["shape"],
+            json!({"paid": "boolean"})
+        );
         assert!(paid.duration_ms.is_some());
         let (_, failed) = closed.iter().find(|(a, _)| a.id == "oshx-req-9").unwrap();
         assert_eq!(failed.error.as_ref().unwrap()["message"], "HTTP 503");
@@ -2074,6 +2177,107 @@ pub(crate) mod tests {
         }
     }
 
+    /// W4's acceptance test: with the default capture, no raw body, prompt,
+    /// tool argument, tool result or model reply reaches Core, across a whole
+    /// agent session, an MCP call and their responses.
+    #[tokio::test]
+    async fn by_default_no_raw_content_reaches_core() {
+        const SECRET: &str = "S3CRET-MARKER-42";
+        const CARD: &str = "4111 1111 1111 1111";
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow; 4]));
+        let ask = json!([{"role": "user", "content": format!("pay {CARD} and use {SECRET}")}]);
+        guard
+            .evaluate(&model_request("m-1", &ask), ApprovalMode::Queue)
+            .await;
+        let reply = json!({"model": "claude-x", "content": [
+            {"type": "text", "text": format!("I will pay with {SECRET}")},
+            {"type": "tool_use", "id": "toolu_1", "name": "fetch", "input": {"note": SECRET}}
+        ], "usage": {"input_tokens": 10, "output_tokens": 5}});
+        guard
+            .complete(response("m-1", 200, reply.to_string().as_bytes()))
+            .await;
+        settle(&core, 1).await;
+        let mut fetch = evaluation(
+            "POST",
+            "/submit",
+            format!("{{\"secret\":\"{SECRET}\"}}").as_bytes(),
+        );
+        fetch.context.as_mut().unwrap().request_id = "f-1".to_owned();
+        guard
+            .evaluate(&Action::from_evaluation(&fetch), ApprovalMode::Queue)
+            .await;
+        guard
+            .complete(response("f-1", 200, format!("<p>{SECRET}</p>").as_bytes()))
+            .await;
+        let back = json!([
+            {"role": "user", "content": format!("pay {CARD} and use {SECRET}")},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "fetch", "input": {"note": SECRET}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": format!("got {SECRET}"), "is_error": true}]}
+        ]);
+        guard
+            .evaluate(&model_request("m-2", &back), ApprovalMode::Queue)
+            .await;
+        let mut mcp = evaluation(
+            "POST",
+            "/mcp",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "pay", "arguments": {"card": CARD, "memo": SECRET}}})
+            .to_string()
+            .as_bytes(),
+        );
+        mcp.context.as_mut().unwrap().request_id = "p-1".to_owned();
+        guard
+            .evaluate(&Action::from_evaluation(&mcp), ApprovalMode::Queue)
+            .await;
+        guard
+            .complete(response(
+                "p-1",
+                200,
+                json!({"jsonrpc": "2.0", "id": 1, "result": {"receipt": SECRET}})
+                    .to_string()
+                    .as_bytes(),
+            ))
+            .await;
+        settle(&core, 3).await;
+
+        let sent = core.sent.lock().unwrap().join("\n");
+        assert!(sent.len() > 1000, "too little was recorded: {sent}");
+        assert!(!sent.contains(SECRET), "raw content reached Core:\n{sent}");
+        assert!(!sent.contains(CARD), "raw content reached Core:\n{sent}");
+        assert!(!sent.contains("4111"), "raw content reached Core:\n{sent}");
+        // What Core does get: digests, and the kinds of data found.
+        assert!(sent.contains("sha256"));
+        assert!(sent.contains("payment_card"));
+        // Metadata still reaches Core: the model, the tool, the host.
+        assert!(sent.contains("claude-x"));
+        assert!(sent.contains("fetch"));
+        assert!(sent.contains("example.com"));
+    }
+
+    /// A sandbox policy can opt one host in to text, and every other host
+    /// keeps the default.
+    #[tokio::test]
+    async fn a_policy_can_opt_a_host_in_to_text() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow; 2]));
+        let mut action = request("req-1");
+        action.capture = capture::Policy {
+            mode: None,
+            hosts: vec![(action.host.clone(), Capture::Text)],
+        };
+        guard.evaluate(&action, ApprovalMode::Queue).await;
+        let mut other = request("req-2");
+        other.host = "other.example.com".to_owned();
+        guard.evaluate(&other, ApprovalMode::Queue).await;
+        let sent = core.sent.lock().unwrap().clone();
+        assert!(
+            sent[0].contains(r#"\"amount\":10"#) || sent[0].contains(r#""amount":10"#),
+            "{}",
+            sent[0]
+        );
+        assert!(!sent[1].contains("10}"), "{}", sent[1]);
+        assert!(sent[1].contains("sha256"));
+    }
+
     #[tokio::test]
     async fn a_session_follows_the_agent_sdk_pattern() {
         let (guard, core, _) = guard(FakeCore::with_verdicts(&[
@@ -2081,6 +2285,10 @@ pub(crate) mod tests {
             Verdict::Allow,
             Verdict::Allow,
         ]));
+        // This test reads the content itself, so it opts in to text.
+        let guard = guard
+            .with_prompt_capture(Capture::Text)
+            .with_body_capture(Capture::Text);
         // The user's prompt goes to the model: an llm_call activity.
         let ask = json!([{"role": "user", "content": "summarise example.com"}]);
         guard
@@ -2164,10 +2372,7 @@ pub(crate) mod tests {
         let completions = core.completions.lock().unwrap();
         let fetched = completions.iter().find(|c| c.request_id == "f-1").unwrap();
         assert_eq!(fetched.activity.id, "oshx-tool-toolu-1");
-        assert_eq!(
-            fetched.response_body.as_deref(),
-            Some("<html>Example</html>")
-        );
+        assert_eq!(fetched.response_body, json!("<html>Example</html>"));
     }
 
     #[tokio::test]
@@ -2502,6 +2707,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_new_user_prompt_is_signalled_once_before_the_call() {
         let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow; 3]));
+        // This test reads the content itself, so it opts in to text.
+        let guard = guard
+            .with_prompt_capture(Capture::Text)
+            .with_body_capture(Capture::Text);
         let first = [("user", "refactor payments")];
         guard
             .evaluate(&model_call("req-1", &first), ApprovalMode::Queue)

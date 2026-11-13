@@ -216,6 +216,13 @@ fn store_from_env() -> Result<(Arc<dyn SharedStore>, Duration), String> {
     Ok((store, approval_ttl))
 }
 
+/// A capture mode from the environment; findings when unset.
+fn capture_from(name: &str) -> Result<Capture, String> {
+    env(name).map_or(Ok(Capture::Findings), |value| {
+        Capture::parse(&value).ok_or_else(|| format!("{name} must be off, hash, findings or text"))
+    })
+}
+
 async fn run() -> Result<(), String> {
     let insecure = env("OPENBOX_MW_INSECURE").as_deref() == Some("1");
     let listen: SocketAddr = env("OPENBOX_MW_LISTEN")
@@ -266,14 +273,13 @@ async fn run() -> Result<(), String> {
     };
 
     let (store, approval_ttl) = store_from_env()?;
-    let capture = env("OPENBOX_PROMPT_CAPTURE").map_or(Ok(Capture::Text), |value| {
-        Capture::parse(&value)
-            .ok_or_else(|| "OPENBOX_PROMPT_CAPTURE must be text, hash or off".to_owned())
-    })?;
+    let capture = capture_from("OPENBOX_PROMPT_CAPTURE")?;
+    let body_capture = capture_from("OPENBOX_BODY_CAPTURE")?;
     let guard = Arc::new(
         Guard::with_store(Arc::new(core), stopper, store, approval_ttl)
             .with_core_budget(core_budget()?)
-            .with_prompt_capture(capture),
+            .with_prompt_capture(capture)
+            .with_body_capture(body_capture),
     );
     let metrics = guard.metrics();
     let draining = Arc::clone(&guard);
