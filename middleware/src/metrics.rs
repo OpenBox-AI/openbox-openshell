@@ -104,6 +104,10 @@ pub struct Metrics {
     shadow: Mutex<BTreeMap<bool, u64>>,
     /// Fast-path allows Core later disagreed with.
     fast_disagreements: AtomicU64,
+    /// From a HALT verdict to the gateway confirming the sandbox stopped.
+    halt_stop_latency: Histogram,
+    /// (confirmed) → count.
+    halt_stops: Mutex<BTreeMap<bool, u64>>,
 }
 
 impl Metrics {
@@ -131,7 +135,7 @@ impl Metrics {
             .entry(tier)
             .or_default() += 1;
         match tier {
-            Tier::LocalRule => &self.local_rule_latency,
+            Tier::LocalRule | Tier::Grant => &self.local_rule_latency,
             Tier::RecentVerdict => &self.recent_verdict_latency,
             Tier::Core => &self.core_tier_latency,
             Tier::Pending => &self.pending_latency,
@@ -146,6 +150,18 @@ impl Metrics {
             .expect("metrics lock")
             .entry(agreed)
             .or_default() += 1;
+    }
+
+    pub fn record_halt_stop(&self, confirmed: bool, elapsed: Duration) {
+        *self
+            .halt_stops
+            .lock()
+            .expect("metrics lock")
+            .entry(confirmed)
+            .or_default() += 1;
+        if confirmed {
+            self.halt_stop_latency.observe(elapsed);
+        }
     }
 
     pub fn record_fast_disagreement(&self) {
@@ -248,6 +264,19 @@ impl Metrics {
                 "openbox_mw_rule_shadow_total{{agreement=\"{agreement}\"}} {count}"
             );
         }
+        out.push_str("# HELP openbox_mw_halt_stops_total Sandboxes stopped after a HALT, by whether the gateway confirmed it.\n");
+        out.push_str("# TYPE openbox_mw_halt_stops_total counter\n");
+        for (confirmed, count) in self.halt_stops.lock().expect("metrics lock").iter() {
+            let outcome = if *confirmed { "confirmed" } else { "failed" };
+            let _ = writeln!(
+                out,
+                "openbox_mw_halt_stops_total{{outcome=\"{outcome}\"}} {count}"
+            );
+        }
+        out.push_str("# HELP openbox_mw_halt_stop_seconds From a HALT verdict to the sandbox confirmed stopped.\n");
+        out.push_str("# TYPE openbox_mw_halt_stop_seconds histogram\n");
+        self.halt_stop_latency
+            .render(out, "openbox_mw_halt_stop_seconds", "");
         out.push_str("# HELP openbox_mw_fast_path_disagreements_total Fast-path allows Core later refused.\n");
         out.push_str("# TYPE openbox_mw_fast_path_disagreements_total counter\n");
         let _ = writeln!(
@@ -259,12 +288,87 @@ impl Metrics {
 }
 
 /// Serves `/healthz`, `/readyz` and `/metrics` until the process exits.
-pub async fn serve_admin(listener: TcpListener, metrics: std::sync::Arc<Metrics>) {
+/// Clears a halt for a sandbox; returns what it did.
+pub type Resume = std::sync::Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The admin actions beyond the probes: off unless a token is configured.
+#[derive(Clone)]
+pub struct AdminActions {
+    pub token: String,
+    pub resume: Resume,
+}
+
+/// `POST /admin/resume?sandbox_id=<id>` with `Authorization: Bearer <token>`.
+async fn admin_action(request: &str, actions: Option<&AdminActions>) -> (&'static str, String) {
+    let Some(actions) = actions else {
+        return ("404 Not Found", "not found\n".to_owned());
+    };
+    let mut lines = request.lines();
+    let mut first = lines.next().unwrap_or("").split_whitespace();
+    let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+    let authorized = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("authorization")
+                && constant_time_eq(
+                    value.trim().as_bytes(),
+                    format!("Bearer {}", actions.token).as_bytes(),
+                )
+        });
+    if method != "POST" {
+        return ("405 Method Not Allowed", "use POST\n".to_owned());
+    }
+    if !authorized {
+        return (
+            "401 Unauthorized",
+            "a valid bearer token is required\n".to_owned(),
+        );
+    }
+    let sandbox_id = target
+        .split_once('?')
+        .map_or("", |(_, query)| query)
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("sandbox_id="))
+        .unwrap_or("");
+    if sandbox_id.is_empty()
+        || sandbox_id.len() > 128
+        || !sandbox_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return ("400 Bad Request", "sandbox_id is required\n".to_owned());
+    }
+    match (actions.resume)(sandbox_id.to_owned()).await {
+        Ok(done) => ("200 OK", format!("{done}\n")),
+        Err(error) => ("502 Bad Gateway", format!("{error}\n")),
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0, |diff, (a, b)| diff | (a ^ b))
+            == 0
+}
+
+pub async fn serve_admin(
+    listener: TcpListener,
+    metrics: std::sync::Arc<Metrics>,
+    actions: Option<AdminActions>,
+) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             continue;
         };
         let metrics = std::sync::Arc::clone(&metrics);
+        let actions = actions.clone();
         tokio::spawn(async move {
             let mut buffer = [0_u8; 1024];
             let Ok(Ok(read)) =
@@ -285,6 +389,9 @@ pub async fn serve_admin(listener: TcpListener, metrics: std::sync::Arc<Metrics>
                 }
                 "/readyz" => ("503 Service Unavailable", "starting\n".to_owned()),
                 "/metrics" => ("200 OK", metrics.render()),
+                admin if admin.starts_with("/admin/resume") => {
+                    admin_action(&request, actions.as_ref()).await
+                }
                 _ => ("404 Not Found", "not found\n".to_owned()),
             };
             let response = format!(
@@ -330,11 +437,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_needs_post_and_the_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let resumed = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&resumed);
+        let resume: Resume = std::sync::Arc::new(move |id: String| {
+            let seen = std::sync::Arc::clone(&seen);
+            Box::pin(async move {
+                seen.lock().unwrap().push(id.clone());
+                Ok(format!("resumed {id}"))
+            })
+        });
+        let actions = AdminActions {
+            token: "t".repeat(32),
+            resume,
+        };
+        tokio::spawn(serve_admin(
+            listener,
+            std::sync::Arc::new(Metrics::default()),
+            Some(actions),
+        ));
+        let send = |request: String| async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.unwrap();
+            reply.lines().next().unwrap_or("").to_owned()
+        };
+        let good = format!("Bearer {}", "t".repeat(32));
+        assert!(
+            send(format!(
+                "GET /admin/resume?sandbox_id=s1 HTTP/1.1\r\nAuthorization: {good}\r\n\r\n"
+            ))
+            .await
+            .contains("405")
+        );
+        assert!(
+            send(
+                "POST /admin/resume?sandbox_id=s1 HTTP/1.1\r\nAuthorization: Bearer nope\r\n\r\n"
+                    .to_owned()
+            )
+            .await
+            .contains("401")
+        );
+        assert!(
+            send(format!(
+                "POST /admin/resume HTTP/1.1\r\nAuthorization: {good}\r\n\r\n"
+            ))
+            .await
+            .contains("400")
+        );
+        assert!(
+            send(format!(
+                "POST /admin/resume?sandbox_id=s1 HTTP/1.1\r\nAuthorization: {good}\r\n\r\n"
+            ))
+            .await
+            .contains("200")
+        );
+        assert_eq!(*resumed.lock().unwrap(), ["s1"]);
+    }
+
+    #[tokio::test]
     async fn admin_listener_serves_probes_and_metrics() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let metrics = std::sync::Arc::new(Metrics::default());
-        tokio::spawn(serve_admin(listener, std::sync::Arc::clone(&metrics)));
+        tokio::spawn(serve_admin(listener, std::sync::Arc::clone(&metrics), None));
         let get = |path: &'static str| async move {
             let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
             stream

@@ -23,6 +23,8 @@ use crate::capture::host_matches;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Tier {
     LocalRule,
+    /// An approval whose scope covers this request ([`grant_key`]).
+    Grant,
     RecentVerdict,
     Core,
     Pending,
@@ -32,6 +34,7 @@ impl Tier {
     pub const fn label(self) -> &'static str {
         match self {
             Self::LocalRule => "local_rule",
+            Self::Grant => "approval_grant",
             Self::RecentVerdict => "recent_verdict",
             Self::Core => "core",
             Self::Pending => "pending",
@@ -257,6 +260,17 @@ fn load(path: &Path) -> Result<Snapshot, String> {
 /// Shared-store key for an action Core allowed recently.
 pub fn verdict_key(sandbox_id: &str, fingerprint: &str) -> String {
     format!("openbox:verdict:{sandbox_id}:{fingerprint}")
+}
+
+/// Shared-store key for an approval that covers more than its own request:
+/// further identical requests (`uses`, a time window).
+pub fn grant_key(sandbox_id: &str, fingerprint: &str) -> String {
+    format!("openbox:grant:{sandbox_id}:{fingerprint}")
+}
+
+/// Shared-store key for a standing grant for one MCP tool.
+pub fn tool_grant_key(sandbox_id: &str, tool: &str) -> String {
+    format!("openbox:grant:{sandbox_id}:tool:{tool}")
 }
 
 /// Shared-store key for a verdict still being worked out, or worked out for

@@ -115,7 +115,8 @@ when a person rejects an approval.
   traffic but cannot stop the sandbox.
 
 An agent that sees `openbox_halted` should stop work and report it. Retrying
-does not help.
+does not help. An operator can resume the sandbox (`docs/runbook.md`); its
+traffic is then scored again.
 
 ## Turning approvals into blocks
 

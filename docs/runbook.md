@@ -169,6 +169,32 @@ through the gateway API. If the door guard has no gateway credential
 `HALT denies traffic but cannot stop sandboxes` at startup, and a halted
 sandbox keeps running with all traffic denied.
 
-The door guard logs `halted sandbox <id> stopped`, or why it could not stop
-it. A halted sandbox is stopped, not deleted. Inspect it before you restart
-it: OpenBox Core latches the halt on the session.
+The door guard logs `halted sandbox <id> stopped stop_ms=<ms>` once the gateway
+reports the sandbox stopped (not just accepted the stop), or why it could not
+stop it within 30 s. `openbox_mw_halt_stop_seconds` is the time from the HALT
+verdict to that confirmation; SPEC-001 FR-1.6 asks for 5 s. Alert on
+`openbox_mw_halt_stops_total{outcome="failed"}`.
+
+A halted sandbox is stopped, not deleted. Inspect it before you restart it.
+
+### Resuming a halted sandbox
+
+A halt is held in two places: OpenBox Core latches it on the session, and each
+door guard replica caches it. Resume clears both. It is off unless the door
+guard has an admin token (`doorGuard.adminTokenSecret`, a Secret with
+`admin-token`, 32 characters or more):
+
+```bash
+kubectl -n openbox port-forward deploy/openbox-openbox-openshell-door-guard 9464 &
+curl -X POST -H "Authorization: Bearer $(cat admin-token)" \
+  "http://127.0.0.1:9464/admin/resume?sandbox_id=<sandbox id>"
+openshell sandbox start <sandbox name>
+```
+
+`200` means the door guard and Core both cleared it; the replica that answers
+tells the others through the shared store. `502` means the door guard cleared
+it but Core did not: requests stay halted until Core's latch is cleared.
+Core's side of resume (`POST /api/v3/governance/session/resume`) is proposed
+and not yet served, so today expect `502` with Core's `404`.
+
+After the resume the sandbox's traffic is scored again from its next request.
