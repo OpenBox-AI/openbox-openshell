@@ -237,6 +237,9 @@ frontDesk:
   sessions: true
   # OPENBOX_FD_RECONCILE_SECS. AI Inventory reconciliation interval.
   reconcileSecs: 60
+  # OPENBOX_FD_OPENSHELL_VERSION. The gateway's OpenShell version, recorded on
+  # each AI Inventory row (openbox.ai/openshell-version). Empty: not recorded.
+  openshellVersion: ""
   terminationGracePeriodSeconds: 30
   extraEnv: []
   podAnnotations: {}
