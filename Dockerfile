@@ -30,9 +30,11 @@ RUN find src -name '*.rs' -exec touch {} + \
  && cargo build --release --locked \
       --bin openbox-verdict-middleware \
       --bin openbox-governance-interceptor \
+      --bin openbox-evidence \
  && install -D -m 0755 -t /out \
       target/release/openbox-verdict-middleware \
-      target/release/openbox-governance-interceptor
+      target/release/openbox-governance-interceptor \
+      target/release/openbox-evidence
 
 # glibc, libgcc and CA roots, no shell. Runs as 65532, the UID the chart's
 # security context expects.
