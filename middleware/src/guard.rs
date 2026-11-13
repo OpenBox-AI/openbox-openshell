@@ -438,6 +438,36 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         action: &Action,
         decision: impl Future<Output = HttpRequestResult>,
     ) -> HttpRequestResult {
+        // SPEC-001 FR-1.3: the same request evaluated twice (OpenShell retrying
+        // the call) gets the same verdict, once in Core and once in the
+        // evidence.
+        let seen = answered_key(&action.sandbox_id, &action.request_id);
+        if !action.request_id.is_empty()
+            && let Ok(Some(text)) = self.store.get(&seen).await
+            && let Some(result) = decode_result(&text)
+        {
+            self.metrics.record_duplicate();
+            eprintln!(
+                "openbox: duplicate request_id={} sandbox_id={} answered as before",
+                action.request_id, action.sandbox_id
+            );
+            return result;
+        }
+        let result = self.observe_new(action, decision).await;
+        if !action.request_id.is_empty() {
+            let _ = self
+                .store
+                .set(&seen, &encode_result(&result), Some(ANSWERED_TTL))
+                .await;
+        }
+        result
+    }
+
+    async fn observe_new(
+        &self,
+        action: &Action,
+        decision: impl Future<Output = HttpRequestResult>,
+    ) -> HttpRequestResult {
         let started = std::time::Instant::now();
         let span = telemetry::start(
             &Context::current(),
@@ -831,8 +861,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             // always remove it.
             let stored = json!({
                 "request_id": request.request_id,
-                "result": base64::engine::general_purpose::STANDARD
-                    .encode(prost::Message::encode_to_vec(&result)),
+                "result": encode_result(&result),
             });
             let _ = me
                 .store
@@ -859,10 +888,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     /// request, so this request's response completes the activity.
     async fn adopt_pending(&self, action: &Action, text: &str) -> Option<HttpRequestResult> {
         let stored: Value = serde_json::from_str(text).ok()?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(stored.get("result")?.as_str()?)
-            .ok()?;
-        let result: HttpRequestResult = prost::Message::decode(bytes.as_slice()).ok()?;
+        let result = decode_result(stored.get("result")?.as_str()?)?;
         let first = stored.get("request_id")?.as_str()?;
         if result.decision == Decision::Allow as i32
             && first != action.request_id
@@ -1980,6 +2006,25 @@ fn resumed_key(sandbox_id: &str) -> String {
     format!("openbox:resumed:{sandbox_id}")
 }
 
+/// How long a request's verdict is kept to answer a repeat of the same
+/// request id.
+const ANSWERED_TTL: Duration = Duration::from_secs(120);
+
+fn answered_key(sandbox_id: &str, request_id: &str) -> String {
+    format!("openbox:answered:{sandbox_id}:{request_id}")
+}
+
+fn encode_result(result: &HttpRequestResult) -> String {
+    base64::engine::general_purpose::STANDARD.encode(prost::Message::encode_to_vec(result))
+}
+
+fn decode_result(text: &str) -> Option<HttpRequestResult> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()?;
+    prost::Message::decode(bytes.as_slice()).ok()
+}
+
 /// Marks a verdict still being worked out in the shared store.
 const PENDING_RUNNING: &str = "running";
 /// How long a worked-out verdict waits for its retry.
@@ -2475,7 +2520,7 @@ pub(crate) mod tests {
         let first = guard.evaluate(&action(), ApprovalMode::Queue).await;
         assert!(is_allow(&first));
         assert_eq!(first.metadata["openbox.governance_event_id"], "evt-1");
-        let second = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        let second = guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
         assert!(is_allow(&second));
         assert_eq!(second.findings[0].label, "constrain_met_by_sandbox");
         assert_eq!(
@@ -3188,6 +3233,29 @@ pub(crate) mod tests {
         assert!(guard.store.get(&key).await.unwrap().is_none());
     }
 
+    /// W9 R9.5 (SPEC-001 A8): the same request id evaluated twice gives one
+    /// verdict, one Core evaluation and one evidence record.
+    #[tokio::test]
+    async fn a_repeated_request_id_gets_the_same_verdict_once() {
+        let (once, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Block]));
+        let first = once.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        let again = once.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        assert_eq!(first, again);
+        assert_eq!(first.reason_code, REASON_BLOCKED);
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            once.metrics()
+                .render()
+                .contains("openbox_mw_duplicate_requests_total 1")
+        );
+        // A different request id is a new evaluation.
+        let core = FakeCore::with_verdicts(&[Verdict::Allow, Verdict::Allow]);
+        let (other, core2, _) = guard(core);
+        other.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        other.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        assert_eq!(core2.evaluate_calls.load(Ordering::SeqCst), 2);
+    }
+
     /// W2: CONSTRAIN with constraints goes out rewritten; one that cannot be
     /// met is denied; CONSTRAIN without constraints is allowed as before.
     #[tokio::test]
@@ -3619,11 +3687,12 @@ pub(crate) mod tests {
             Verdict::Block,
         ]));
         guard.evaluate(&action(), ApprovalMode::Queue).await;
-        let modified = Action::from_evaluation(&evaluation(
+        let mut modified = Action::from_evaluation(&evaluation(
             "POST",
             "/mcp",
             br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pay","arguments":{"amount":99999}}}"#,
         ));
+        modified.request_id = "req-2".to_owned();
         let result = guard.evaluate(&modified, ApprovalMode::Queue).await;
         assert_eq!(result.reason_code, REASON_BLOCKED);
         assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 2);
@@ -3637,7 +3706,7 @@ pub(crate) mod tests {
             .unwrap()
             .push_back(Ok(ApprovalState::Rejected(Verdict::Halt)));
         guard.evaluate(&action(), ApprovalMode::Queue).await;
-        let result = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        let result = guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
         assert_eq!(result.reason_code, REASON_HALTED);
         tokio::task::yield_now().await;
         assert_eq!(stopper.stopped.lock().unwrap().len(), 1);
