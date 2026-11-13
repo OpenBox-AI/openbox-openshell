@@ -9,6 +9,7 @@ pub mod agent;
 pub mod capture;
 pub mod constrain;
 pub mod core_client;
+pub mod fastpath;
 pub mod front_desk;
 pub mod guard;
 pub mod halt;

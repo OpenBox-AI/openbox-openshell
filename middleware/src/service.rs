@@ -432,7 +432,9 @@ impl<G: Governance, S: SandboxStopper + ?Sized> SupervisorMiddleware for Verdict
         action.profile = config.profile;
         action.capture = config.capture;
         Ok(Response::new(
-            self.guard.evaluate(&action, config.approval_mode).await,
+            self.guard
+                .evaluate_shared(&action, config.approval_mode)
+                .await,
         ))
     }
 
