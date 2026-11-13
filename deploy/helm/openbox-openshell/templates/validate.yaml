@@ -63,6 +63,15 @@
 {{- fail (printf "doorGuard.%s must be off, hash, findings or text" $key) -}}
 {{- end }}
 {{- end -}}
+{{- if not (has $v.doorGuard.fastPath.rulesMode (list "off" "shadow" "enforce")) -}}
+{{- fail "doorGuard.fastPath.rulesMode must be off, shadow or enforce" -}}
+{{- end -}}
+{{- if not (has $v.doorGuard.fastPath.slowCore (list "inline" "pending")) -}}
+{{- fail "doorGuard.fastPath.slowCore must be inline or pending" -}}
+{{- end -}}
+{{- if and (eq $v.doorGuard.fastPath.slowCore "pending") (gt (int $v.doorGuard.replicaCount) 1) (not (or $v.redis.enabled $v.externalRedis.url $v.externalRedis.existingSecret)) -}}
+{{- fail "doorGuard.fastPath.slowCore=pending with more than one replica needs Redis: the retry may reach another replica" -}}
+{{- end -}}
 {{- if ge (int $v.doorGuard.coreTimeoutMs) 30000 -}}
 {{- fail "doorGuard.coreTimeoutMs must stay under the gateway's 30 s middleware timeout" -}}
 {{- end -}}
