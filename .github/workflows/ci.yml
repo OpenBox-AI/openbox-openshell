@@ -33,6 +33,20 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
+  clients:
+    name: Agent retry helpers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No dependencies: the runner's Python, and a Node that strips types.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: python3 -m unittest -v test_openbox_retry
+        working-directory: clients/python
+      - run: node --experimental-strip-types --test openbox-retry.test.ts
+        working-directory: clients/typescript
+
   chart:
     name: Helm chart
     runs-on: ubuntu-24.04

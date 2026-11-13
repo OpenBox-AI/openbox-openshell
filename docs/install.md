@@ -441,6 +441,27 @@ itself: the request goes out unchanged. A CONSTRAIN verdict without
 `constraints` is allowed unchanged too, as before. Any other string is a
 constraint the door guard cannot meet.
 
+## Approval scopes
+
+An approval covers its own request. Core can widen it by sending
+`approval_scope` with the approved state (proposed; Core does not send it
+yet):
+
+```json
+{"action": "allow", "approval_scope": {"uses": 3, "window_secs": 600}}
+{"action": "allow", "approval_scope": {"tool": "deploy", "expires_at": "2026-11-13T18:00:00Z"}}
+```
+
+| Field | Covers |
+|---|---|
+| `uses` | That many identical requests, this one included |
+| `window_secs` or `expires_at` | Identical requests until then |
+| `tool` (with an end time) | Every call of that MCP tool in the sandbox until then |
+
+Covered requests are allowed by the door guard without asking Core, and are
+still recorded in the session. Grants live in the shared store, so every
+replica honours them. Without `approval_scope` an approval is single use.
+
 ## The approval retry contract
 
 OpenShell cannot hold a request, so an approval is deny-then-retry:
