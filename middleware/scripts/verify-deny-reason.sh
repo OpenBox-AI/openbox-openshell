@@ -6,7 +6,7 @@
 #
 # agent.env is the dashboard's snippet for an agent with a workload identity
 # (see openbox-openshell.sh). Runs against the OpenBox Core it names, with a
-# real OpenShell v0.1.2 gateway and sandbox brought up by openbox-openshell.sh:
+# real OpenShell v0.1.8 gateway and sandbox brought up by openbox-openshell.sh:
 #
 #   1  a request the agent's Core allows: decision=allow, no reason=
 #   2  the door guard restarted with an API key Core does not know, so Core
@@ -58,7 +58,7 @@ evals() { grep 'openbox: eval ' "$DIR/door-guard.log" || true; }
 echo "== Sandbox $BOX"
 os sandbox create --name "$BOX" --policy "$DIR/policy.yaml" --detach --no-tty --no-auto-providers >/dev/null
 i=0
-until os logs "$BOX" --source sandbox 2>/dev/null | grep -q 'Settings poll'; do
+until os logs "$BOX" --source sandbox 2>/dev/null | grep -qE 'Settings poll|Acknowledged initial policy revision'; do
   i=$((i + 1)); [ $i -le 90 ] || { echo "sandbox did not come up" >&2; exit 1; }
   sleep 2
 done

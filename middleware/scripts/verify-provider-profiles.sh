@@ -8,12 +8,12 @@
 # example copilot profile, which sends credentials uninspected, is accepted.
 # Scenarios 1-5 run the same gateway with the front desk registered.
 #
-# Starts its own OpenShell v0.1.2 gateway (VM driver) with its own state,
+# Starts its own OpenShell v0.1.8 gateway (VM driver) with its own state,
 # ports and CLI config, so it does not touch any gateway you already run.
 # Prints PASS/FAIL per scenario, exits non-zero if any fail, and removes
 # everything it created on exit.
 #
-# Needs the OpenShell v0.1.2 release binaries: set OPENSHELL_PREFIX to a
+# Needs the OpenShell v0.1.8 release binaries: set OPENSHELL_PREFIX to a
 # directory with bin/openshell, bin/openshell-gateway and
 # libexec/openshell-driver-vm (default ~/openshell-repro). If they are not
 # there, they are downloaded from NVIDIA's release and checksum-verified
@@ -57,12 +57,12 @@ for port in "$GW_PORT" $((GW_PORT + 1)) $((GW_PORT + 2)) "$FD_PORT" $((FD_PORT +
   free "$port" || { echo "port $port is in use; set OBX_GATEWAY_PORT / OBX_FD_PORT"; exit 1; }
 done
 
-echo "== OpenShell v0.1.2 binaries"
+echo "== OpenShell v0.1.8 binaries"
 if [ ! -x "$PREFIX/bin/openshell-gateway" ] || [ ! -x "$PREFIX/libexec/openshell-driver-vm" ]; then
-  [ "$(uname -sm)" = "Darwin arm64" ] || { echo "set OPENSHELL_PREFIX to an OpenShell v0.1.2 install"; exit 1; }
+  [ "$(uname -sm)" = "Darwin arm64" ] || { echo "set OPENSHELL_PREFIX to an OpenShell v0.1.8 install"; exit 1; }
   PREFIX=$WORK/openshell
   mkdir -p "$PREFIX/bin" "$PREFIX/libexec" "$PREFIX/dl"
-  R=https://github.com/NVIDIA/OpenShell/releases/download/v0.1.2
+  R=https://github.com/NVIDIA/OpenShell/releases/download/v0.1.8
   (
     cd "$PREFIX/dl"
     for f in openshell-aarch64-apple-darwin.tar.gz openshell-gateway-aarch64-apple-darwin.tar.gz \
