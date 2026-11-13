@@ -136,12 +136,12 @@ fn rules_from_env() -> Result<Rules, String> {
     Ok(Rules::new(mode, file))
 }
 
-/// Tier 2: `OPENBOX_SLOW_CORE` (inline, or pending with
-/// `OPENBOX_PENDING_WAIT_MS`, default 2000).
+/// Tier 2: `OPENBOX_SLOW_CORE`: pending (the default, decision D1) with
+/// `OPENBOX_PENDING_WAIT_MS` (default 2000), or inline.
 fn slow_core_from_env() -> Result<SlowCore, String> {
     match env("OPENBOX_SLOW_CORE").as_deref() {
-        None | Some("inline") => Ok(SlowCore::Inline),
-        Some("pending") => Ok(SlowCore::Pending(Duration::from_millis(number(
+        Some("inline") => Ok(SlowCore::Inline),
+        None | Some("pending") => Ok(SlowCore::Pending(Duration::from_millis(number(
             "OPENBOX_PENDING_WAIT_MS",
             2000,
         )?))),

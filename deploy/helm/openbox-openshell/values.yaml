@@ -175,10 +175,11 @@ doorGuard:
     # an identical one this long when Core sends no TTL of its own. 0 = only
     # when Core sends one.
     verdictTtlSecs: 0
-    # OPENBOX_SLOW_CORE: inline (wait for Core, up to coreTimeoutMs) or
-    # pending (wait pendingWaitMs, then deny openbox_pending and hand the
-    # verdict to the identical retry). pending needs Redis or one replica.
-    slowCore: inline
+    # OPENBOX_SLOW_CORE: pending (the default, decision D1: wait
+    # pendingWaitMs, then deny openbox_pending and hand the verdict to the
+    # identical retry) or inline (wait for Core, up to coreTimeoutMs).
+    # pending needs Redis or one replica.
+    slowCore: pending
     # OPENBOX_PENDING_WAIT_MS.
     pendingWaitMs: 2000
   # Seconds Kubernetes waits after SIGTERM. The door guard stops taking
