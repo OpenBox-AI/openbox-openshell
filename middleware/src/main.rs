@@ -54,6 +54,7 @@ use std::time::Duration;
 use openbox_verdict_middleware::core_client::{
     AgentSigner, CoreClient, CoreConfig, WorkloadIdentity,
 };
+use openbox_verdict_middleware::fastpath::{Rules, RulesMode, SlowCore};
 use openbox_verdict_middleware::guard::{
     DEFAULT_APPROVAL_TTL, DEFAULT_CORE_BUDGET, Governance, Guard, SandboxStopper,
 };
@@ -91,6 +92,61 @@ fn read_secret(key: &str) -> Result<String, String> {
     std::fs::read_to_string(&path)
         .map(|text| text.trim().to_owned())
         .map_err(|error| format!("{key}: cannot read {path}: {error}"))
+}
+
+/// Tiers 0 to 2 from the environment, and the rule snapshot kept fresh.
+fn with_fast_path<G: Governance, S: SandboxStopper + ?Sized>(
+    guard: Arc<Guard<G, S>>,
+) -> Result<Arc<Guard<G, S>>, String> {
+    let guard = Arc::into_inner(guard)
+        .ok_or("guard is shared before it is configured")?
+        .with_rules(rules_from_env()?)
+        .with_verdict_ttl(Duration::from_secs(number("OPENBOX_VERDICT_TTL_SECS", 0)?))
+        .with_slow_core(slow_core_from_env()?);
+    guard.refresh_rules();
+    let guard = Arc::new(guard);
+    let refreshing = Arc::clone(&guard);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(RULES_REFRESH);
+        loop {
+            tick.tick().await;
+            refreshing.refresh_rules();
+        }
+    });
+    Ok(guard)
+}
+
+/// How often the rule snapshot file is checked for changes.
+const RULES_REFRESH: Duration = Duration::from_secs(10);
+
+/// Tier 0: `OPENBOX_RULES_FILE` and `OPENBOX_RULES_MODE` (off, shadow,
+/// enforce; shadow when a file is given, off without one).
+fn rules_from_env() -> Result<Rules, String> {
+    let file = env("OPENBOX_RULES_FILE").map(PathBuf::from);
+    let mode = match env("OPENBOX_RULES_MODE") {
+        Some(value) => {
+            RulesMode::parse(&value).ok_or("OPENBOX_RULES_MODE must be off, shadow or enforce")?
+        }
+        None if file.is_some() => RulesMode::Shadow,
+        None => RulesMode::Off,
+    };
+    if mode != RulesMode::Off && file.is_none() {
+        return Err("OPENBOX_RULES_MODE needs OPENBOX_RULES_FILE".to_owned());
+    }
+    Ok(Rules::new(mode, file))
+}
+
+/// Tier 2: `OPENBOX_SLOW_CORE` (inline, or pending with
+/// `OPENBOX_PENDING_WAIT_MS`, default 2000).
+fn slow_core_from_env() -> Result<SlowCore, String> {
+    match env("OPENBOX_SLOW_CORE").as_deref() {
+        None | Some("inline") => Ok(SlowCore::Inline),
+        Some("pending") => Ok(SlowCore::Pending(Duration::from_millis(number(
+            "OPENBOX_PENDING_WAIT_MS",
+            2000,
+        )?))),
+        Some(_) => Err("OPENBOX_SLOW_CORE must be inline or pending".to_owned()),
+    }
 }
 
 fn core_budget() -> Result<Duration, String> {
@@ -281,6 +337,7 @@ async fn run() -> Result<(), String> {
             .with_prompt_capture(capture)
             .with_body_capture(body_capture),
     );
+    let guard = with_fast_path(guard)?;
     let metrics = guard.metrics();
     let draining = Arc::clone(&guard);
     let admin: SocketAddr = env("OPENBOX_MW_ADMIN_LISTEN")

@@ -94,6 +94,16 @@ pub struct Metrics {
     approval_latency: Histogram,
     evaluate_latency: Histogram,
     signal_latency: Histogram,
+    /// Answers per fast-path tier, and their latency.
+    tiers: Mutex<BTreeMap<crate::fastpath::Tier, u64>>,
+    local_rule_latency: Histogram,
+    recent_verdict_latency: Histogram,
+    core_tier_latency: Histogram,
+    pending_latency: Histogram,
+    /// Shadow-mode local rules: (agreed with Core) → count.
+    shadow: Mutex<BTreeMap<bool, u64>>,
+    /// Fast-path allows Core later disagreed with.
+    fast_disagreements: AtomicU64,
 }
 
 impl Metrics {
@@ -110,6 +120,36 @@ impl Metrics {
             .entry((decision, reason_code.to_owned()))
             .or_default() += 1;
         self.evaluation_latency.observe(elapsed);
+    }
+
+    pub fn record_tier(&self, tier: crate::fastpath::Tier, elapsed: Duration) {
+        use crate::fastpath::Tier;
+        *self
+            .tiers
+            .lock()
+            .expect("metrics lock")
+            .entry(tier)
+            .or_default() += 1;
+        match tier {
+            Tier::LocalRule => &self.local_rule_latency,
+            Tier::RecentVerdict => &self.recent_verdict_latency,
+            Tier::Core => &self.core_tier_latency,
+            Tier::Pending => &self.pending_latency,
+        }
+        .observe(elapsed);
+    }
+
+    pub fn record_shadow(&self, agreed: bool) {
+        *self
+            .shadow
+            .lock()
+            .expect("metrics lock")
+            .entry(agreed)
+            .or_default() += 1;
+    }
+
+    pub fn record_fast_disagreement(&self) {
+        self.fast_disagreements.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_core(&self, call: CoreCall, ok: bool, elapsed: Duration) {
@@ -168,7 +208,53 @@ impl Metrics {
                 &format!("call=\"{}\",", call.label()),
             );
         }
+        self.render_tiers(&mut out);
         out
+    }
+
+    fn render_tiers(&self, out: &mut String) {
+        use crate::fastpath::Tier;
+        out.push_str("# HELP openbox_mw_tier_total Verdicts by the tier that gave them.\n");
+        out.push_str("# TYPE openbox_mw_tier_total counter\n");
+        for (tier, count) in self.tiers.lock().expect("metrics lock").iter() {
+            let _ = writeln!(
+                out,
+                "openbox_mw_tier_total{{tier=\"{}\"}} {count}",
+                tier.label()
+            );
+        }
+        out.push_str("# HELP openbox_mw_tier_duration_seconds Time to answer, by tier.\n");
+        out.push_str("# TYPE openbox_mw_tier_duration_seconds histogram\n");
+        for (tier, histogram) in [
+            (Tier::LocalRule, &self.local_rule_latency),
+            (Tier::RecentVerdict, &self.recent_verdict_latency),
+            (Tier::Core, &self.core_tier_latency),
+            (Tier::Pending, &self.pending_latency),
+        ] {
+            histogram.render(
+                out,
+                "openbox_mw_tier_duration_seconds",
+                &format!("tier=\"{}\",", tier.label()),
+            );
+        }
+        out.push_str(
+            "# HELP openbox_mw_rule_shadow_total Shadow-mode local rules against Core's verdict.\n",
+        );
+        out.push_str("# TYPE openbox_mw_rule_shadow_total counter\n");
+        for (agreed, count) in self.shadow.lock().expect("metrics lock").iter() {
+            let agreement = if *agreed { "agree" } else { "disagree" };
+            let _ = writeln!(
+                out,
+                "openbox_mw_rule_shadow_total{{agreement=\"{agreement}\"}} {count}"
+            );
+        }
+        out.push_str("# HELP openbox_mw_fast_path_disagreements_total Fast-path allows Core later refused.\n");
+        out.push_str("# TYPE openbox_mw_fast_path_disagreements_total counter\n");
+        let _ = writeln!(
+            out,
+            "openbox_mw_fast_path_disagreements_total {}",
+            self.fast_disagreements.load(Ordering::Relaxed)
+        );
     }
 }
 
