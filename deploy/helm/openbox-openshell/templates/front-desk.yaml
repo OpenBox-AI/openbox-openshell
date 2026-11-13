@@ -75,6 +75,10 @@ spec:
               value: {{ $fd.inventoryAudience | quote }}
             - name: OPENBOX_FD_RECONCILE_SECS
               value: {{ $fd.reconcileSecs | int64 | quote }}
+            {{- if $fd.openshellVersion }}
+            - name: OPENBOX_FD_OPENSHELL_VERSION
+              value: {{ $fd.openshellVersion | quote }}
+            {{- end }}
             {{- if $core }}
             - name: OPENBOX_URL
               value: {{ .Values.openbox.url | quote }}
