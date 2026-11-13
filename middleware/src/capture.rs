@@ -238,6 +238,14 @@ fn bounded_key(key: &str) -> String {
     truncate(key, 64)
 }
 
+/// The detector for a finding kind, for redaction ([`crate::constrain`]).
+pub fn detector(kind: &str) -> Option<&'static Regex> {
+    DETECTORS
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .map(|(_, pattern)| pattern)
+}
+
 static DETECTORS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     [
         ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"),

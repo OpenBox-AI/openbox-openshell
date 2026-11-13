@@ -7,6 +7,7 @@
 pub mod action;
 pub mod agent;
 pub mod capture;
+pub mod constrain;
 pub mod core_client;
 pub mod front_desk;
 pub mod guard;

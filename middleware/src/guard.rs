@@ -59,7 +59,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use openshell_core::proto::{Decision, Finding, HttpRequestResult};
+use openshell_core::proto::{
+    Decision, Finding, HeaderMutation, HttpRequestResult, RemoveHeader, header_mutation,
+};
 use opentelemetry::trace::{FutureExt as _, SpanKind, Status, TraceContextExt as _};
 use opentelemetry::{Context, KeyValue};
 use serde_json::{Value, json};
@@ -69,6 +71,7 @@ use sha2::Digest as _;
 use crate::action::{Action, Payload};
 use crate::agent;
 use crate::capture;
+use crate::constrain;
 use crate::core_client::{
     Activity, ApprovalState, Completion, CoreDecision, CoreError, LLM_CALL, Outcome, Verdict,
     activity_name, request_activity_id, request_url, span_ids, started_span, tool_activity_id,
@@ -106,6 +109,11 @@ pub const REASON_APPROVAL_REQUIRED: &str = "openbox_approval_required";
 pub const REASON_BLOCKED: &str = "openbox_blocked";
 pub const REASON_HALTED: &str = "openbox_halted";
 pub const REASON_UNAVAILABLE: &str = "openbox_unavailable";
+/// CONSTRAIN came with a change the door guard could not make; the request
+/// is not forwarded.
+pub const REASON_CONSTRAIN_FAILED: &str = "openbox_constrain_failed";
+/// The largest replacement body `OpenShell` accepts.
+const MAX_REWRITTEN_BODY: usize = 4 << 20;
 
 const MAX_REASON_BYTES: usize = 4 * 1024;
 /// How much of a deny reason the `openbox: eval` log line keeps.
@@ -497,6 +505,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             );
         }
         let result = self.apply(action, mode, &decision);
+        let span = with_rewrite(span, &result);
         let held = mode == ApprovalMode::Queue && decision.verdict == Verdict::RequireApproval;
         if result.decision != Decision::Allow as i32 && closes && !held {
             self.close_refused(action, activity.clone(), &decision)
@@ -514,22 +523,27 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 "started_ms": millis(started),
                 "capture": self.body_mode(action).name(),
             });
-            if let Err(error) = self
-                .store
-                .set(
-                    &request_key(&action.request_id),
-                    &record.to_string(),
-                    Some(REQUEST_TTL),
-                )
-                .await
-            {
-                eprintln!(
-                    "openbox: request_id={} not recorded, its completion carries no duration: {error}",
-                    action.request_id
-                );
-            }
+            self.remember_request(&action.request_id, &record).await;
         }
         result
+    }
+
+    /// Keeps what the response's completion needs, for whichever replica
+    /// sees the response.
+    async fn remember_request(&self, request_id: &str, record: &Value) {
+        if let Err(error) = self
+            .store
+            .set(
+                &request_key(request_id),
+                &record.to_string(),
+                Some(REQUEST_TTL),
+            )
+            .await
+        {
+            eprintln!(
+                "openbox: request_id={request_id} not recorded, its completion carries no duration: {error}"
+            );
+        }
     }
 
     /// Closes the activity of a request Core refused, as the agent SDK closes
@@ -620,6 +634,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                     risk_score: None,
                     approval_expires_at: None,
                     policy_id: None,
+                    constraints: None,
                 };
                 Err(self.apply(action, mode, &decision))
             }
@@ -1076,7 +1091,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     ) -> HttpRequestResult {
         match decision.verdict {
             Verdict::Allow => allow(decision, "allow"),
-            Verdict::Constrain => allow(decision, "constrain_met_by_sandbox"),
+            Verdict::Constrain => constrain(action, decision),
             Verdict::RequireApproval if mode == ApprovalMode::Queue => deny(
                 REASON_APPROVAL_REQUIRED,
                 decision
@@ -1365,6 +1380,71 @@ fn allow(decision: &CoreDecision, label: &str) -> HttpRequestResult {
     }
 }
 
+/// The request's span with what CONSTRAIN changed, so its completion
+/// records the rewrite: what was applied, and both bodies' SHA-256.
+fn with_rewrite(mut span: Value, result: &HttpRequestResult) -> Value {
+    for key in [
+        "openbox.constraints_applied",
+        "openbox.original_sha256",
+        "openbox.rewritten_sha256",
+    ] {
+        if let Some(value) = result.metadata.get(key) {
+            span["attributes"][key] = json!(value);
+        }
+    }
+    span
+}
+
+/// CONSTRAIN: allow the request as rewritten by Core's constraints, or deny
+/// it when they cannot be met. Without constraints CONSTRAIN keeps its older
+/// meaning, "allowed because the sandbox already contains it".
+fn constrain(action: &Action, decision: &CoreDecision) -> HttpRequestResult {
+    let Some(constraints) = &decision.constraints else {
+        return allow(decision, "constrain_met_by_sandbox");
+    };
+    let rewrite = constrain::parse(constraints)
+        .and_then(|constraints| constrain::apply(action, &constraints, MAX_REWRITTEN_BODY));
+    let rewrite = match rewrite {
+        Ok(rewrite) => rewrite,
+        Err(error) => {
+            return deny(
+                REASON_CONSTRAIN_FAILED,
+                &format!("the request could not be constrained: {error}"),
+                Some(decision),
+            );
+        }
+    };
+    // Nothing to change (`run_in_sandbox`): allowed as sent, as before.
+    if rewrite.applied.is_empty() && rewrite.body.is_none() {
+        return allow(decision, "constrain_met_by_sandbox");
+    }
+    let mut result = allow(decision, "constrained");
+    result.metadata.insert(
+        "openbox.original_sha256".to_owned(),
+        rewrite.original_sha256.clone(),
+    );
+    result.metadata.insert(
+        "openbox.rewritten_sha256".to_owned(),
+        rewrite.rewritten_sha256.clone(),
+    );
+    result.metadata.insert(
+        "openbox.constraints_applied".to_owned(),
+        truncate(&rewrite.applied.join(","), MAX_REASON_BYTES),
+    );
+    if let Some(body) = rewrite.body {
+        result.body = body;
+        result.has_body = true;
+    }
+    result.header_mutations = rewrite
+        .remove_headers
+        .into_iter()
+        .map(|name| HeaderMutation {
+            operation: Some(header_mutation::Operation::Remove(RemoveHeader { name })),
+        })
+        .collect();
+    result
+}
+
 fn deny(reason_code: &str, reason: &str, decision: Option<&CoreDecision>) -> HttpRequestResult {
     let severity = match reason_code {
         REASON_HALTED => "critical",
@@ -1493,6 +1573,8 @@ pub(crate) mod tests {
         /// Everything each call carried that could hold content, as Core
         /// would receive it: activities, spans, outcomes, signal arguments.
         pub sent: Mutex<Vec<String>>,
+        /// Sent with every verdict, as Core's `constraints`.
+        pub constraints: Option<Value>,
     }
 
     fn decision(verdict: Verdict) -> CoreDecision {
@@ -1503,6 +1585,7 @@ pub(crate) mod tests {
             risk_score: Some(0.5),
             approval_expires_at: None,
             policy_id: None,
+            constraints: None,
         }
     }
 
@@ -1588,6 +1671,7 @@ pub(crate) mod tests {
             match next {
                 Ok(verdict) => Ok(CoreDecision {
                     approval_expires_at: self.approval_expires_at,
+                    constraints: self.constraints.clone(),
                     ..decision(verdict)
                 }),
                 Err(()) => Err(CoreError::Status(500)),
@@ -2175,6 +2259,79 @@ pub(crate) mod tests {
             headers: Vec::new(),
             body: Some(body.to_vec()),
         }
+    }
+
+    /// W2: CONSTRAIN with constraints goes out rewritten; one that cannot be
+    /// met is denied; CONSTRAIN without constraints is allowed as before.
+    #[tokio::test]
+    async fn constrain_rewrites_the_request_or_denies_it() {
+        let core = FakeCore {
+            constraints: Some(json!([
+                {"kind": "narrow", "tool": "pay", "drop": ["amount"], "set": {"dry_run": true}},
+                {"kind": "strip_headers", "names": ["x-debug"]}
+            ])),
+            ..FakeCore::with_verdicts(&[Verdict::Constrain])
+        };
+        let (first, _, _) = guard(core);
+        let mut evaluation = evaluation(
+            "POST",
+            "/mcp",
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pay","arguments":{"amount":10}}}"#,
+        );
+        evaluation.headers.push(openshell_core::proto::HttpHeader {
+            name: "x-debug".to_owned(),
+            value: "1".to_owned(),
+        });
+        let action = Action::from_evaluation(&evaluation);
+        let fingerprint = action.fingerprint.clone();
+        let result = first.evaluate(&action, ApprovalMode::Queue).await;
+        assert!(is_allow(&result));
+        assert!(result.has_body);
+        let sent: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(sent["params"]["arguments"], json!({"dry_run": true}));
+        assert_eq!(result.header_mutations.len(), 1);
+        assert_eq!(
+            result.metadata["openbox.constraints_applied"],
+            "narrow:pay,strip_header:x-debug"
+        );
+        assert_ne!(
+            result.metadata["openbox.original_sha256"],
+            result.metadata["openbox.rewritten_sha256"]
+        );
+        // The approval fingerprint is still the request as the agent sent it.
+        assert_eq!(action.fingerprint, fingerprint);
+
+        // A constraint the request cannot meet: denied, never forwarded.
+        let core = FakeCore {
+            constraints: Some(
+                json!([{"kind": "narrow", "tool": "delete_repo", "drop": ["force"]}]),
+            ),
+            ..FakeCore::with_verdicts(&[Verdict::Constrain])
+        };
+        let (unmet, _, _) = guard(core);
+        let result = unmet.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        assert!(!is_allow(&result));
+        assert_eq!(result.reason_code, REASON_CONSTRAIN_FAILED);
+        assert!(!result.has_body);
+
+        // What Core sends today: met by the sandbox, allowed unchanged.
+        let core = FakeCore {
+            constraints: Some(json!(["run_in_sandbox"])),
+            ..FakeCore::with_verdicts(&[Verdict::Constrain])
+        };
+        let (sandboxed, _, _) = guard(core);
+        let result = sandboxed
+            .evaluate(&request("req-4"), ApprovalMode::Queue)
+            .await;
+        assert!(is_allow(&result), "{result:?}");
+        assert!(!result.has_body);
+
+        // No constraints: allowed unchanged, as before W2.
+        let (plain, _, _) = guard(FakeCore::with_verdicts(&[Verdict::Constrain]));
+        let result = plain.evaluate(&request("req-3"), ApprovalMode::Queue).await;
+        assert!(is_allow(&result));
+        assert!(!result.has_body);
+        assert!(result.header_mutations.is_empty());
     }
 
     /// W4's acceptance test: with the default capture, no raw body, prompt,
