@@ -115,12 +115,85 @@ impl RuntimeEnvironment {
                 .as_ref()
                 .map(|status| u64::from(status.current_policy_version))
                 .filter(|version| *version > 0),
-            labels: metadata
-                .labels
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
+            labels: {
+                let mut labels: BTreeMap<String, String> = metadata
+                    .labels
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                // R8.3: what the inventory row says about governance.
+                let posture = posture(sandbox);
+                labels.insert(COMPLIANCE_LABEL.to_owned(), posture.compliance.to_owned());
+                if let Some(profile) = posture.profile {
+                    labels.insert(PROFILE_LABEL.to_owned(), profile);
+                }
+                if let Some(version) = OPENSHELL_VERSION.get() {
+                    labels.insert(OPENSHELL_VERSION_LABEL.to_owned(), version.clone());
+                }
+                labels
+            },
         })
+    }
+}
+
+/// Inventory label: how the sandbox stands with the door guard.
+///
+/// `compliant` as the front desk set it up, `ungoverned` without the door
+/// guard, `weakened` (fail open, or not on every host), or `unknown` (its
+/// policy could not be read).
+pub const COMPLIANCE_LABEL: &str = "openbox.ai/compliance";
+/// Inventory label: the sandbox's profile from its policy.
+pub const PROFILE_LABEL: &str = "openbox.ai/profile";
+/// Inventory label: the `OpenShell` version of the gateway.
+pub const OPENSHELL_VERSION_LABEL: &str = "openbox.ai/openshell-version";
+
+/// The gateway's `OpenShell` version, set once at startup
+/// (`OPENBOX_FD_OPENSHELL_VERSION`).
+pub static OPENSHELL_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// How a sandbox stands with the door guard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Posture {
+    pub compliance: &'static str,
+    pub profile: Option<String>,
+}
+
+/// Reads a listed sandbox's policy: is the door guard attached the way the
+/// front desk attaches it (`openbox`, fail closed, every host)?
+pub fn posture(sandbox: &Sandbox) -> Posture {
+    let Some(policy) = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()) else {
+        return Posture {
+            compliance: "unknown",
+            profile: None,
+        };
+    };
+    let Some(attachment) = policy.network_middlewares.get("openbox") else {
+        return Posture {
+            compliance: "ungoverned",
+            profile: None,
+        };
+    };
+    let profile = attachment.config.as_ref().and_then(|config| {
+        match config.fields.get("profile")?.kind.as_ref()? {
+            prost_types::value::Kind::StringValue(profile) => Some(profile.clone()),
+            _ => None,
+        }
+    });
+    let every_host = attachment
+        .endpoints
+        .as_ref()
+        .is_some_and(|endpoints| endpoints.include.iter().any(|host| host == "**"));
+    let fail_closed = attachment.on_error.is_empty() || attachment.on_error == "fail_closed";
+    let compliance = if attachment.middleware != "openbox" {
+        "ungoverned"
+    } else if fail_closed && every_host {
+        "compliant"
+    } else {
+        "weakened"
+    };
+    Posture {
+        compliance,
+        profile,
     }
 }
 
@@ -309,6 +382,8 @@ pub struct ReconcileStats {
     pub written: usize,
     pub deleted: usize,
     pub failed: usize,
+    /// Sandboxes not governed as the front desk set them up (R8.4).
+    pub noncompliant: usize,
 }
 
 /// One pass: write every sandbox the gateway has, then delete the rows whose
@@ -326,6 +401,18 @@ pub async fn reconcile(
             continue;
         };
         present.insert(environment.external_id.clone());
+        let compliance = environment
+            .labels
+            .get(COMPLIANCE_LABEL)
+            .map_or("unknown", String::as_str);
+        if compliance != "compliant" {
+            stats.noncompliant += 1;
+            // A posture alert: one line per pass while it lasts.
+            eprintln!(
+                "openbox: posture alert sandbox_id={} name={} compliance={compliance}",
+                environment.external_id, environment.name
+            );
+        }
         match backend.upsert(&environment).await {
             Ok(()) => stats.written += 1,
             Err(error) => {
@@ -430,8 +517,8 @@ async fn run(
             let Some(lister) = lister else { return };
             match reconcile(backend, lister, gateway).await {
                 Ok(stats) => eprintln!(
-                    "openbox: inventory reconciled written={} deleted={} failed={}",
-                    stats.written, stats.deleted, stats.failed
+                    "openbox: inventory reconciled written={} deleted={} failed={} noncompliant={}",
+                    stats.written, stats.deleted, stats.failed, stats.noncompliant
                 ),
                 Err(error) => eprintln!("openbox: inventory reconcile skipped: {error}"),
             }
@@ -633,12 +720,87 @@ mod tests {
             ReconcileStats {
                 written: 2,
                 deleted: 1,
-                failed: 0
+                failed: 0,
+                // The test sandboxes carry no policy: posture unknown.
+                noncompliant: 2,
             }
         );
         let rows = backend.rows.lock().unwrap();
         assert_eq!(rows.keys().collect::<Vec<_>>(), ["kept", "new"]);
         assert_eq!(rows["kept"].policy_version, Some(3));
+    }
+
+    fn governed(on_error: &str, include: &[&str], middleware: &str) -> Sandbox {
+        use openshell_core::proto::{
+            MiddlewareEndpointSelector, NetworkMiddlewareConfig, SandboxPolicy,
+        };
+        let mut sandbox = sandbox("sbx-p", "p", 1);
+        let config = prost_types::Struct {
+            fields: [(
+                "profile".to_owned(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue("coding".to_owned())),
+                },
+            )]
+            .into(),
+        };
+        sandbox.spec.as_mut().unwrap().policy = Some(SandboxPolicy {
+            network_middlewares: [(
+                "openbox".to_owned(),
+                NetworkMiddlewareConfig {
+                    middleware: middleware.to_owned(),
+                    on_error: on_error.to_owned(),
+                    config: Some(config),
+                    endpoints: Some(MiddlewareEndpointSelector {
+                        include: include.iter().map(|host| (*host).to_owned()).collect(),
+                        ..MiddlewareEndpointSelector::default()
+                    }),
+                    ..NetworkMiddlewareConfig::default()
+                },
+            )]
+            .into(),
+            ..SandboxPolicy::default()
+        });
+        sandbox
+    }
+
+    /// W8 R8.3 and R8.4: each row says how the sandbox stands, and its profile.
+    #[test]
+    fn rows_carry_compliance_and_profile() {
+        let compliant =
+            RuntimeEnvironment::from_sandbox(&governed("fail_closed", &["**"], "openbox"), None)
+                .unwrap();
+        assert_eq!(compliant.labels[COMPLIANCE_LABEL], "compliant");
+        assert_eq!(compliant.labels[PROFILE_LABEL], "coding");
+        for (on_error, include, middleware, expected) in [
+            ("fail_open", &["**"][..], "openbox", "weakened"),
+            (
+                "fail_closed",
+                &["api.example.com"][..],
+                "openbox",
+                "weakened",
+            ),
+            ("fail_closed", &["**"][..], "someone-else", "ungoverned"),
+        ] {
+            let row =
+                RuntimeEnvironment::from_sandbox(&governed(on_error, include, middleware), None)
+                    .unwrap();
+            assert_eq!(
+                row.labels[COMPLIANCE_LABEL], expected,
+                "{on_error} {include:?} {middleware}"
+            );
+        }
+        let mut stripped = governed("fail_closed", &["**"], "openbox");
+        stripped
+            .spec
+            .as_mut()
+            .unwrap()
+            .policy
+            .as_mut()
+            .unwrap()
+            .network_middlewares
+            .clear();
+        assert_eq!(posture(&stripped).compliance, "ungoverned");
     }
 
     #[tokio::test]

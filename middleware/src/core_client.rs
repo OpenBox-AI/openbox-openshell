@@ -37,6 +37,8 @@ const EVALUATE_PATH: &str = "/api/v1/governance/evaluate";
 const APPROVAL_PATH: &str = "/api/v1/governance/approval";
 const V3_EVALUATE_PATH: &str = "/api/v3/governance/evaluate";
 const V3_APPROVAL_PATH: &str = "/api/v3/governance/approval";
+/// Proposed to Core (R5.4): clears the halt Core holds for a session.
+const V3_RESUME_PATH: &str = "/api/v3/governance/session/resume";
 const V3_BOOTSTRAP_PATH: &str = "/api/v3/auth/bootstrap";
 /// Refresh a workload token this long before Keycloak says it expires.
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
@@ -87,9 +89,29 @@ pub struct CoreDecision {
     pub verdict_ttl_secs: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// How far an approval reaches beyond the one request (R5.1). Core sends it
+/// with an approved state as `approval_scope`; without one an approval is
+/// single use.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ApprovalScope {
+    /// Identical requests the approval covers, this one included.
+    pub uses: Option<u32>,
+    /// Unix seconds until which it covers them.
+    pub until: Option<i64>,
+    /// A standing grant for every call of this MCP tool, until `until`.
+    pub tool: Option<String>,
+}
+
+impl ApprovalScope {
+    /// Whether it reaches past this one request.
+    pub fn is_wider(&self) -> bool {
+        self.uses.is_some_and(|uses| uses > 1) || self.until.is_some() || self.tool.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApprovalState {
-    Approved,
+    Approved(ApprovalScope),
     Pending {
         expires_at: Option<i64>,
     },
@@ -411,6 +433,23 @@ impl CoreClient {
         self.evaluate(&payload, &idempotency_key(&key)).await
     }
 
+    /// Asks Core to clear the halt it holds for a sandbox's session. Core
+    /// does not serve this yet (HTTP 404 until it does).
+    pub async fn resume_session(&self, sandbox_id: &str) -> Result<(), CoreError> {
+        let body = serde_json::to_vec(&json!({
+            "workflow_id": sandbox_id,
+            "run_id": sandbox_id,
+        }))
+        .map_err(|_| CoreError::Malformed)?;
+        let response = self.post(V3_RESUME_PATH, body, None).await?;
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(CoreError::Status(status))
+        }
+    }
+
     /// Reads the state of an approval Core is holding for an action. Polling
     /// also makes Core issue the short-lived grant that lets the approved
     /// action's retry through.
@@ -450,7 +489,12 @@ impl CoreClient {
                 .and_then(Verdict::parse)
                 .ok_or(CoreError::Malformed)?
             {
-                Verdict::Allow => ApprovalState::Approved,
+                Verdict::Allow => ApprovalState::Approved(
+                    parsed
+                        .approval_scope
+                        .map(|scope| scope.into_scope(unix_now()))
+                        .unwrap_or_default(),
+                ),
                 Verdict::RequireApproval => {
                     if expires_at.is_some_and(|at| at <= unix_now()) {
                         ApprovalState::Gone
@@ -643,6 +687,31 @@ impl EvaluateResponse {
 struct ApprovalResponse {
     action: Option<String>,
     approval_expiration_time: Option<String>,
+    approval_scope: Option<ScopeResponse>,
+}
+
+#[derive(Deserialize)]
+struct ScopeResponse {
+    uses: Option<u32>,
+    /// RFC 3339.
+    expires_at: Option<String>,
+    window_secs: Option<i64>,
+    tool: Option<String>,
+}
+
+impl ScopeResponse {
+    fn into_scope(self, now: i64) -> ApprovalScope {
+        let until = self
+            .expires_at
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .or_else(|| self.window_secs.map(|window| now + window));
+        ApprovalScope {
+            uses: self.uses,
+            until,
+            tool: self.tool.filter(|tool| !tool.is_empty()),
+        }
+    }
 }
 
 /// A request's own activity id. Request ids are `OpenShell`'s, so trim them to

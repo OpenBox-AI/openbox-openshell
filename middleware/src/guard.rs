@@ -73,9 +73,9 @@ use crate::agent;
 use crate::capture;
 use crate::constrain;
 use crate::core_client::{
-    Activity, ApprovalState, Completion, CoreDecision, CoreError, LLM_CALL, Outcome, Verdict,
-    activity_name, request_activity_id, request_url, span_ids, started_span, tool_activity_id,
-    unix_now,
+    Activity, ApprovalScope, ApprovalState, Completion, CoreDecision, CoreError, LLM_CALL, Outcome,
+    Verdict, activity_name, request_activity_id, request_url, span_ids, started_span,
+    tool_activity_id, unix_now,
 };
 use crate::fastpath::{self, LocalDecision, Rules, RulesMode, SlowCore, Tier};
 use crate::metrics::{CoreCall, Metrics};
@@ -130,6 +130,11 @@ pub const DEFAULT_CORE_BUDGET: Duration = Duration::from_secs(29);
 /// Core's governance API, as the guard uses it.
 #[tonic::async_trait]
 pub trait Governance: Send + Sync + 'static {
+    /// Clears the halt Core holds for a sandbox's session.
+    async fn resume_session(&self, _sandbox_id: &str) -> Result<(), CoreError> {
+        Err(CoreError::Status(501))
+    }
+
     async fn start_session(
         &self,
         sandbox_id: &str,
@@ -172,6 +177,9 @@ pub trait Governance: Send + Sync + 'static {
 
 #[tonic::async_trait]
 impl Governance for crate::core_client::CoreClient {
+    async fn resume_session(&self, sandbox_id: &str) -> Result<(), CoreError> {
+        Self::resume_session(self, sandbox_id).await
+    }
     async fn start_session(
         &self,
         sandbox_id: &str,
@@ -291,6 +299,8 @@ pub struct Guard<G, S: ?Sized> {
     verdict_ttl: Duration,
     /// Tier 2: what to do while Core is slow.
     slow_core: SlowCore,
+    /// Signed, hash-chained verdict records (W6).
+    evidence: Option<Arc<crate::evidence::Evidence>>,
 }
 
 impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
@@ -325,7 +335,15 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             rules: Rules::off(),
             verdict_ttl: Duration::ZERO,
             slow_core: SlowCore::Inline,
+            evidence: None,
         }
+    }
+
+    /// Writes a signed, hash-chained record of every verdict.
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: Arc<crate::evidence::Evidence>) -> Self {
+        self.evidence = Some(evidence);
+        self
     }
 
     /// Tier 0: decide matching requests from a local rule snapshot.
@@ -420,6 +438,36 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         action: &Action,
         decision: impl Future<Output = HttpRequestResult>,
     ) -> HttpRequestResult {
+        // SPEC-001 FR-1.3: the same request evaluated twice (OpenShell retrying
+        // the call) gets the same verdict, once in Core and once in the
+        // evidence.
+        let seen = answered_key(&action.sandbox_id, &action.request_id);
+        if !action.request_id.is_empty()
+            && let Ok(Some(text)) = self.store.get(&seen).await
+            && let Some(result) = decode_result(&text)
+        {
+            self.metrics.record_duplicate();
+            eprintln!(
+                "openbox: duplicate request_id={} sandbox_id={} answered as before",
+                action.request_id, action.sandbox_id
+            );
+            return result;
+        }
+        let result = self.observe_new(action, decision).await;
+        if !action.request_id.is_empty() {
+            let _ = self
+                .store
+                .set(&seen, &encode_result(&result), Some(ANSWERED_TTL))
+                .await;
+        }
+        result
+    }
+
+    async fn observe_new(
+        &self,
+        action: &Action,
+        decision: impl Future<Output = HttpRequestResult>,
+    ) -> HttpRequestResult {
         let started = std::time::Instant::now();
         let span = telemetry::start(
             &Context::current(),
@@ -450,6 +498,30 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         self.metrics
             .record_result(allowed, &result.reason_code, elapsed);
         eprintln!("{}", eval_line(action, &result, elapsed));
+        if let Some(evidence) = &self.evidence {
+            let url = request_url(action);
+            let written = evidence.record(&crate::evidence::Verdict {
+                sandbox_id: &action.sandbox_id,
+                request_id: &action.request_id,
+                method: &action.method,
+                host: &action.host,
+                url: &url,
+                allowed,
+                reason_code: &result.reason_code,
+                governance_event_id: result
+                    .metadata
+                    .get("openbox.governance_event_id")
+                    .map(String::as_str),
+                fast_path: result.metadata.contains_key("openbox.fast_path"),
+            });
+            self.metrics.record_evidence(written.is_ok());
+            if let Err(error) = written {
+                eprintln!(
+                    "openbox: evidence for request_id={} not written: {error}",
+                    action.request_id
+                );
+            }
+        }
         result
     }
 
@@ -472,13 +544,25 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     }
 
     /// What every request is checked for before any tier.
-    fn precheck(&self, action: &Action) -> Option<HttpRequestResult> {
+    async fn precheck(&self, action: &Action) -> Option<HttpRequestResult> {
         if action.sandbox_id.is_empty() {
             return Some(deny(
                 REASON_UNAVAILABLE,
                 "request carried no sandbox id",
                 None,
             ));
+        }
+        // An admin resumed it, possibly on another replica.
+        if self.is_halted(&action.sandbox_id)
+            && matches!(
+                self.store.get(&resumed_key(&action.sandbox_id)).await,
+                Ok(Some(_))
+            )
+        {
+            self.halted
+                .lock()
+                .expect("halted set lock")
+                .remove(&action.sandbox_id);
         }
         if self.is_halted(&action.sandbox_id) {
             return Some(deny(REASON_HALTED, "sandbox was halted by OpenBox", None));
@@ -488,7 +572,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
 
     async fn decide(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
         let started = std::time::Instant::now();
-        if let Some(result) = self.precheck(action) {
+        if let Some(result) = self.precheck(action).await {
             return result;
         }
         let shadow = match self.fast_answer(action).await {
@@ -545,6 +629,10 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             return Ok((Tier::LocalRule, result));
         }
         let shadow = local.map(|(_, rule, decision)| (rule, decision));
+        if let Some(reason) = self.use_grant(action).await {
+            self.record_fast(action, Tier::Grant).await;
+            return Ok((Tier::Grant, local_allow(&reason)));
+        }
         let key = fastpath::verdict_key(&action.sandbox_id, &action.fingerprint);
         if matches!(self.store.get(&key).await, Ok(Some(_))) {
             self.record_fast(action, Tier::RecentVerdict).await;
@@ -575,6 +663,89 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 action.request_id
             );
         }
+    }
+
+    /// Keeps an approval whose scope reaches past its own request (R5.1):
+    /// for further identical requests, or for every call of one MCP tool.
+    async fn grant(&self, action: &Action, held: &str, scope: &ApprovalScope) {
+        let now = unix_now();
+        let ttl = |until: Option<i64>| {
+            until.map_or(self.approval_ttl, |until| {
+                Duration::from_secs(u64::try_from(until.saturating_sub(now)).unwrap_or(0))
+            })
+        };
+        if let Some(tool) = &scope.tool {
+            if scope.until.is_none() {
+                eprintln!("openbox: a tool grant needs a time limit; {tool} not granted");
+            } else {
+                let record = json!({"until": scope.until, "approval": held});
+                let key = fastpath::tool_grant_key(&action.sandbox_id, tool);
+                let _ = self
+                    .store
+                    .set(&key, &record.to_string(), Some(ttl(scope.until)))
+                    .await;
+            }
+        }
+        // This request is the first use.
+        let uses_left = scope.uses.map(|uses| uses.saturating_sub(1));
+        if uses_left != Some(0) && (scope.uses.is_some() || scope.until.is_some()) {
+            let record = json!({"uses_left": uses_left, "until": scope.until, "approval": held});
+            let key = fastpath::grant_key(&action.sandbox_id, &action.fingerprint);
+            let _ = self
+                .store
+                .set(&key, &record.to_string(), Some(ttl(scope.until)))
+                .await;
+        }
+    }
+
+    /// Spends one use of an approval grant covering this request, if any.
+    /// Returns why the request is allowed.
+    async fn use_grant(&self, action: &Action) -> Option<String> {
+        let now = unix_now();
+        let valid = |record: &Value| {
+            record
+                .get("until")
+                .and_then(Value::as_i64)
+                .is_none_or(|until| now < until)
+        };
+        let key = fastpath::grant_key(&action.sandbox_id, &action.fingerprint);
+        if let Ok(Some(text)) = self.store.get(&key).await
+            && let Ok(mut record) = serde_json::from_str::<Value>(&text)
+            && valid(&record)
+        {
+            match record.get("uses_left").and_then(Value::as_u64) {
+                Some(0) => {
+                    let _ = self.store.delete(&key).await;
+                }
+                Some(left) => {
+                    record["uses_left"] = json!(left - 1);
+                    if left == 1 {
+                        let _ = self.store.delete(&key).await;
+                    } else {
+                        let _ = self.store.set(&key, &record.to_string(), None).await;
+                    }
+                    return Some(format!("approval grant ({} uses left)", left - 1));
+                }
+                None => return Some("approval grant (time window)".to_owned()),
+            }
+        }
+        let tools = action.tools();
+        if tools.is_empty() {
+            return None;
+        }
+        for tool in &tools {
+            let key = fastpath::tool_grant_key(&action.sandbox_id, tool);
+            let granted = match self.store.get(&key).await {
+                Ok(Some(text)) => serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .is_some_and(|record| valid(&record)),
+                _ => false,
+            };
+            if !granted {
+                return None;
+            }
+        }
+        Some(format!("standing approval for {}", tools.join(", ")))
     }
 
     /// Records a request a fast tier allowed: its activity and span now, so
@@ -648,7 +819,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             return self.decide(action, mode).await;
         };
         let started = std::time::Instant::now();
-        if let Some(result) = self.precheck(action) {
+        if let Some(result) = self.precheck(action).await {
             return result;
         }
         // A verdict worked out for an earlier identical attempt comes first:
@@ -690,8 +861,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             // always remove it.
             let stored = json!({
                 "request_id": request.request_id,
-                "result": base64::engine::general_purpose::STANDARD
-                    .encode(prost::Message::encode_to_vec(&result)),
+                "result": encode_result(&result),
             });
             let _ = me
                 .store
@@ -718,10 +888,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     /// request, so this request's response completes the activity.
     async fn adopt_pending(&self, action: &Action, text: &str) -> Option<HttpRequestResult> {
         let stored: Value = serde_json::from_str(text).ok()?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(stored.get("result")?.as_str()?)
-            .ok()?;
-        let result: HttpRequestResult = prost::Message::decode(bytes.as_slice()).ok()?;
+        let result = decode_result(stored.get("result")?.as_str()?)?;
         let first = stored.get("request_id")?.as_str()?;
         if result.decision == Decision::Allow as i32
             && first != action.request_id
@@ -934,7 +1101,12 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 "awaiting human approval",
                 None,
             )),
-            Ok(ApprovalState::Approved) => Ok(Some(held)),
+            Ok(ApprovalState::Approved(scope)) => {
+                if scope.is_wider() {
+                    self.grant(action, &held, &scope).await;
+                }
+                Ok(Some(held))
+            }
             Ok(ApprovalState::Gone) => {
                 let _ = self.store.delete(approval).await;
                 Ok(None)
@@ -1444,9 +1616,20 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 action.sandbox_name.clone(),
                 action.workspace.clone(),
             );
+            let metrics = Arc::clone(&self.metrics);
+            let store = Arc::clone(&self.store);
+            let halted_at = std::time::Instant::now();
             tokio::spawn(async move {
-                match stopper.stop(&sandbox_id, &sandbox_name, &workspace).await {
-                    Ok(()) => eprintln!("openbox: halted sandbox {sandbox_id} stopped"),
+                // A new halt outlives an earlier resume.
+                let _ = store.delete(&resumed_key(&sandbox_id)).await;
+                let outcome = stopper.stop(&sandbox_id, &sandbox_name, &workspace).await;
+                let elapsed = halted_at.elapsed();
+                metrics.record_halt_stop(outcome.is_ok(), elapsed);
+                match outcome {
+                    Ok(()) => eprintln!(
+                        "openbox: halted sandbox {sandbox_id} stopped stop_ms={}",
+                        elapsed.as_millis()
+                    ),
                     Err(error) => eprintln!(
                         "openbox: halted sandbox {sandbox_id} could not be stopped: {error}"
                     ),
@@ -1458,6 +1641,63 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             reason.unwrap_or("halted by OpenBox"),
             Some(decision),
         )
+    }
+
+    /// Records what a WebSocket message carried in the sandbox's session:
+    /// the kinds found, never the message. Queued in order with the
+    /// sandbox's other events; the message is not held for it.
+    pub fn record_message(
+        &self,
+        sandbox_id: &str,
+        sequence: u64,
+        counts: &std::collections::BTreeMap<String, u64>,
+    ) {
+        let governance = Arc::clone(&self.governance);
+        let args = json!({"findings": counts, "sequence": sequence});
+        let sandbox = sandbox_id.to_owned();
+        let turn = format!("ws-{sequence}-{}", unix_now());
+        self.sequence.push(
+            sandbox_id,
+            telemetry::job("openbox.websocket_findings", vec![telemetry::sandbox(sandbox_id)], async move {
+                if let Err(error) = governance
+                    .signal(&sandbox, "websocket_message", &args, &turn)
+                    .await
+                {
+                    eprintln!("openbox: websocket findings for sandbox_id={sandbox} not recorded: {error}");
+                }
+            }),
+        );
+    }
+
+    /// Resumes a halted sandbox (R5.4): clears this replica's halt, tells
+    /// the other replicas through the shared store, and asks Core to clear
+    /// the halt it holds for the session. The sandbox itself is started
+    /// again with `openshell sandbox start`.
+    pub async fn resume(&self, sandbox_id: &str) -> Result<String, String> {
+        self.halted
+            .lock()
+            .expect("halted set lock")
+            .remove(sandbox_id);
+        self.store
+            .set(
+                &resumed_key(sandbox_id),
+                &unix_now().to_string(),
+                Some(RESUMED_TTL),
+            )
+            .await
+            .map_err(|error| format!("resume not shared with other replicas: {error}"))?;
+        match self.governance.resume_session(sandbox_id).await {
+            Ok(()) => {
+                eprintln!("openbox: sandbox {sandbox_id} resumed");
+                Ok(format!("resumed {sandbox_id}: door guard and Core cleared"))
+            }
+            Err(error) => {
+                eprintln!("openbox: sandbox {sandbox_id} resumed in the door guard; Core: {error}");
+                Err(format!(
+                    "door guard cleared, but Core did not clear its halt ({error}); requests stay halted until it does"
+                ))
+            }
+        }
     }
 
     fn is_halted(&self, sandbox_id: &str) -> bool {
@@ -1759,6 +1999,32 @@ fn constrain(action: &Action, decision: &CoreDecision) -> HttpRequestResult {
     result
 }
 
+/// How long a resume is announced to other replicas.
+const RESUMED_TTL: Duration = Duration::from_secs(24 * 3600);
+
+fn resumed_key(sandbox_id: &str) -> String {
+    format!("openbox:resumed:{sandbox_id}")
+}
+
+/// How long a request's verdict is kept to answer a repeat of the same
+/// request id.
+const ANSWERED_TTL: Duration = Duration::from_secs(120);
+
+fn answered_key(sandbox_id: &str, request_id: &str) -> String {
+    format!("openbox:answered:{sandbox_id}:{request_id}")
+}
+
+fn encode_result(result: &HttpRequestResult) -> String {
+    base64::engine::general_purpose::STANDARD.encode(prost::Message::encode_to_vec(result))
+}
+
+fn decode_result(text: &str) -> Option<HttpRequestResult> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()?;
+    prost::Message::decode(bytes.as_slice()).ok()
+}
+
 /// Marks a verdict still being worked out in the shared store.
 const PENDING_RUNNING: &str = "running";
 /// How long a worked-out verdict waits for its retry.
@@ -1922,6 +2188,9 @@ pub(crate) mod tests {
         pub constraints: Option<Value>,
         /// Sent with every verdict, as Core's `verdict_ttl_secs`.
         pub verdict_ttl_secs: Option<u64>,
+        /// Sandboxes Core was asked to resume; `Err` when it refuses.
+        pub resumed: Mutex<Vec<String>>,
+        pub refuse_resume: bool,
     }
 
     fn decision(verdict: Verdict) -> CoreDecision {
@@ -1950,6 +2219,14 @@ pub(crate) mod tests {
 
     #[tonic::async_trait]
     impl Governance for FakeCore {
+        async fn resume_session(&self, sandbox_id: &str) -> Result<(), CoreError> {
+            self.resumed.lock().unwrap().push(sandbox_id.to_owned());
+            if self.refuse_resume {
+                Err(CoreError::Status(404))
+            } else {
+                Ok(())
+            }
+        }
         async fn start_session(&self, _: &str, _: &str) -> Result<CoreDecision, CoreError> {
             tokio::time::sleep(self.delay).await;
             self.session_calls.fetch_add(1, Ordering::SeqCst);
@@ -2082,7 +2359,7 @@ pub(crate) mod tests {
             args: &Value,
             _: &str,
         ) -> Result<CoreDecision, CoreError> {
-            assert_eq!(signal_name, "user_prompt");
+            assert!(matches!(signal_name, "user_prompt" | "websocket_message"));
             self.sent.lock().unwrap().push(args.to_string());
             self.signals.lock().unwrap().push(args.clone());
             let verdict = self
@@ -2243,7 +2520,7 @@ pub(crate) mod tests {
         let first = guard.evaluate(&action(), ApprovalMode::Queue).await;
         assert!(is_allow(&first));
         assert_eq!(first.metadata["openbox.governance_event_id"], "evt-1");
-        let second = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        let second = guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
         assert!(is_allow(&second));
         assert_eq!(second.findings[0].label, "constrain_met_by_sandbox");
         assert_eq!(
@@ -2286,7 +2563,7 @@ pub(crate) mod tests {
         ]));
         core.approvals.lock().unwrap().extend([
             Ok(ApprovalState::Pending { expires_at: None }),
-            Ok(ApprovalState::Approved),
+            Ok(ApprovalState::Approved(ApprovalScope::default())),
         ]);
         let first = guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
         assert_eq!(first.reason_code, REASON_APPROVAL_REQUIRED);
@@ -2323,7 +2600,7 @@ pub(crate) mod tests {
         ]));
         core.approvals.lock().unwrap().extend([
             Ok(ApprovalState::Pending { expires_at: None }),
-            Ok(ApprovalState::Approved),
+            Ok(ApprovalState::Approved(ApprovalScope::default())),
         ]);
         let replica = |store: &Arc<dyn SharedStore>| {
             Guard::with_store(
@@ -2610,6 +2887,143 @@ pub(crate) mod tests {
         }
     }
 
+    /// W5 R5.1: an approval Core scopes to three uses covers the next two
+    /// identical requests without asking Core, then it is spent.
+    #[tokio::test]
+    async fn a_scoped_approval_covers_its_uses_then_is_spent() {
+        // Covered requests are still recorded in Core, in the background:
+        // one verdict each.
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[
+            Verdict::RequireApproval,
+            Verdict::Allow,
+            Verdict::Allow,
+            Verdict::Allow,
+            Verdict::RequireApproval,
+        ]));
+        core.approvals
+            .lock()
+            .unwrap()
+            .push_back(Ok(ApprovalState::Approved(ApprovalScope {
+                uses: Some(3),
+                until: Some(unix_now() + 600),
+                tool: None,
+            })));
+        guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        assert!(is_allow(
+            &guard.evaluate(&request("req-2"), ApprovalMode::Queue).await
+        ));
+        for id in ["req-3", "req-4"] {
+            let covered = guard.evaluate(&request(id), ApprovalMode::Queue).await;
+            assert!(is_allow(&covered), "{id}");
+            assert!(covered.metadata["openbox.fast_path"].contains("approval grant"));
+        }
+        // All three uses are spent: the next identical request asks Core.
+        guard.evaluate(&request("req-5"), ApprovalMode::Queue).await;
+        assert_eq!(core.approval_calls.load(Ordering::SeqCst), 2);
+        let rendered = guard.metrics().render();
+        assert!(
+            rendered.contains(r#"openbox_mw_tier_total{tier="approval_grant"} 2"#),
+            "{rendered}"
+        );
+    }
+
+    /// W5 R5.1: a standing grant for a tool covers its calls until it ends.
+    #[tokio::test]
+    async fn a_tool_grant_covers_calls_of_that_tool() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[
+            Verdict::RequireApproval,
+            Verdict::Allow,
+            Verdict::Allow,
+        ]));
+        core.approvals
+            .lock()
+            .unwrap()
+            .push_back(Ok(ApprovalState::Approved(ApprovalScope {
+                uses: None,
+                until: Some(unix_now() + 600),
+                tool: Some("pay".to_owned()),
+            })));
+        guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        // A different call of the same tool.
+        let mut other = evaluation(
+            "POST",
+            "/mcp",
+            br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"pay","arguments":{"amount":99}}}"#,
+        );
+        other.context.as_mut().unwrap().request_id = "req-3".to_owned();
+        let covered = guard
+            .evaluate(&Action::from_evaluation(&other), ApprovalMode::Queue)
+            .await;
+        assert!(is_allow(&covered));
+        assert!(covered.metadata["openbox.fast_path"].contains("standing approval for pay"));
+    }
+
+    /// W5 R5.3 and R5.4: a halt is timed to the confirmed stop; a resume
+    /// clears it on every replica and in Core, and traffic is scored again.
+    #[tokio::test]
+    async fn a_resumed_sandbox_is_scored_again() {
+        let store: Arc<dyn SharedStore> = Arc::new(MemoryStore::default());
+        let core = Arc::new(FakeCore::with_verdicts(&[Verdict::Halt, Verdict::Allow]));
+        let stopper = Arc::new(FakeStopper::default());
+        let replica = |store: &Arc<dyn SharedStore>| {
+            Guard::with_store(
+                Arc::clone(&core),
+                Arc::clone(&stopper),
+                Arc::clone(store),
+                DEFAULT_APPROVAL_TTL,
+            )
+        };
+        let (first, second) = (replica(&store), replica(&store));
+        assert_eq!(
+            first
+                .evaluate(&request("req-1"), ApprovalMode::Queue)
+                .await
+                .reason_code,
+            REASON_HALTED
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !first
+            .metrics()
+            .render()
+            .contains(r#"openbox_mw_halt_stops_total{outcome="confirmed"} 1"#)
+        {
+            assert!(tokio::time::Instant::now() < deadline, "stop not recorded");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            first
+                .evaluate(&request("req-2"), ApprovalMode::Queue)
+                .await
+                .reason_code,
+            REASON_HALTED
+        );
+        assert_eq!(
+            core.evaluate_calls.load(Ordering::SeqCst),
+            1,
+            "a halted sandbox is not scored"
+        );
+        // The admin resumes it on the other replica.
+        second.resume("sbx-id-1").await.unwrap();
+        assert_eq!(*core.resumed.lock().unwrap(), ["sbx-id-1"]);
+        assert!(is_allow(
+            &first.evaluate(&request("req-3"), ApprovalMode::Queue).await
+        ));
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// W5 R5.4: when Core cannot clear its halt, the resume says so.
+    #[tokio::test]
+    async fn a_resume_core_refuses_is_reported() {
+        let core = FakeCore {
+            refuse_resume: true,
+            ..FakeCore::default()
+        };
+        let (guard, _, _) = guard(core);
+        let error = guard.resume("sbx-id-1").await.unwrap_err();
+        assert!(error.contains("Core did not clear"), "{error}");
+    }
+
     /// W3 tier 1: an allow Core marked reusable answers the identical action
     /// at once; the action is still recorded in Core, in the background.
     #[tokio::test]
@@ -2817,6 +3231,29 @@ pub(crate) mod tests {
         // Nothing left behind for a retry: the next identical request asks Core.
         let key = fastpath::pending_key("sbx-id-1", &request("req-2").fingerprint);
         assert!(guard.store.get(&key).await.unwrap().is_none());
+    }
+
+    /// W9 R9.5 (SPEC-001 A8): the same request id evaluated twice gives one
+    /// verdict, one Core evaluation and one evidence record.
+    #[tokio::test]
+    async fn a_repeated_request_id_gets_the_same_verdict_once() {
+        let (once, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Block]));
+        let first = once.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        let again = once.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        assert_eq!(first, again);
+        assert_eq!(first.reason_code, REASON_BLOCKED);
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            once.metrics()
+                .render()
+                .contains("openbox_mw_duplicate_requests_total 1")
+        );
+        // A different request id is a new evaluation.
+        let core = FakeCore::with_verdicts(&[Verdict::Allow, Verdict::Allow]);
+        let (other, core2, _) = guard(core);
+        other.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        other.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        assert_eq!(core2.evaluate_calls.load(Ordering::SeqCst), 2);
     }
 
     /// W2: CONSTRAIN with constraints goes out rewritten; one that cannot be
@@ -3250,11 +3687,12 @@ pub(crate) mod tests {
             Verdict::Block,
         ]));
         guard.evaluate(&action(), ApprovalMode::Queue).await;
-        let modified = Action::from_evaluation(&evaluation(
+        let mut modified = Action::from_evaluation(&evaluation(
             "POST",
             "/mcp",
             br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pay","arguments":{"amount":99999}}}"#,
         ));
+        modified.request_id = "req-2".to_owned();
         let result = guard.evaluate(&modified, ApprovalMode::Queue).await;
         assert_eq!(result.reason_code, REASON_BLOCKED);
         assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 2);
@@ -3268,7 +3706,7 @@ pub(crate) mod tests {
             .unwrap()
             .push_back(Ok(ApprovalState::Rejected(Verdict::Halt)));
         guard.evaluate(&action(), ApprovalMode::Queue).await;
-        let result = guard.evaluate(&action(), ApprovalMode::Queue).await;
+        let result = guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
         assert_eq!(result.reason_code, REASON_HALTED);
         tokio::task::yield_now().await;
         assert_eq!(stopper.stopped.lock().unwrap().len(), 1);

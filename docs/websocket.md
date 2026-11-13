@@ -1,15 +1,14 @@
-# WebSocket traffic in v1
+# WebSocket traffic
 
-Known finding: in v1, OpenBox does not give a verdict on WebSocket messages.
-Once a WebSocket connection is open, its messages pass through without an
-OpenBox verdict.
+OpenBox governs a WebSocket in two places: the upgrade request, with a Core
+verdict like any request, and the text messages the sandbox sends, which the
+door guard scores itself.
 
-## What is governed
+## The upgrade request
 
-**The upgrade request.** A sandbox opens a WebSocket with an HTTP request
-(`Upgrade: websocket`). OpenShell sends that request to the door guard like any
-other HTTP request, before it contacts the destination. The door guard asks
-OpenBox Core for a verdict:
+A sandbox opens a WebSocket with an HTTP request (`Upgrade: websocket`).
+OpenShell sends it to the door guard before it contacts the destination, and
+the door guard asks OpenBox Core for a verdict:
 
 - Core blocks or halts it: the upgrade is denied and no connection opens.
 - Core asks for approval: the upgrade is denied with
@@ -17,36 +16,31 @@ OpenBox Core for a verdict:
   approval contract (`docs/agent-approvals.md`).
 - Core allows it: the connection opens.
 
-So OpenBox still decides whether a sandbox may talk to a WebSocket endpoint at
-all, by host, path, query and headers.
+So OpenBox decides whether a sandbox may talk to a WebSocket endpoint at all,
+by host, path, query and headers.
 
-## What is not governed
+## The messages
 
-**The messages.** After the upgrade, OpenShell asks the door guard whether to
-inspect the session. The door guard answers `SKIP`. OpenShell then passes every
-message on that connection without asking the door guard again:
+After the upgrade, OpenShell asks the door guard whether to inspect the
+session. What the door guard answers is the sandbox policy's `websocket`
+setting in the `openbox` middleware config:
 
-- text messages from the sandbox: no verdict, not recorded in OpenBox
-- binary messages and messages from the destination: OpenShell never sends
-  these to any middleware
+| `websocket` | Text messages from the sandbox |
+|---|---|
+| `findings` (default) | Each is scanned with the detectors in "What Core receives" (`docs/install.md`). The kinds found go to OpenShell's OCSF log and to the sandbox's session in OpenBox (a `websocket_message` signal with the counts, never the message). The message is delivered unchanged. |
+| `enforce` | As `findings`, and a message carrying one of `response_kinds` is denied (or, with `responses: redact`, delivered with the matches replaced). The denial's reason code `openbox_websocket_blocked` goes to OCSF; OpenShell never puts it in a close frame. |
+| `skip` | Not inspected. The skip is recorded as a finding (`openbox.coverage`, `websocket_not_inspected`) so the gap shows in the evidence. |
 
-The door guard's answer carries a finding, type `openbox.coverage`, label
-`websocket_not_inspected`, so the gap shows in the evidence rather than
-staying silent. OpenShell also logs the skip in its OCSF log as a WebSocket
-middleware event.
+## What is still not governed
 
-## What this means
+- **Binary messages** pass unchanged: there is no text to scan.
+- **Messages from the destination** are never sent to any middleware by
+  OpenShell.
+- **No Core verdict per message.** Messages are scored by the door guard's
+  detectors, locally and in microseconds; a Core round trip of seconds per
+  message would stall most WebSocket protocols. Policy on what a sandbox may
+  do over a WebSocket stays at the upgrade.
 
-An agent that is allowed to open a WebSocket can send anything over it. If a
-WebSocket endpoint can do something you want governed per action, either:
-
-- deny the upgrade for that host in OpenBox policy, or
-- reach the same service over HTTP or MCP, where every request gets a verdict.
-
-## Why
-
-OpenShell can send each outgoing text message to the middleware. Giving each
-one a Core verdict needs a model of WebSocket actions (which message is a tool
-call, which is chatter) that we have not built, and a Core round trip of
-seconds per message would stall most WebSocket protocols. Per-message verdicts
-are out of scope for v1.
+If a WebSocket endpoint can do something you want governed per action,
+either deny the upgrade for that host in OpenBox policy, or reach the same
+service over HTTP or MCP, where every request gets a Core verdict.

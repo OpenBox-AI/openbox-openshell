@@ -163,6 +163,7 @@ No Kubernetes? See [Try it on one machine](#try-it-on-one-machine).
 | Halt | does not go out | HTTP 403, `openbox_halted`. The sandbox is stopped, and nothing else from it gets out |
 | No verdict in time | does not go out | HTTP 403, `openbox_unavailable` |
 | Still deciding (`pending` mode) | does not go out yet | HTTP 403, `openbox_pending`. The identical retry gets the verdict |
+| A response carries a secret, under `responses: block` | went out; its response is not delivered | HTTP 403, `openbox_response_blocked` |
 
 OpenShell cannot hold a request open while a person decides, so approval is
 deny-then-retry. `docs/agent-approvals.md` is the guide to give agent authors.

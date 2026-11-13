@@ -26,6 +26,8 @@
 //!   `OPENBOX_GATEWAY_ENDPOINT`, `OPENBOX_GATEWAY_MTLS_DIR`   gateway API
 //!                                     credential; enables reconciliation
 //!   `OPENBOX_FD_RECONCILE_SECS`       reconciliation interval, default 60
+//!   `OPENBOX_FD_OPENSHELL_VERSION`    the gateway's `OpenShell` version, recorded
+//!                                     on each inventory row
 //!
 //! Sandbox sessions: with `OPENBOX_URL` and the workload identity above, the
 //! front desk opens each sandbox's Core session on create and completes it on
@@ -162,6 +164,10 @@ fn inventory_from_env(
             );
         }
     };
+    // R8.3: the inventory records which OpenShell each sandbox runs on.
+    if let Some(version) = env("OPENBOX_FD_OPENSHELL_VERSION") {
+        let _ = openbox_verdict_middleware::inventory::OPENSHELL_VERSION.set(version);
+    }
     let interval: u64 = env("OPENBOX_FD_RECONCILE_SECS").map_or(Ok(60), |value| {
         value
             .parse()

@@ -441,6 +441,66 @@ itself: the request goes out unchanged. A CONSTRAIN verdict without
 `constraints` is allowed unchanged too, as before. Any other string is a
 constraint the door guard cannot meet.
 
+## Responses and WebSocket messages
+
+What comes back into the sandbox is checked by the door guard itself, with
+the detectors listed under "What Core receives", against a sandbox policy's
+settings in the `openbox` middleware config:
+
+```yaml
+network_middlewares:
+  openbox:
+    middleware: openbox
+    config:
+      responses: block          # findings (default), redact or block
+      response_kinds: [aws_access_key, private_key, jwt, api_key, prompt_injection, email]
+      websocket: enforce        # findings (default), enforce or skip
+```
+
+| `responses` | A response carrying one of `response_kinds` |
+|---|---|
+| `findings` | is delivered unchanged; the kinds found are logged in OpenShell's OCSF log and recorded with the request in the session |
+| `redact` | is delivered with each match replaced by `[REDACTED]` |
+| `block` | is not delivered: the sandbox gets `openbox_response_blocked` |
+
+`response_kinds` defaults to the secrets and `prompt_injection` (instructions
+planted in a tool result or a page to redirect the agent). Personal data
+(`email`, `payment_card`, `us_ssn`) is acted on only when listed.
+
+`redact` and `block` read the whole body when OpenShell offers it, so a match
+is never split between two pieces; otherwise the body is judged piece by
+piece as it streams, and a match across a boundary can be missed.
+
+**The upstream call has already run.** Blocking a response keeps its content
+out of the sandbox; it does not undo what the request did at the destination.
+Block requests with policy for that.
+
+`websocket` applies to text messages from the sandbox: `findings` scores each
+one and records the kinds found in the session, `enforce` denies a message
+carrying one of `response_kinds` (or, with `responses: redact`, delivers it
+redacted), and `skip` turns inspection off. See `docs/websocket.md`.
+
+## Approval scopes
+
+An approval covers its own request. Core can widen it by sending
+`approval_scope` with the approved state (proposed; Core does not send it
+yet):
+
+```json
+{"action": "allow", "approval_scope": {"uses": 3, "window_secs": 600}}
+{"action": "allow", "approval_scope": {"tool": "deploy", "expires_at": "2026-11-13T18:00:00Z"}}
+```
+
+| Field | Covers |
+|---|---|
+| `uses` | That many identical requests, this one included |
+| `window_secs` or `expires_at` | Identical requests until then |
+| `tool` (with an end time) | Every call of that MCP tool in the sandbox until then |
+
+Covered requests are allowed by the door guard without asking Core, and are
+still recorded in the session. Grants live in the shared store, so every
+replica honours them. Without `approval_scope` an approval is single use.
+
 ## The approval retry contract
 
 OpenShell cannot hold a request, so an approval is deny-then-retry:
@@ -457,6 +517,55 @@ OpenShell cannot hold a request, so an approval is deny-then-retry:
 To treat every approval as a block instead, set `approval_mode: deny` in the
 `openbox` entry's `config` with a policy update. The front desk writes
 `queue` at create time.
+
+## Fleet posture
+
+Each AI Inventory row carries, as labels:
+
+| Label | Value |
+|---|---|
+| `openbox.ai/compliance` | `compliant` (the door guard attached as the front desk attaches it: `openbox`, fail closed, every host), `weakened` (fail open, or not every host), `ungoverned` (no door guard), `unknown` (policy not readable) |
+| `openbox.ai/profile` | the sandbox's `profile`, when its policy sets one |
+| `openbox.ai/openshell-version` | `frontDesk.openshellVersion`, when set |
+
+Every reconciliation pass (`frontDesk.reconcileSecs`) logs
+`openbox: posture alert sandbox_id=... compliance=...` for each sandbox that
+is not `compliant`, and counts them in its summary line. A sandbox the front
+desk created is compliant unless something changed it outside the front
+desk's checks; alert on the log line.
+
+OpenShell v0.1.8 does not tell the gateway when a supervisor keeps a local
+policy override (it reports it only per provider), so the inventory cannot
+flag that case yet. Recheck when OpenShell moves policies to Cedar.
+
+Not built, waiting on OpenBox Core: risk budgets per tenant, refusing a
+`CreateSandbox` or policy change that would exceed one with a stable reason
+code, and scoring agent-authored policy proposals into the approval
+workflow. The front desk already refuses turning on automatic approval of
+agent-authored proposals.
+
+## Running next to other middleware
+
+OpenShell runs a sandbox's network middlewares in `order`, lowest first, and
+any one of them denying a request stops it: a later middleware cannot
+undo an earlier deny. The front desk gives the `openbox` entry order 1000,
+or 10 more than the highest order already in the policy, so the door guard
+runs last and judges the request as it will actually leave, after any
+redaction by middleware such as NVIDIA's APF.
+
+So with APF and OpenBox on the same sandbox:
+
+- APF denies: the request stops at APF; OpenBox does not see it.
+- APF allows (or rewrites): OpenBox judges what APF passed on. An OpenBox
+  deny holds whatever APF said.
+- Approvals and halts work as usual; APF does not see OpenBox's retries as
+  different requests unless APF rewrites them differently each time.
+
+## Signed verdict records
+
+The door guard can sign a hash-chained record of every verdict, checkable
+with `openbox-evidence verify` and only the public key. See
+`docs/evidence.md`.
 
 ## Forwarding to your SIEM
 
@@ -498,11 +607,13 @@ Ours, or OpenShell's design:
 - Raw TCP (`protocol: tcp`: Postgres, SSH, Redis) and `tls: skip` hosts are
   allowed or denied by host and port only. No per-request verdict. Put
   internal systems behind HTTP or MCP.
-- WebSocket traffic passes through without per-message verdicts. See
+- WebSocket text messages are scored locally, not by Core, and binary
+  messages and messages from the destination are never seen. See
   `docs/websocket.md`.
-- Response bodies are recorded but never decide a verdict. Compressed
-  responses are recorded without a body, because OpenShell only offers their
-  headers.
+- Responses are judged locally for secrets, injected instructions and (when
+  asked) personal data; Core does not decide on them. Blocking a response
+  stops delivery only: the upstream call has already run. Compressed
+  responses carry no readable body and are delivered unjudged.
 - A policy shipped inside a sandbox image is ignored unless `--policy` is
   passed.
 - The mounted workspace is a write path to the host, limited by Landlock.
