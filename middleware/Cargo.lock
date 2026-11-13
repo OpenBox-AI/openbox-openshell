@@ -1026,6 +1026,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "prost-types",
+ "regex",
  "reqwest",
  "ring",
  "rustls",

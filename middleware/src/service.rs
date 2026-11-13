@@ -254,6 +254,20 @@ pub struct MiddlewareConfig {
     /// The sandbox's profile, sent to Core as `profile_id` so a policy can
     /// tell one kind of sandbox from another under the same agent.
     pub profile: Option<String>,
+    /// What Core may see of the sandbox's request and response content:
+    /// `capture` (one mode) and `capture_hosts` (per-host modes).
+    pub capture: crate::capture::Policy,
+}
+
+/// The most per-host capture overrides a policy may set.
+const MAX_CAPTURE_HOSTS: usize = 64;
+
+fn capture_mode(value: &prost_types::Value, what: &str) -> Result<crate::capture::Mode, String> {
+    match value.kind.as_ref() {
+        Some(Kind::StringValue(text)) => crate::capture::Mode::parse(text),
+        _ => None,
+    }
+    .ok_or_else(|| format!("{what} must be \"off\", \"hash\", \"findings\" or \"text\""))
 }
 
 /// Parses the policy-supplied middleware config. Only known keys are accepted
@@ -288,9 +302,39 @@ pub fn parse_config(config: Option<&Struct>) -> Result<MiddlewareConfig, String>
                     }
                 };
             }
+            "capture" => {
+                parsed.capture.mode = Some(capture_mode(value, "capture")?);
+            }
+            "capture_hosts" => {
+                let Some(Kind::StructValue(hosts)) = value.kind.as_ref() else {
+                    return Err("capture_hosts must map host patterns to capture modes".to_owned());
+                };
+                if hosts.fields.len() > MAX_CAPTURE_HOSTS {
+                    return Err(format!(
+                        "capture_hosts may name at most {MAX_CAPTURE_HOSTS} hosts"
+                    ));
+                }
+                // Exact hosts before wildcards, so the most specific wins.
+                let mut entries = Vec::new();
+                for (pattern, mode) in &hosts.fields {
+                    if !crate::capture::valid_host_pattern(pattern) {
+                        return Err(format!(
+                            "capture_hosts: {pattern:?} is not a lowercase host or *.host"
+                        ));
+                    }
+                    entries.push((
+                        pattern.clone(),
+                        capture_mode(mode, &format!("capture_hosts[{pattern:?}]"))?,
+                    ));
+                }
+                entries.sort_by_key(|(pattern, _)| {
+                    (pattern.starts_with("*."), std::cmp::Reverse(pattern.len()))
+                });
+                parsed.capture.hosts = entries;
+            }
             other => {
                 return Err(format!(
-                    "unknown config key {other:?}; supported: approval_mode, profile"
+                    "unknown config key {other:?}; supported: approval_mode, profile, capture, capture_hosts"
                 ));
             }
         }
@@ -386,6 +430,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> SupervisorMiddleware for Verdict
         let config = parse_config(evaluation.config.as_ref()).map_err(Status::invalid_argument)?;
         let mut action = Action::from_evaluation(&evaluation);
         action.profile = config.profile;
+        action.capture = config.capture;
         Ok(Response::new(
             self.guard.evaluate(&action, config.approval_mode).await,
         ))
@@ -604,9 +649,12 @@ mod tests {
         );
         let completion = completed(&core).await;
         assert_eq!(completion.request_id, "req-1");
+        // Read in full, sent to Core as captured: digest, findings, shape.
+        let body: serde_json::Value =
+            serde_json::from_str(completion.response_body.as_str().unwrap()).unwrap();
         assert_eq!(
-            completion.response_body.as_deref(),
-            Some(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)
+            body["shape"],
+            serde_json::json!({"jsonrpc": "string", "id": "number", "result": {}})
         );
     }
 
@@ -624,7 +672,10 @@ mod tests {
             Some(http_response_event_result::Result::PreflightResult(preflight))
                 if matches!(preflight.action, Some(http_response_preflight_result::Action::Skip(_)))
         ));
-        assert_eq!(completed(&core).await.response_body, None);
+        assert_eq!(
+            completed(&core).await.response_body,
+            serde_json::Value::Null
+        );
     }
 
     fn with_token<T>(message: T, token: &str) -> Request<T> {
@@ -657,6 +708,74 @@ mod tests {
     }
 
     #[test]
+    fn config_sets_capture_for_the_sandbox_and_per_host() {
+        use crate::capture::Mode;
+        let hosts = Struct {
+            fields: [
+                ("*.corp.example", "off"),
+                ("api.internal.example", "text"),
+                ("git.corp.example", "hash"),
+            ]
+            .into_iter()
+            .map(|(host, mode)| {
+                (
+                    host.to_owned(),
+                    Value {
+                        kind: Some(Kind::StringValue(mode.to_owned())),
+                    },
+                )
+            })
+            .collect(),
+        };
+        let mut authored = config(&[("capture", "hash")]);
+        authored.fields.insert(
+            "capture_hosts".to_owned(),
+            Value {
+                kind: Some(Kind::StructValue(hosts)),
+            },
+        );
+        let parsed = parse_config(Some(&authored)).unwrap();
+        assert_eq!(parsed.capture.mode, Some(Mode::Hash));
+        // The exact host wins over the wildcard that also matches it.
+        assert_eq!(
+            parsed.capture.mode_for("git.corp.example", Mode::Findings),
+            Mode::Hash
+        );
+        assert_eq!(
+            parsed.capture.mode_for("wiki.corp.example", Mode::Findings),
+            Mode::Off
+        );
+        assert_eq!(
+            parsed
+                .capture
+                .mode_for("api.internal.example", Mode::Findings),
+            Mode::Text
+        );
+        assert_eq!(
+            parsed.capture.mode_for("example.com", Mode::Findings),
+            Mode::Hash
+        );
+
+        assert!(parse_config(Some(&config(&[("capture", "raw")]))).is_err());
+        let mut bad = config(&[]);
+        bad.fields.insert(
+            "capture_hosts".to_owned(),
+            Value {
+                kind: Some(Kind::StructValue(config(&[("Bad Host", "text")]))),
+            },
+        );
+        assert!(parse_config(Some(&bad)).is_err());
+        let mut bad = config(&[]);
+        bad.fields.insert(
+            "capture_hosts".to_owned(),
+            Value {
+                kind: Some(Kind::StringValue("text".to_owned())),
+            },
+        );
+        assert!(parse_config(Some(&bad)).is_err());
+    }
+
+    #[test]
     fn config_accepts_only_known_keys() {
         assert_eq!(parse_config(None), Ok(MiddlewareConfig::default()));
         assert_eq!(
@@ -668,6 +787,7 @@ mod tests {
             Ok(MiddlewareConfig {
                 approval_mode: ApprovalMode::Deny,
                 profile: None,
+                capture: crate::capture::Policy::default(),
             })
         );
         assert_eq!(
@@ -678,6 +798,7 @@ mod tests {
             Ok(MiddlewareConfig {
                 approval_mode: ApprovalMode::Queue,
                 profile: Some("coding".to_owned()),
+                capture: crate::capture::Policy::default(),
             })
         );
         assert!(parse_config(Some(&config(&[("profile", " ")]))).is_err());
