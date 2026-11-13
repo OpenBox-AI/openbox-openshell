@@ -151,7 +151,13 @@ pub fn required_attachment(policy: &Value) -> Value {
     {
         config["profile"] = json!(profile);
     }
-    for key in ["capture", "capture_hosts"] {
+    for key in [
+        "capture",
+        "capture_hosts",
+        "responses",
+        "response_kinds",
+        "websocket",
+    ] {
         if let Some(value) = authored.and_then(|config| config.get(key)) {
             config[key] = value.clone();
         }

@@ -441,6 +441,45 @@ itself: the request goes out unchanged. A CONSTRAIN verdict without
 `constraints` is allowed unchanged too, as before. Any other string is a
 constraint the door guard cannot meet.
 
+## Responses and WebSocket messages
+
+What comes back into the sandbox is checked by the door guard itself, with
+the detectors listed under "What Core receives", against a sandbox policy's
+settings in the `openbox` middleware config:
+
+```yaml
+network_middlewares:
+  openbox:
+    middleware: openbox
+    config:
+      responses: block          # findings (default), redact or block
+      response_kinds: [aws_access_key, private_key, jwt, api_key, prompt_injection, email]
+      websocket: enforce        # findings (default), enforce or skip
+```
+
+| `responses` | A response carrying one of `response_kinds` |
+|---|---|
+| `findings` | is delivered unchanged; the kinds found are logged in OpenShell's OCSF log and recorded with the request in the session |
+| `redact` | is delivered with each match replaced by `[REDACTED]` |
+| `block` | is not delivered: the sandbox gets `openbox_response_blocked` |
+
+`response_kinds` defaults to the secrets and `prompt_injection` (instructions
+planted in a tool result or a page to redirect the agent). Personal data
+(`email`, `payment_card`, `us_ssn`) is acted on only when listed.
+
+`redact` and `block` read the whole body when OpenShell offers it, so a match
+is never split between two pieces; otherwise the body is judged piece by
+piece as it streams, and a match across a boundary can be missed.
+
+**The upstream call has already run.** Blocking a response keeps its content
+out of the sandbox; it does not undo what the request did at the destination.
+Block requests with policy for that.
+
+`websocket` applies to text messages from the sandbox: `findings` scores each
+one and records the kinds found in the session, `enforce` denies a message
+carrying one of `response_kinds` (or, with `responses: redact`, delivers it
+redacted), and `skip` turns inspection off. See `docs/websocket.md`.
+
 ## Approval scopes
 
 An approval covers its own request. Core can widen it by sending
@@ -519,11 +558,13 @@ Ours, or OpenShell's design:
 - Raw TCP (`protocol: tcp`: Postgres, SSH, Redis) and `tls: skip` hosts are
   allowed or denied by host and port only. No per-request verdict. Put
   internal systems behind HTTP or MCP.
-- WebSocket traffic passes through without per-message verdicts. See
+- WebSocket text messages are scored locally, not by Core, and binary
+  messages and messages from the destination are never seen. See
   `docs/websocket.md`.
-- Response bodies are recorded but never decide a verdict. Compressed
-  responses are recorded without a body, because OpenShell only offers their
-  headers.
+- Responses are judged locally for secrets, injected instructions and (when
+  asked) personal data; Core does not decide on them. Blocking a response
+  stops delivery only: the upstream call has already run. Compressed
+  responses carry no readable body and are delivered unjudged.
 - A policy shipped inside a sandbox image is ignored unless `--policy` is
   passed.
 - The mounted workspace is a write path to the host, limited by Landlock.
