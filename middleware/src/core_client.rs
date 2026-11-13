@@ -82,6 +82,9 @@ pub struct CoreDecision {
     /// With CONSTRAIN: what to change before the request goes out
     /// ([`crate::constrain`]). `None` when Core sent none.
     pub constraints: Option<Value>,
+    /// How long an identical action may reuse this allow without asking
+    /// Core again ([`crate::fastpath`] tier 1). `None` when Core sent none.
+    pub verdict_ttl_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -607,6 +610,7 @@ struct EvaluateResponse {
     approval_expiration_time: Option<String>,
     policy_id: Option<String>,
     constraints: Option<Value>,
+    verdict_ttl_secs: Option<u64>,
 }
 
 impl EvaluateResponse {
@@ -630,6 +634,7 @@ impl EvaluateResponse {
                 .and_then(parse_rfc3339),
             policy_id: self.policy_id.filter(|id| !id.is_empty()),
             constraints: self.constraints.filter(|value| !value.is_null()),
+            verdict_ttl_secs: self.verdict_ttl_secs,
         })
     }
 }
@@ -1150,6 +1155,7 @@ mod tests {
             approval_expiration_time: None,
             policy_id: None,
             constraints: None,
+            verdict_ttl_secs: None,
         };
         assert!(matches!(
             response.into_decision(),

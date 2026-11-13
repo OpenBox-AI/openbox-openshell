@@ -163,6 +163,25 @@ doorGuard:
   # OPENBOX_BODY_CAPTURE: request and response bodies, tool arguments and
   # results, and model replies.
   bodyCapture: findings
+  # Fast-path verdicts (docs/install.md, "Fast-path verdicts").
+  fastPath:
+    # Tier 0: a local rule snapshot, as JSON under `rules.json` in this
+    # ConfigMap (OPENBOX_RULES_FILE). Empty: no local rules.
+    rulesConfigMap: ""
+    # OPENBOX_RULES_MODE: shadow (count agreement with Core, Core decides)
+    # or enforce (a matching rule decides). off ignores the snapshot.
+    rulesMode: shadow
+    # OPENBOX_VERDICT_TTL_SECS. Tier 1: reuse Core's allow of an action for
+    # an identical one this long when Core sends no TTL of its own. 0 = only
+    # when Core sends one.
+    verdictTtlSecs: 0
+    # OPENBOX_SLOW_CORE: pending (the default, decision D1: wait
+    # pendingWaitMs, then deny openbox_pending and hand the verdict to the
+    # identical retry) or inline (wait for Core, up to coreTimeoutMs).
+    # pending needs Redis or one replica.
+    slowCore: pending
+    # OPENBOX_PENDING_WAIT_MS.
+    pendingWaitMs: 2000
   # Seconds Kubernetes waits after SIGTERM. The door guard stops taking
   # calls, finishes the ones in flight, and sends what it still owes Core.
   terminationGracePeriodSeconds: 30
