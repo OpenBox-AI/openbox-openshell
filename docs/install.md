@@ -518,6 +518,12 @@ To treat every approval as a block instead, set `approval_mode: deny` in the
 `openbox` entry's `config` with a policy update. The front desk writes
 `queue` at create time.
 
+## Signed verdict records
+
+The door guard can sign a hash-chained record of every verdict, checkable
+with `openbox-evidence verify` and only the public key. See
+`docs/evidence.md`.
+
 ## Forwarding to your SIEM
 
 There are two sources.

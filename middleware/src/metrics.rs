@@ -108,6 +108,8 @@ pub struct Metrics {
     halt_stop_latency: Histogram,
     /// (confirmed) → count.
     halt_stops: Mutex<BTreeMap<bool, u64>>,
+    /// Evidence records: (written) → count.
+    evidence: Mutex<BTreeMap<bool, u64>>,
 }
 
 impl Metrics {
@@ -162,6 +164,15 @@ impl Metrics {
         if confirmed {
             self.halt_stop_latency.observe(elapsed);
         }
+    }
+
+    pub fn record_evidence(&self, written: bool) {
+        *self
+            .evidence
+            .lock()
+            .expect("metrics lock")
+            .entry(written)
+            .or_default() += 1;
     }
 
     pub fn record_fast_disagreement(&self) {
@@ -277,6 +288,15 @@ impl Metrics {
         out.push_str("# TYPE openbox_mw_halt_stop_seconds histogram\n");
         self.halt_stop_latency
             .render(out, "openbox_mw_halt_stop_seconds", "");
+        out.push_str("# HELP openbox_mw_evidence_records_total Verdict records, by whether they were written. Alert on failed: the evidence has a gap.\n");
+        out.push_str("# TYPE openbox_mw_evidence_records_total counter\n");
+        for (written, count) in self.evidence.lock().expect("metrics lock").iter() {
+            let outcome = if *written { "written" } else { "failed" };
+            let _ = writeln!(
+                out,
+                "openbox_mw_evidence_records_total{{outcome=\"{outcome}\"}} {count}"
+            );
+        }
         out.push_str("# HELP openbox_mw_fast_path_disagreements_total Fast-path allows Core later refused.\n");
         out.push_str("# TYPE openbox_mw_fast_path_disagreements_total counter\n");
         let _ = writeln!(
