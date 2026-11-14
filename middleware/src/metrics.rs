@@ -104,6 +104,7 @@ pub struct Metrics {
     shadow: Mutex<BTreeMap<bool, u64>>,
     /// Fast-path allows Core later disagreed with.
     fast_disagreements: AtomicU64,
+    background_dropped: AtomicU64,
     /// From a HALT verdict to the gateway confirming the sandbox stopped.
     halt_stop_latency: Histogram,
     /// (confirmed) → count.
@@ -183,6 +184,11 @@ impl Metrics {
 
     pub fn record_fast_disagreement(&self) {
         self.fast_disagreements.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A background Core record dropped because the sandbox's queue was full.
+    pub fn record_background_dropped(&self) -> u64 {
+        self.background_dropped.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn record_core(&self, call: CoreCall, ok: bool, elapsed: Duration) {
@@ -316,6 +322,13 @@ impl Metrics {
             out,
             "openbox_mw_fast_path_disagreements_total {}",
             self.fast_disagreements.load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP openbox_mw_core_background_dropped_total Background Core records dropped because Core fell too far behind.\n");
+        out.push_str("# TYPE openbox_mw_core_background_dropped_total counter\n");
+        let _ = writeln!(
+            out,
+            "openbox_mw_core_background_dropped_total {}",
+            self.background_dropped.load(Ordering::Relaxed)
         );
     }
 }
