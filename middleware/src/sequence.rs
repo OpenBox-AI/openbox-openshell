@@ -12,8 +12,9 @@
 //! replica: a sandbox's traffic reaches one replica at a time in practice,
 //! and the shared store, not this queue, keeps replicas consistent.
 //!
-//! A sandbox's background work is bounded ([`MAX_BACKLOG`] jobs): when Core
-//! falls that far behind, further background records for the sandbox are
+//! Background work is bounded, [`MAX_BACKLOG`] jobs per sandbox and
+//! [`MAX_TOTAL_BACKLOG`] in all (each job holds its Core call's future, tens
+//! of KiB): when Core falls that far behind, further background records are
 //! dropped and counted, rather than held in memory until the process is
 //! killed. Verdicts are never dropped.
 
@@ -29,19 +30,23 @@ use crate::telemetry;
 
 type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// The job, taking itself off the queue's count when it finishes.
-fn counted(job: Job, depth: &Arc<AtomicUsize>) -> Job {
-    let depth = Arc::clone(depth);
+/// The job, taking itself off the counts when it finishes.
+fn counted(job: Job, depth: &Arc<AtomicUsize>, total: &Arc<AtomicUsize>) -> Job {
+    let (depth, total) = (Arc::clone(depth), Arc::clone(total));
+    total.fetch_add(1, Ordering::Relaxed);
     Box::pin(async move {
         job.await;
         depth.fetch_sub(1, Ordering::Relaxed);
+        total.fetch_sub(1, Ordering::Relaxed);
     })
 }
 
 /// How long a sandbox's queue waits for work before it is put away.
 const IDLE: Duration = Duration::from_secs(10 * 60);
 /// Most background jobs a sandbox's queue holds while Core catches up.
-pub const MAX_BACKLOG: usize = 1000;
+pub const MAX_BACKLOG: usize = 256;
+/// Most background jobs held across all sandboxes.
+pub const MAX_TOTAL_BACKLOG: usize = 4096;
 
 struct Queue {
     sender: mpsc::UnboundedSender<Job>,
@@ -55,6 +60,9 @@ pub struct Sequencer {
     /// sandbox's queue.
     job_timeout: Duration,
     max_backlog: usize,
+    max_total: usize,
+    /// Jobs queued and not yet finished, across all sandboxes.
+    total: Arc<AtomicUsize>,
 }
 
 /// A verdict's place in its sandbox's queue: everything queued before it has
@@ -65,26 +73,30 @@ pub struct Turn {
 
 impl Sequencer {
     pub fn new(job_timeout: Duration) -> Arc<Self> {
-        Self::with_backlog(job_timeout, MAX_BACKLOG)
+        Self::with_backlog(job_timeout, MAX_BACKLOG, MAX_TOTAL_BACKLOG)
     }
 
-    pub fn with_backlog(job_timeout: Duration, max_backlog: usize) -> Arc<Self> {
+    pub fn with_backlog(job_timeout: Duration, max_backlog: usize, max_total: usize) -> Arc<Self> {
         Arc::new(Self {
             queues: Mutex::new(HashMap::new()),
             job_timeout,
             max_backlog: max_backlog.max(1),
+            max_total: max_total.max(1),
+            total: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     /// Queues background work for a sandbox, after everything already
     /// queued. Returns false, and drops the job, when the sandbox already has
-    /// `max_backlog` jobs waiting.
+    /// `max_backlog` jobs waiting, or all sandboxes together `max_total`.
     pub fn push(
         self: &Arc<Self>,
         sandbox_id: &str,
         job: impl Future<Output = ()> + Send + 'static,
     ) -> bool {
-        if self.depth(sandbox_id) >= self.max_backlog {
+        if self.depth(sandbox_id) >= self.max_backlog
+            || self.total.load(Ordering::Relaxed) >= self.max_total
+        {
             return false;
         }
         let timeout = self.job_timeout;
@@ -172,14 +184,14 @@ impl Sequencer {
             // lock, so an open sender here stays open for this send.
             if !queue.sender.is_closed() {
                 queue.depth.fetch_add(1, Ordering::Relaxed);
-                let _ = queue.sender.send(counted(job, &queue.depth));
+                let _ = queue.sender.send(counted(job, &queue.depth, &self.total));
                 return;
             }
             queues.remove(sandbox_id);
         }
         let (sender, receiver) = mpsc::unbounded_channel();
         let depth = Arc::new(AtomicUsize::new(1));
-        let _ = sender.send(counted(job, &depth));
+        let _ = sender.send(counted(job, &depth, &self.total));
         queues.insert(sandbox_id.to_owned(), Queue { sender, depth });
         tokio::spawn(Arc::clone(self).run(sandbox_id.to_owned(), receiver));
     }
@@ -264,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_work_is_bounded_per_sandbox_and_verdicts_still_run() {
-        let sequencer = Sequencer::with_backlog(Duration::from_secs(5), 3);
+        let sequencer = Sequencer::with_backlog(Duration::from_secs(5), 3, 4);
         let (open, gate) = tokio::sync::watch::channel(false);
         let held = |gate: tokio::sync::watch::Receiver<bool>| async move {
             let mut gate = gate;
