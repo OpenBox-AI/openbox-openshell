@@ -78,6 +78,8 @@ spec:
             {{- if $fd.fleetChecks }}
             - name: OPENBOX_FD_FLEET_CHECKS
               value: "on"
+            - name: OPENBOX_FD_FLEET_WAIT_MS
+              value: {{ $fd.fleetWaitMs | int64 | quote }}
             {{- end }}
             {{- if $fd.openshellVersion }}
             - name: OPENBOX_FD_OPENSHELL_VERSION

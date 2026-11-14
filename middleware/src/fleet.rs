@@ -23,13 +23,14 @@
 //! finds the same approval. Content never leaves the front desk: Core gets
 //! the score, its factors, the sandbox and rule names, and the hosts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 
 use crate::core_client::{Activity, ApprovalState, CoreClient, CoreError, Verdict};
 use crate::front_desk::{
@@ -223,7 +224,7 @@ impl FleetState {
 }
 
 /// Why an operation may not go ahead, for the gateway to show.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FleetRefusal(pub String);
 
 /// What the fleet check needs from Core; a trait so it can be tested.
@@ -259,106 +260,198 @@ impl FleetCore for CoreClient {
     }
 }
 
+/// How long a check waits for Core before refusing with "still checking"
+/// when nothing else is set: under the gateway's default interceptor timeout
+/// (500 ms).
+pub const DEFAULT_WAIT: Duration = Duration::from_millis(400);
+
+/// How long a decided outcome waits to be collected by the same operation
+/// asked again before it is dropped and the next ask judges afresh.
+const KEEP_DECIDED: Duration = Duration::from_secs(120);
+
+type Outcome = Option<Result<u32, FleetRefusal>>;
+
+struct Pending {
+    outcome: watch::Receiver<Outcome>,
+    since: Instant,
+}
+
 /// The fleet check.
+///
+/// Core can take longer than the gateway gives an interceptor, so each
+/// operation is judged in the background and the check waits at most
+/// `wait` for it. An operation still undecided by then is refused with
+/// "still checking"; asking again (the same operation has the same id)
+/// collects the outcome once Core has answered.
 pub struct FleetGovernance<C: ?Sized> {
-    core: std::sync::Arc<C>,
-    session: String,
-    started: OnceCell<()>,
+    core: Arc<C>,
+    session: Arc<str>,
+    started: Arc<OnceCell<()>>,
+    wait: Duration,
+    pending: Mutex<HashMap<String, Pending>>,
     pub state: FleetState,
 }
 
 impl<C: FleetCore + ?Sized> FleetGovernance<C> {
-    pub fn new(core: std::sync::Arc<C>, gateway_id: &str) -> Self {
+    pub fn new(core: Arc<C>, gateway_id: &str) -> Self {
         Self {
             core,
-            session: format!("openshell-fleet-{gateway_id}"),
-            started: OnceCell::new(),
+            session: format!("openshell-fleet-{gateway_id}").into(),
+            started: Arc::new(OnceCell::new()),
+            wait: DEFAULT_WAIT,
+            pending: Mutex::new(HashMap::new()),
             state: FleetState::default(),
         }
+    }
+
+    /// How long a check waits for Core (keep it under the gateway
+    /// registration's `timeout`).
+    #[must_use]
+    pub const fn with_wait(mut self, wait: Duration) -> Self {
+        self.wait = wait;
+        self
     }
 
     /// Asks `OpenBox` whether an operation may go ahead. Core unreachable or
     /// failing is a refusal: the front desk fails closed.
     pub async fn check(&self, operation: &Operation) -> Result<u32, FleetRefusal> {
-        let unavailable = |error: CoreError| {
-            FleetRefusal(format!(
-                "OpenBox could not check this change ({error:?}); try again"
-            ))
-        };
-        self.started
-            .get_or_try_init(|| async { self.core.start(&self.session).await })
-            .await
-            .map_err(unavailable)?;
-        let risk = operation.risk();
         let activity_id = operation.activity_id();
-        match self.core.approval(&self.session, &activity_id).await {
-            Ok(ApprovalState::Approved(_)) => return Ok(risk.score),
-            Ok(ApprovalState::Pending { .. }) => {
-                return Err(FleetRefusal(format!(
-                    "waiting for approval in OpenBox ({}, risk {}); ask again once it is approved",
-                    operation.kind(),
-                    risk.score
-                )));
-            }
-            Ok(ApprovalState::Rejected(_)) => {
-                return Err(FleetRefusal(format!(
-                    "refused in OpenBox ({}, risk {})",
-                    operation.kind(),
-                    risk.score
-                )));
-            }
-            // Core has not seen it, or the approval lapsed: judge it now.
-            Ok(ApprovalState::Gone) => {}
-            Err(error) => return Err(unavailable(error)),
-        }
-        let (count, total) = self.state.totals_without(operation.sandbox());
-        let mut input = json!({
-            "operation": operation.kind(),
-            "sandbox": operation.sandbox(),
-            "risk": risk.score,
-            "factors": risk.factors,
-            "hosts": risk.hosts,
-            "fleet": {
-                "sandboxes": count,
-                "risk": total,
-                "sandboxes_after": count + 1,
-                "risk_after": total + risk.score,
-            },
-        });
-        if let Operation::Proposal {
-            chunk_id,
-            rule_name,
-            ..
-        } = operation
-        {
-            input["chunk_id"] = json!(chunk_id);
-            input["rule_name"] = json!(rule_name);
-        }
-        let activity = Activity {
-            id: activity_id,
-            kind: operation.kind().to_owned(),
-            input: json!([input]),
-            profile: None,
-        };
-        let (verdict, reason) = self
-            .core
-            .judge(&self.session, &activity)
+        let mut outcome = self.outcome_for(&activity_id, operation);
+        let decided = tokio::time::timeout(self.wait, outcome.wait_for(Option::is_some))
             .await
-            .map_err(unavailable)?;
-        let because = reason.map_or_else(String::new, |reason| format!(": {reason}"));
-        match verdict {
-            Verdict::Allow | Verdict::Constrain => Ok(risk.score),
-            Verdict::RequireApproval => Err(FleetRefusal(format!(
-                "needs approval in OpenBox ({}, risk {}){because}; ask again once it is approved",
-                operation.kind(),
-                risk.score
-            ))),
-            Verdict::Block | Verdict::Halt => Err(FleetRefusal(format!(
-                "refused by OpenBox governance ({}, risk {}){because}",
-                operation.kind(),
-                risk.score
-            ))),
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|outcome| outcome.clone());
+        if let Some(decided) = decided {
+            self.pending
+                .lock()
+                .expect("fleet lock")
+                .remove(&activity_id);
+            return decided;
         }
+        Err(FleetRefusal(format!(
+            "OpenBox is still checking this change ({}, risk {}); make the same change again in a few seconds",
+            operation.kind(),
+            operation.risk().score
+        )))
+    }
+
+    /// The outcome being worked out for this operation, starting the work if
+    /// nothing is under way.
+    fn outcome_for(&self, activity_id: &str, operation: &Operation) -> watch::Receiver<Outcome> {
+        let mut pending = self.pending.lock().expect("fleet lock");
+        pending.retain(|_, entry| {
+            entry.since.elapsed() < KEEP_DECIDED || entry.outcome.borrow().is_none()
+        });
+        if let Some(entry) = pending.get(activity_id) {
+            return entry.outcome.clone();
+        }
+        let (send, outcome) = watch::channel(None);
+        let totals = self.state.totals_without(operation.sandbox());
+        let work = judge(
+            Arc::clone(&self.core),
+            Arc::clone(&self.session),
+            Arc::clone(&self.started),
+            operation.clone(),
+            activity_id.to_owned(),
+            totals,
+        );
+        tokio::spawn(async move {
+            let _ = send.send(Some(work.await));
+        });
+        pending.insert(
+            activity_id.to_owned(),
+            Pending {
+                outcome: outcome.clone(),
+                since: Instant::now(),
+            },
+        );
+        outcome
+    }
+}
+
+/// One operation judged by Core: an approval already given (or pending)
+/// first, otherwise a fresh verdict.
+async fn judge<C: FleetCore + ?Sized>(
+    core: Arc<C>,
+    session: Arc<str>,
+    started: Arc<OnceCell<()>>,
+    operation: Operation,
+    activity_id: String,
+    (count, total): (usize, u32),
+) -> Result<u32, FleetRefusal> {
+    let unavailable = |error: CoreError| {
+        FleetRefusal(format!(
+            "OpenBox could not check this change ({error:?}); try again"
+        ))
+    };
+    started
+        .get_or_try_init(|| async { core.start(&session).await })
+        .await
+        .map_err(unavailable)?;
+    let risk = operation.risk();
+    match core.approval(&session, &activity_id).await {
+        Ok(ApprovalState::Approved(_)) => return Ok(risk.score),
+        Ok(ApprovalState::Pending { .. }) => {
+            return Err(FleetRefusal(format!(
+                "waiting for approval in OpenBox ({}, risk {}); ask again once it is approved",
+                operation.kind(),
+                risk.score
+            )));
+        }
+        Ok(ApprovalState::Rejected(_)) => {
+            return Err(FleetRefusal(format!(
+                "refused in OpenBox ({}, risk {})",
+                operation.kind(),
+                risk.score
+            )));
+        }
+        // Core has not seen it, or the approval lapsed: judge it now.
+        Ok(ApprovalState::Gone) => {}
+        Err(error) => return Err(unavailable(error)),
+    }
+    let mut input = json!({
+        "operation": operation.kind(),
+        "sandbox": operation.sandbox(),
+        "risk": risk.score,
+        "factors": risk.factors,
+        "hosts": risk.hosts,
+        "fleet": {
+            "sandboxes": count,
+            "risk": total,
+            "sandboxes_after": count + 1,
+            "risk_after": total + risk.score,
+        },
+    });
+    if let Operation::Proposal {
+        chunk_id,
+        rule_name,
+        ..
+    } = &operation
+    {
+        input["chunk_id"] = json!(chunk_id);
+        input["rule_name"] = json!(rule_name);
+    }
+    let activity = Activity {
+        id: activity_id,
+        kind: operation.kind().to_owned(),
+        input: json!([input]),
+        profile: None,
+    };
+    let (verdict, reason) = core.judge(&session, &activity).await.map_err(unavailable)?;
+    let because = reason.map_or_else(String::new, |reason| format!(": {reason}"));
+    match verdict {
+        Verdict::Allow | Verdict::Constrain => Ok(risk.score),
+        Verdict::RequireApproval => Err(FleetRefusal(format!(
+            "needs approval in OpenBox ({}, risk {}){because}; ask again once it is approved",
+            operation.kind(),
+            risk.score
+        ))),
+        Verdict::Block | Verdict::Halt => Err(FleetRefusal(format!(
+            "refused by OpenBox governance ({}, risk {}){because}",
+            operation.kind(),
+            risk.score
+        ))),
     }
 }
 
@@ -532,6 +625,7 @@ mod tests {
         verdict: Mutex<Option<Verdict>>,
         judged: Mutex<Vec<Activity>>,
         down: bool,
+        slow: Option<Duration>,
     }
 
     #[tonic::async_trait]
@@ -556,6 +650,9 @@ mod tests {
             _: &str,
             activity: &Activity,
         ) -> Result<(Verdict, Option<String>), CoreError> {
+            if let Some(slow) = self.slow {
+                tokio::time::sleep(slow).await;
+            }
             self.judged.lock().unwrap().push(activity.clone());
             Ok((
                 self.verdict.lock().unwrap().unwrap_or(Verdict::Allow),
@@ -677,5 +774,42 @@ mod tests {
                 .0
                 .contains("could not check")
         );
+    }
+
+    #[tokio::test]
+    async fn a_slow_core_is_still_checking_and_the_retry_collects_its_verdict() {
+        let core = Arc::new(FakeCore {
+            slow: Some(Duration::from_millis(300)),
+            ..FakeCore::default()
+        });
+        *core.verdict.lock().unwrap() = Some(Verdict::Block);
+        let fleet =
+            FleetGovernance::new(Arc::clone(&core), "gw").with_wait(Duration::from_millis(50));
+        let first = fleet.check(&create("s", "x")).await.unwrap_err();
+        assert!(first.0.contains("still checking"), "{}", first.0);
+        // asking again while Core works does not judge it twice
+        assert!(
+            fleet
+                .check(&create("s", "x"))
+                .await
+                .unwrap_err()
+                .0
+                .contains("still checking")
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let decided = fleet.check(&create("s", "x")).await.unwrap_err();
+        assert!(
+            decided.0.contains("refused by OpenBox governance"),
+            "{}",
+            decided.0
+        );
+        assert_eq!(core.judged.lock().unwrap().len(), 1);
+        // the outcome is used once: the next ask judges afresh
+        *core.verdict.lock().unwrap() = Some(Verdict::Allow);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let _ = fleet.check(&create("s", "x")).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(fleet.check(&create("s", "x")).await, Ok(1));
+        assert_eq!(core.judged.lock().unwrap().len(), 2);
     }
 }

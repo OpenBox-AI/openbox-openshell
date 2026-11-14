@@ -256,6 +256,12 @@ frontDesk:
   # checks"). Needs sessions (OPENBOX_URL); proposal checks also need the
   # gateway API credential. Refuses the change when OpenBox cannot answer.
   fleetChecks: false
+  # OPENBOX_FD_FLEET_WAIT_MS. How long a fleet check waits for Core before
+  # refusing with "still checking" (the same change made again collects the
+  # verdict). Keep it under the governing registration's `timeout`: 400 fits
+  # OpenShell's default of 500 ms; with `timeout = "10s"` use 9000 so most
+  # changes are decided in one go.
+  fleetWaitMs: 400
   terminationGracePeriodSeconds: 30
   extraEnv: []
   podAnnotations: {}

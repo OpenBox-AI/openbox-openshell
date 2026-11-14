@@ -203,7 +203,15 @@ fn fleet_from_env(core: Option<Arc<CoreClient>>) -> Result<Option<FleetSetup>, S
     let core = core.ok_or("OPENBOX_FD_FLEET_CHECKS=on needs OPENBOX_URL")?;
     let gateway_id = env("OPENBOX_FD_GATEWAY_ID").unwrap_or_else(|| "gateway".to_owned());
     let core: Arc<dyn FleetCore> = core;
-    let checks = Arc::new(FleetGovernance::new(core, &gateway_id));
+    let wait = match env("OPENBOX_FD_FLEET_WAIT_MS") {
+        None => fleet::DEFAULT_WAIT,
+        Some(value) => Duration::from_millis(
+            value
+                .parse()
+                .map_err(|_| "OPENBOX_FD_FLEET_WAIT_MS must be a number of milliseconds")?,
+        ),
+    };
+    let checks = Arc::new(FleetGovernance::new(core, &gateway_id).with_wait(wait));
     let lister = if let (Some(endpoint), Some(dir)) = (
         env("OPENBOX_GATEWAY_ENDPOINT"),
         env("OPENBOX_GATEWAY_MTLS_DIR"),
