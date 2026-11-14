@@ -305,7 +305,7 @@ securityContext:
 # -- Ship OpenShell's OCSF log (docs/install.md, "Forwarding to your SIEM").
 # Turn the export on first: openshell settings set --global --key
 # ocsf_json_enabled --value true. A DaemonSet then follows every
-# openshell-ocsf.YYYY-MM-DD.log on each node (sandbox pods and shared
+# openshell-ocsf.YYYY-MM-DD.jsonl on each node (sandbox pods and shared
 # supervisor pods alike keep it in their `logs` emptyDir) and writes each
 # line, unchanged, to stdout, so the log pipeline that ships pod logs ships
 # these too, within a few seconds of OpenShell writing them.

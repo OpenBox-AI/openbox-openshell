@@ -6,7 +6,7 @@
 //! openbox-evidence check --key <public key> --certificate <cert.json> <records.jsonl>...
 //! openbox-evidence check --core-key <org public key> --certificate <cert.json> <records.jsonl>...
 //! openbox-evidence collect-ocsf [--dir <dir>]... [--kubelet-pods <dir>]... [--state <file>] [--interval-secs <n>] [--once]
-//! openbox-evidence join --ocsf <openshell-ocsf.log>... [--window-ms <n>] <records.jsonl>...
+//! openbox-evidence join --ocsf <openshell-ocsf.jsonl>... [--window-ms <n>] <records.jsonl>...
 //! ```
 //!
 //! `verify` checks every record's fingerprint and signature and each chain's
@@ -40,7 +40,7 @@ use openbox_verdict_middleware::ocsf::{self, Collector, Source};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage:\n  openbox-evidence verify --key <public key> [--partial] <records.jsonl>...\n  openbox-evidence seal --signing-key <private key> --chain <chain_uid> <records.jsonl>...\n  openbox-evidence check --key <public key> --certificate <cert.json> <records.jsonl>...\n  openbox-evidence check --core-key <org public key> --certificate <cert.json> <records.jsonl>...\n  openbox-evidence collect-ocsf [--dir <dir>]... [--kubelet-pods <dir>]... [--state <file>] [--interval-secs <n>] [--once]\n  openbox-evidence join --ocsf <openshell-ocsf.log>... [--window-ms <n>] <records.jsonl>..."
+        "usage:\n  openbox-evidence verify --key <public key> [--partial] <records.jsonl>...\n  openbox-evidence seal --signing-key <private key> --chain <chain_uid> <records.jsonl>...\n  openbox-evidence check --key <public key> --certificate <cert.json> <records.jsonl>...\n  openbox-evidence check --core-key <org public key> --certificate <cert.json> <records.jsonl>...\n  openbox-evidence collect-ocsf [--dir <dir>]... [--kubelet-pods <dir>]... [--state <file>] [--interval-secs <n>] [--once]\n  openbox-evidence join --ocsf <openshell-ocsf.jsonl>... [--window-ms <n>] <records.jsonl>..."
     );
     ExitCode::from(2)
 }
