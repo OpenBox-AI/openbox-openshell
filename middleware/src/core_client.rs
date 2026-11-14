@@ -494,9 +494,20 @@ impl CoreClient {
         action: &Action,
         activity_id: &str,
     ) -> Result<ApprovalState, CoreError> {
+        self.approval_state_for(&action.sandbox_id, activity_id)
+            .await
+    }
+
+    /// [`Self::approval_state`] for any session and activity, such as the
+    /// front desk's fleet checks.
+    pub async fn approval_state_for(
+        &self,
+        workflow_id: &str,
+        activity_id: &str,
+    ) -> Result<ApprovalState, CoreError> {
         let body = serde_json::to_vec(&json!({
-            "workflow_id": action.sandbox_id,
-            "run_id": action.sandbox_id,
+            "workflow_id": workflow_id,
+            "run_id": workflow_id,
             "activity_id": activity_id,
         }))
         .map_err(|_| CoreError::Malformed)?;

@@ -11,6 +11,7 @@ pub mod constrain;
 pub mod core_client;
 pub mod evidence;
 pub mod fastpath;
+pub mod fleet;
 pub mod front_desk;
 pub mod guard;
 pub mod halt;

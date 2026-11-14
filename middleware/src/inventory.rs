@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
-use openshell_core::proto::{ListSandboxesRequest, Sandbox, all_workspaces_selector};
+use openshell_core::proto::{
+    GetDraftPolicyRequest, ListSandboxesRequest, Sandbox, all_workspaces_selector,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -375,6 +377,38 @@ impl SandboxLister for GatewayLister {
             }
             page_token = page.next_page_token;
         }
+    }
+}
+
+#[tonic::async_trait]
+impl crate::fleet::DraftReader for GatewayLister {
+    async fn pending_chunks(&self, sandbox: &str) -> Result<Vec<Value>, String> {
+        let mut client = OpenShellClient::new(self.channel.clone());
+        let draft = client
+            .get_draft_policy(GetDraftPolicyRequest {
+                workspace_scope: None,
+                status_filter: "pending".to_owned(),
+                sandbox: sandbox.to_owned(),
+            })
+            .await
+            .map_err(|status| format!("gateway draft read failed: {}", status.code()))?
+            .into_inner();
+        Ok(draft
+            .chunks
+            .iter()
+            .map(|chunk| {
+                serde_json::json!({
+                    "id": chunk.id,
+                    "status": chunk.status,
+                    "rule_name": chunk.rule_name,
+                    "security_notes": chunk.security_notes,
+                    "proposed_rule": chunk
+                        .proposed_rule
+                        .as_ref()
+                        .map_or(Value::Null, crate::fleet::proto_rule_json),
+                })
+            })
+            .collect())
     }
 }
 

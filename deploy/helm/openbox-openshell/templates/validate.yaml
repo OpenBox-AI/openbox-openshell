@@ -33,6 +33,9 @@
 {{- if and $v.openbox.backendUrl (ne $v.credentials.identity "workload") -}}
 {{- fail "openbox.backendUrl (AI Inventory) needs credentials.identity workload" -}}
 {{- end -}}
+{{- if and $v.frontDesk.fleetChecks (not (and $v.frontDesk.sessions (eq $v.credentials.identity "workload"))) -}}
+{{- fail "frontDesk.fleetChecks needs frontDesk.sessions and credentials.identity: workload (the checks go to Core's v3 API)" -}}
+{{- end -}}
 {{- if and $v.openbox.backendUrl (not $v.frontDesk.sessions) -}}
 {{- fail "openbox.backendUrl needs frontDesk.sessions: the front desk gets its workload token through OPENBOX_URL" -}}
 {{- end -}}
