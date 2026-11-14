@@ -13,19 +13,35 @@
 //! Records carry identifiers and outcomes only: no request content.
 //! [`verify`] checks a set of records; [`seal`] batches a chain's records
 //! under a Merkle root into a signed certificate.
+//!
+//! With an outbox ([`Evidence::with_outbox`]) each chain's new records also
+//! wait to be sent to Core, which checks them and returns a Proof
+//! Certificate signed with the organisation's attestation key
+//! (OB-OSHELL-SPEC-002 R6.4). Certificates are written to the same sink as
+//! one line under [`CERTIFICATE_KEY`]; [`verify`] skips those lines and
+//! [`check_core_certificate`] checks one against the records it covers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
+use ring::signature::{
+    ECDSA_P256_SHA256_ASN1, ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// The top-level key of a Proof Certificate line in the evidence sink.
+pub const CERTIFICATE_KEY: &str = "openbox_certificate";
+/// Most records one chain keeps waiting for a certificate; past it the
+/// oldest are dropped from the outbox (they stay in the sink) and the next
+/// certificate starts after the gap.
+const MAX_OUTBOX: usize = 10_000;
 
 /// The signing key, kept by the door guard (a Kubernetes Secret), never in a
 /// sandbox.
@@ -122,6 +138,8 @@ pub struct Evidence {
     replica: String,
     /// chain → (last sequence, last fingerprint).
     chains: Mutex<HashMap<String, (u64, String)>>,
+    /// chain → records not yet certified by Core, oldest first.
+    outbox: Option<Mutex<BTreeMap<String, VecDeque<Value>>>>,
 }
 
 impl Evidence {
@@ -131,7 +149,66 @@ impl Evidence {
             sink,
             replica: replica.into(),
             chains: Mutex::new(HashMap::new()),
+            outbox: None,
         }
+    }
+
+    /// Keeps each chain's new records for Core to certify.
+    #[must_use]
+    pub fn with_outbox(mut self) -> Self {
+        self.outbox = Some(Mutex::new(BTreeMap::new()));
+        self
+    }
+
+    pub fn certifies(&self) -> bool {
+        self.outbox.is_some()
+    }
+
+    /// The signing key's public half, raw 32 bytes in base64, as Core takes it.
+    pub fn public_key_base64(&self) -> String {
+        B64.encode(self.signer.public_key())
+    }
+
+    /// Takes up to `max` of the oldest uncertified records of every chain.
+    pub fn take_batches(&self, max: usize) -> Vec<(String, Vec<Value>)> {
+        let Some(outbox) = &self.outbox else {
+            return Vec::new();
+        };
+        let mut outbox = outbox.lock().expect("evidence lock");
+        let batches = outbox
+            .iter_mut()
+            .filter(|(_, records)| !records.is_empty())
+            .map(|(chain, records)| {
+                let take = records.len().min(max);
+                (chain.clone(), records.drain(..take).collect())
+            })
+            .collect();
+        outbox.retain(|_, records| !records.is_empty());
+        batches
+    }
+
+    /// Puts a batch Core did not certify back at the front of its chain.
+    pub fn restore(&self, chain: &str, batch: Vec<Value>) {
+        let Some(outbox) = &self.outbox else { return };
+        let mut outbox = outbox.lock().expect("evidence lock");
+        let records = outbox.entry(chain.to_owned()).or_default();
+        for record in batch.into_iter().rev() {
+            records.push_front(record);
+        }
+        while records.len() > MAX_OUTBOX {
+            records.pop_front();
+        }
+    }
+
+    /// Writes a certificate Core issued, as one line under
+    /// [`CERTIFICATE_KEY`].
+    pub fn write_certificate(&self, certificate: &Value) -> Result<(), String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        self.write(&json!({ CERTIFICATE_KEY: certificate }), now)
     }
 
     /// Writes the record for one verdict. Returns the record, or an error if
@@ -185,6 +262,14 @@ impl Evidence {
             "value": self.signer.sign(fingerprint.as_bytes()),
         }]);
         self.write(&record, now)?;
+        if let Some(outbox) = &self.outbox {
+            let mut outbox = outbox.lock().expect("evidence lock");
+            let waiting = outbox.entry(chain.clone()).or_default();
+            waiting.push_back(record.clone());
+            if waiting.len() > MAX_OUTBOX {
+                waiting.pop_front();
+            }
+        }
         chains.insert(chain, (sequence, fingerprint));
         Ok(record)
     }
@@ -265,8 +350,8 @@ pub fn verify(lines: &[String], keys: &[Vec<u8>], allow_partial: bool) -> Report
         if line.trim().is_empty() {
             continue;
         }
-        report.records += 1;
         let Ok(record) = serde_json::from_str::<Value>(line) else {
+            report.records += 1;
             report
                 .chains
                 .entry("<unreadable>".to_owned())
@@ -275,6 +360,10 @@ pub fn verify(lines: &[String], keys: &[Vec<u8>], allow_partial: bool) -> Report
                 .push(format!("line {}: not JSON", index + 1));
             continue;
         };
+        if record.get(CERTIFICATE_KEY).is_some() {
+            continue;
+        }
+        report.records += 1;
         let chain = record
             .pointer("/attestation/chain_uid")
             .and_then(Value::as_str)
@@ -493,6 +582,100 @@ pub fn check_certificate(
     Ok(())
 }
 
+/// An ECDSA P-256 public key for [`check_core_certificate`]: an SPKI PEM or
+/// base64 SPKI DER, as Core reports the organisation's attestation key.
+/// Returns the uncompressed point ring verifies with.
+pub fn core_public_key(text: &str) -> Result<Vec<u8>, String> {
+    let der = if text.contains("-----BEGIN") {
+        pem_body(text, "PUBLIC KEY")?
+    } else {
+        B64.decode(text.trim())
+            .map_err(|_| "Core key: not base64".to_owned())?
+    };
+    let point = der
+        .get(der.len().saturating_sub(65)..)
+        .ok_or("Core key: too short")?;
+    if point.len() != 65 || point[0] != 4 {
+        return Err("Core key: not an uncompressed P-256 key".to_owned());
+    }
+    Ok(point.to_vec())
+}
+
+/// Checks a Proof Certificate Core issued against the records it covers.
+///
+/// The certificate is `{certificate, signature}`, alone or under
+/// [`CERTIFICATE_KEY`]. Checked: Core's
+/// ECDSA P-256 signature over the certificate's sorted-key JSON, by one of
+/// `core_keys` (the organisation key you pin, never the one the certificate
+/// carries), and the Merkle root of the covered records' fingerprints.
+pub fn check_core_certificate(
+    issued: &Value,
+    lines: &[String],
+    core_keys: &[Vec<u8>],
+) -> Result<(), String> {
+    let issued = issued.get(CERTIFICATE_KEY).unwrap_or(issued);
+    let certificate = issued
+        .get("certificate")
+        .ok_or("Core certificate: no certificate")?;
+    let signature = issued
+        .get("signature")
+        .ok_or("Core certificate: no signature")?;
+    if signature.get("algorithm").and_then(Value::as_str) != Some("ECDSA_P256_SHA256") {
+        return Err("Core certificate: not an ECDSA P-256 signature".to_owned());
+    }
+    let value = signature
+        .get("value")
+        .and_then(Value::as_str)
+        .and_then(|value| B64.decode(value).ok())
+        .ok_or("Core certificate: unreadable signature")?;
+    let signed = certificate.to_string();
+    if !core_keys.iter().any(|key| {
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, key.as_slice())
+            .verify(signed.as_bytes(), &value)
+            .is_ok()
+    }) {
+        return Err("Core certificate: not signed by a pinned Core key".to_owned());
+    }
+    let chain = certificate["chain_uid"].as_str().unwrap_or("");
+    let (first, last) = (
+        certificate["first_sequence"].as_u64().unwrap_or(0),
+        certificate["last_sequence"].as_u64().unwrap_or(0),
+    );
+    let mut covered: Vec<(u64, String)> = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| {
+            record
+                .pointer("/attestation/chain_uid")
+                .and_then(Value::as_str)
+                == Some(chain)
+        })
+        .filter_map(|record| {
+            let sequence = record.pointer("/metadata/sequence")?.as_u64()?;
+            (first..=last)
+                .contains(&sequence)
+                .then(|| (sequence, fingerprint(&record)))
+        })
+        .collect();
+    covered.sort_by_key(|(sequence, _)| *sequence);
+    covered.dedup_by_key(|(sequence, _)| *sequence);
+    if u64::try_from(covered.len()).unwrap_or(0) != last.saturating_sub(first) + 1
+        || certificate["count"].as_u64() != u64::try_from(covered.len()).ok()
+    {
+        return Err(format!(
+            "Core certificate: records {first} to {last} of {chain} are not all here"
+        ));
+    }
+    let leaves: Vec<String> = covered
+        .into_iter()
+        .map(|(_, fingerprint)| fingerprint)
+        .collect();
+    if merkle_root(&leaves) != certificate["merkle_root"].as_str().unwrap_or("") {
+        return Err("Core certificate: the records it covers have changed".to_owned());
+    }
+    Ok(())
+}
+
 /// Binary Merkle root over hex leaves; an odd node is promoted unchanged.
 fn merkle_root(leaves: &[String]) -> String {
     let mut level: Vec<Vec<u8>> = leaves
@@ -642,6 +825,118 @@ pub mod tests {
         let mut forged = certificate;
         forged["count"] = json!(4);
         assert!(check_certificate(&forged, &lines, &[key]).is_err());
+    }
+
+    #[test]
+    fn the_outbox_hands_out_batches_and_takes_refused_ones_back() {
+        let evidence =
+            Evidence::new(signer(), Sink::Memory(Mutex::new(Vec::new())), "r1").with_outbox();
+        assert!(evidence.certifies());
+        for i in 0..5 {
+            evidence.record(&verdict(&format!("req-{i}"))).unwrap();
+        }
+        let batches = evidence.take_batches(3);
+        assert_eq!(batches.len(), 1);
+        let (chain, first) = &batches[0];
+        assert_eq!(chain, "sbx-1:r1");
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0]["metadata"]["sequence"], 1);
+        evidence.restore(chain, first.clone());
+        let again = evidence.take_batches(10);
+        assert_eq!(again[0].1.len(), 5, "a refused batch goes back in front");
+        assert_eq!(again[0].1[0]["metadata"]["sequence"], 1);
+        assert!(evidence.take_batches(10).is_empty());
+        assert!(!Evidence::new(signer(), Sink::Memory(Mutex::new(Vec::new())), "r1").certifies());
+    }
+
+    /// Core's certificate format: `{certificate, signature}` signed with an
+    /// ECDSA P-256 key over the certificate's sorted-key JSON.
+    fn core_issue(lines: &[String], first: u64, last: u64) -> (Value, Vec<u8>) {
+        use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let leaves: Vec<String> = lines
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| {
+                (first..=last).contains(&record["metadata"]["sequence"].as_u64().unwrap())
+            })
+            .map(|record| fingerprint(&record))
+            .collect();
+        let certificate = json!({
+            "scheme": "openbox.proof_certificate.v1",
+            "organization_id": "example.test",
+            "agent_id": "agent-1",
+            "chain_uid": "sbx-1:r1",
+            "first_sequence": first,
+            "last_sequence": last,
+            "count": leaves.len(),
+            "merkle_root": merkle_root(&leaves),
+            "record_key_id": "k",
+            "issued_at": "2026-11-14T10:00:00Z",
+        });
+        let signature = key.sign(&rng, certificate.to_string().as_bytes()).unwrap();
+        let point = key.public_key().as_ref().to_vec();
+        (
+            json!({
+                "certificate": certificate,
+                "signature": {"algorithm": "ECDSA_P256_SHA256", "key_id": "org", "value": B64.encode(signature.as_ref())},
+            }),
+            point,
+        )
+    }
+
+    #[test]
+    fn a_core_certificate_checks_against_the_records_it_covers() {
+        let (lines, _, _) = chain(6);
+        let (issued, point) = core_issue(&lines, 2, 5);
+        let keys = std::slice::from_ref(&point);
+        assert!(check_core_certificate(&issued, &lines, keys).is_ok());
+        let line = json!({ CERTIFICATE_KEY: &issued });
+        assert!(
+            check_core_certificate(&line, &lines, keys).is_ok(),
+            "as written in the sink"
+        );
+
+        let mut edited = lines.clone();
+        edited[2] = edited[2].replace("\"GET\"", "\"PUT\"");
+        assert!(check_core_certificate(&issued, &edited, keys).is_err());
+        let missing: Vec<String> = lines.iter().take(4).cloned().collect();
+        assert!(check_core_certificate(&issued, &missing, keys).is_err());
+        let (_, other) = core_issue(&lines, 2, 5);
+        assert!(check_core_certificate(&issued, &lines, &[other]).is_err());
+        let mut forged = issued;
+        forged["certificate"]["last_sequence"] = json!(4);
+        assert!(check_core_certificate(&forged, &lines, keys).is_err());
+    }
+
+    #[test]
+    fn verify_skips_certificate_lines() {
+        let (mut lines, public, _) = chain(3);
+        lines.push(json!({ CERTIFICATE_KEY: {"certificate": {}, "signature": {}} }).to_string());
+        let report = verify(&lines, &[public], false);
+        assert_eq!(report.records, 3);
+        assert!(
+            report
+                .chains
+                .values()
+                .all(|chain| chain.problems.is_empty())
+        );
+    }
+
+    #[test]
+    fn core_keys_load_from_spki_pem_and_base64() {
+        let mut spki = vec![0x30, 0x59, 0x30, 0x13];
+        spki.extend([0_u8; 21]);
+        spki.extend([0x03, 0x42, 0x00, 0x04]);
+        spki.extend([7_u8; 64]);
+        let b64 = B64.encode(&spki);
+        assert_eq!(core_public_key(&b64).unwrap().len(), 65);
+        let pem = format!("-----BEGIN PUBLIC KEY-----\n{b64}\n-----END PUBLIC KEY-----\n");
+        assert_eq!(core_public_key(&pem).unwrap()[0], 4);
+        assert!(core_public_key(&B64.encode([4_u8; 10])).is_err());
     }
 
     #[test]

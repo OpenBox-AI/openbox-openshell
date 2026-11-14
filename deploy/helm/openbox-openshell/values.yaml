@@ -173,6 +173,11 @@ doorGuard:
   # (OPENBOX_EVIDENCE_KEY_FILE). Empty: no records. Records go to stdout,
   # one JSON line each, for your log pipeline; chains are per pod.
   evidenceKeySecret: ""
+  # With evidenceKeySecret: send each chain's new records to Core this often
+  # (seconds) for an OpenBox Proof Certificate, written to the same output
+  # under `openbox_certificate` (OPENBOX_EVIDENCE_CERTIFY_SECS; needs the v3
+  # workload identity). 0: never.
+  evidenceCertifySecs: 0
   # Fast-path verdicts (docs/install.md, "Fast-path verdicts").
   fastPath:
     # Tier 0: where the local rule snapshot comes from. "core": fetched from
