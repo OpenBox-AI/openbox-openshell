@@ -503,15 +503,14 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     }
 
     /// Queues a background Core call for the sandbox. When Core has fallen
-    /// [`crate::sequence::MAX_BACKLOG`] calls behind for it, the call is
-    /// dropped and counted instead of held in memory.
+    /// too far behind (see [`crate::sequence`]), the call is dropped and
+    /// counted instead of held in memory.
     fn background(&self, sandbox_id: &str, job: impl Future<Output = ()> + Send + 'static) {
         if !self.sequence.push(sandbox_id, job) {
             let dropped = self.metrics.record_background_dropped();
             if dropped == 1 || dropped.is_multiple_of(1000) {
                 eprintln!(
-                    "openbox: Core is {} calls behind for sandbox_id={sandbox_id}; dropping background records ({dropped} so far)",
-                    crate::sequence::MAX_BACKLOG
+                    "openbox: Core is too far behind (sandbox_id={sandbox_id}); dropping background records ({dropped} so far)"
                 );
             }
         }
