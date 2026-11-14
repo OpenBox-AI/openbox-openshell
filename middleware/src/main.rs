@@ -371,9 +371,22 @@ fn core_from_env() -> Result<CoreClient, String> {
     .map_err(|error| error.to_string())
 }
 
+/// Requests one connection may have in flight unless
+/// `OPENBOX_MW_MAX_CONCURRENT_STREAMS` says otherwise. Each holds its body
+/// (up to 1 MiB) and copies of it while it is judged; past this the
+/// supervisor waits to send more, instead of the door guard holding every
+/// request a burst brings until it is out of memory.
+const DEFAULT_MAX_CONCURRENT_STREAMS: u64 = 128;
+
 /// The gRPC server, with TLS unless the operator chose plaintext.
 fn server_from_env(insecure: bool) -> Result<Server, String> {
-    let server = Server::builder();
+    let streams = number(
+        "OPENBOX_MW_MAX_CONCURRENT_STREAMS",
+        DEFAULT_MAX_CONCURRENT_STREAMS,
+    )?
+    .max(1);
+    let server =
+        Server::builder().max_concurrent_streams(Some(u32::try_from(streams).unwrap_or(u32::MAX)));
     if insecure {
         return Ok(server);
     }
