@@ -87,12 +87,36 @@ openbox-evidence check --key evidence.pub --certificate cert.json records-*.json
 
 `check` fails if any record the certificate covers has changed since.
 
-## What is not done yet
+## OpenBox Proof Certificates
 
-- **OpenBox Proof Certificates.** Sending batches of records to OpenBox's
-  attestation service, to be anchored and issued as Proof Certificates the
-  way Core seals sessions, needs an intake on Core's side. Until it exists,
-  `seal` gives the same guarantee locally.
+With `doorGuard.evidenceCertifySecs` above 0 (`OPENBOX_EVIDENCE_CERTIFY_SECS`)
+the door guard sends each chain's new records to Core that often, up to 1,000
+per request, and on shutdown. Core (`POST /api/v3/governance/evidence/certify`)
+checks them the way `verify` does, checks that the chain's sandbox is one of
+the agent's own sessions, and returns a Proof Certificate: the range, count
+and Merkle root of the records, the key that signed them and the previous
+batch's last fingerprint (`first_prev_event`), signed with your
+organisation's attestation key (AWS KMS, ECDSA P-256). The door guard writes
+it next to the records as one line:
+
+```json
+{"openbox_certificate": {"certificate": {"chain_uid": "...", "first_sequence": 1, "last_sequence": 23, "merkle_root": "..."}, "signature": {"algorithm": "ECDSA_P256_SHA256", "key_id": "...", "value": "...", "public_key": "..."}}}
+```
+
+Check one with your organisation's public key, which you pin; the key the
+certificate carries is for reference only:
+
+```bash
+openbox-evidence check --core-key org-attestation.pub --certificate cert-line.json records-*.jsonl
+```
+
+A batch Core cannot take is retried next time; one it refuses (HTTP 422: a
+record changed, a gap, the wrong key) is dropped from the queue and counted
+in `openbox_mw_evidence_certified_records_total{outcome="failed"}`, so the
+chain's later records still get certificates. The records stay in the
+output either way.
+
+## What is not done yet
 - **Collecting OpenShell's OCSF log.** Each sandbox writes
   `/var/log/openshell-ocsf.YYYY-MM-DD.log` (JSON Lines, daily, three kept)
   when `ocsf_json_enabled` is on. Shipping it within 60 s needs a collector

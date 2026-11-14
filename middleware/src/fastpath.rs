@@ -2,7 +2,7 @@
 //!
 //! | Tier | Decides | How |
 //! |------|---------|-----|
-//! | 0 | Requests matched by a local rule snapshot | [`Snapshot`], loaded from a file Core publishes (or an operator mounts); `shadow` by default |
+//! | 0 | Requests matched by a local rule snapshot | [`Snapshot`], fetched from Core (`POST /api/v3/governance/rules/snapshot`, the agent's `config.openshell.fast_rules`) or loaded from a file an operator mounts; `shadow` by default |
 //! | 1 | An identical action Core allowed within its TTL | the shared store, keyed by the action fingerprint |
 //! | 2 | Everything else | Core, inline (as before) or `pending`: wait briefly, otherwise deny `openbox_pending` and keep evaluating, so the identical retry gets the verdict at once |
 //!
@@ -178,22 +178,69 @@ impl Snapshot {
     }
 }
 
-/// The snapshot file and what was last loaded from it. Reloaded when the
-/// file changes ([`Rules::refresh`]); a file that fails to parse keeps the
-/// previous snapshot until it expires.
+/// Where the rule snapshot comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RulesSource {
+    None,
+    /// A file an operator mounts, reloaded when it changes.
+    File(PathBuf),
+    /// Core, polled ([`Rules::accept`] takes each answer).
+    Core,
+}
+
+/// The snapshot source and what was last loaded from it.
+///
+/// A file is reloaded when it changes ([`Rules::refresh`]); Core's answer is
+/// taken when its version changes ([`Rules::accept`]). A snapshot that fails
+/// to parse keeps the previous one until it expires.
 pub struct Rules {
     pub mode: RulesMode,
-    path: Option<PathBuf>,
+    source: RulesSource,
     loaded: RwLock<Option<(SystemTime, Snapshot)>>,
 }
 
 impl Rules {
     pub fn new(mode: RulesMode, path: Option<PathBuf>) -> Self {
+        let source = path.map_or(RulesSource::None, RulesSource::File);
+        Self::with_source(mode, source)
+    }
+
+    pub fn with_source(mode: RulesMode, source: RulesSource) -> Self {
         Self {
             mode,
-            path,
+            source,
             loaded: RwLock::new(None),
         }
+    }
+
+    /// Whether the snapshot is polled from Core.
+    pub fn from_core(&self) -> bool {
+        self.mode != RulesMode::Off && self.source == RulesSource::Core
+    }
+
+    /// Takes a snapshot Core sent. Returns whether it replaced the loaded
+    /// one (a new version); an unusable snapshot is refused and the loaded
+    /// one stays until it expires.
+    pub fn accept(&self, text: &str) -> Result<bool, String> {
+        let snapshot = Snapshot::parse(text)?;
+        let mut loaded = self.loaded.write().expect("rules lock");
+        let same = loaded
+            .as_ref()
+            .is_some_and(|(_, current)| current.version == snapshot.version);
+        if same {
+            // Same rules; keep the newer expiry.
+            if let Some((_, current)) = loaded.as_mut() {
+                current.expires_at = snapshot.expires_at;
+            }
+            return Ok(false);
+        }
+        eprintln!(
+            "openbox: rule snapshot {} from Core ({} rules)",
+            snapshot.version,
+            snapshot.rules.len()
+        );
+        *loaded = Some((SystemTime::now(), snapshot));
+        Ok(true)
     }
 
     pub fn off() -> Self {
@@ -209,7 +256,9 @@ impl Rules {
 
     /// Reloads the file if it changed since the last load.
     pub fn refresh(&self) {
-        let Some(path) = &self.path else { return };
+        let RulesSource::File(path) = &self.source else {
+            return;
+        };
         let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
             return;
         };
@@ -334,6 +383,36 @@ mod tests {
         assert!(rules.decide(&request, 2_000_000_000).is_none(), "stale");
         let off = Rules::fixed(RulesMode::Off, snapshot());
         assert!(off.decide(&request, 1_000).is_none());
+    }
+
+    #[test]
+    fn a_core_snapshot_replaces_the_loaded_one_only_when_its_version_changes() {
+        let rules = Rules::with_source(RulesMode::Enforce, RulesSource::Core);
+        assert!(rules.from_core());
+        let v1 = r#"{"version": "v1", "expires_at": 2000000000, "rules": [{"id": "a", "decision": "block", "hosts": ["x.test"]}], "skipped": 1}"#;
+        assert_eq!(rules.accept(v1), Ok(true));
+        let request = action("GET", "x.test", "/", b"");
+        assert_eq!(rules.decide(&request, 0).unwrap().0, "v1");
+        // Same version, later expiry: kept, expiry extended.
+        assert_eq!(
+            rules.accept(r#"{"version": "v1", "expires_at": 2100000000, "rules": [{"id": "a", "decision": "block", "hosts": ["x.test"]}]}"#),
+            Ok(false)
+        );
+        assert!(rules.decide(&request, 2_050_000_000).is_some());
+        // A broken answer keeps what is loaded.
+        assert!(
+            rules
+                .accept(r#"{"version": "", "expires_at": 1, "rules": []}"#)
+                .is_err()
+        );
+        assert_eq!(rules.decide(&request, 0).unwrap().0, "v1");
+        // Core omits empty lists; a new version takes over.
+        assert_eq!(
+            rules.accept(r#"{"version": "v2", "expires_at": 2000000000, "rules": []}"#),
+            Ok(true)
+        );
+        assert!(rules.decide(&request, 0).is_none());
+        assert!(!Rules::with_source(RulesMode::Off, RulesSource::Core).from_core());
     }
 
     #[test]

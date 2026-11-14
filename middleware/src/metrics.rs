@@ -110,6 +110,7 @@ pub struct Metrics {
     halt_stops: Mutex<BTreeMap<bool, u64>>,
     /// Evidence records: (written) → count.
     evidence: Mutex<BTreeMap<bool, u64>>,
+    certified: Mutex<BTreeMap<bool, u64>>,
     /// Requests seen again under a request id already answered.
     duplicates: AtomicU64,
 }
@@ -179,6 +180,16 @@ impl Metrics {
             .expect("metrics lock")
             .entry(written)
             .or_default() += 1;
+    }
+
+    /// Records sent to Core for a Proof Certificate, by outcome.
+    pub fn evidence_certified(&self, records: usize, certified: bool) {
+        *self
+            .certified
+            .lock()
+            .expect("metrics lock")
+            .entry(certified)
+            .or_default() += u64::try_from(records).unwrap_or(u64::MAX);
     }
 
     pub fn record_fast_disagreement(&self) {
@@ -308,6 +319,15 @@ impl Metrics {
             let _ = writeln!(
                 out,
                 "openbox_mw_evidence_records_total{{outcome=\"{outcome}\"}} {count}"
+            );
+        }
+        out.push_str("# HELP openbox_mw_evidence_certified_records_total Records sent to Core for a Proof Certificate, by outcome. Alert on failed.\n");
+        out.push_str("# TYPE openbox_mw_evidence_certified_records_total counter\n");
+        for (certified, count) in self.certified.lock().expect("metrics lock").iter() {
+            let outcome = if *certified { "certified" } else { "failed" };
+            let _ = writeln!(
+                out,
+                "openbox_mw_evidence_certified_records_total{{outcome=\"{outcome}\"}} {count}"
             );
         }
         out.push_str("# HELP openbox_mw_fast_path_disagreements_total Fast-path allows Core later refused.\n");

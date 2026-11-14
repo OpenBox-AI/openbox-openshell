@@ -101,6 +101,8 @@ const REQUEST_TTL: Duration = Duration::from_secs(60 * 60);
 const SEQUENCED_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a tool the model asked for is tracked, open or closed.
 const TOOL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Most records of one chain sent to Core in one certification request.
+const CERTIFY_BATCH: usize = 1000;
 /// How long a signalled prompt turn is remembered. Conversations resent
 /// after that are signalled again, which Core replays by idempotency key.
 const PROMPT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -132,6 +134,20 @@ pub const DEFAULT_CORE_BUDGET: Duration = Duration::from_secs(29);
 pub trait Governance: Send + Sync + 'static {
     /// Clears the halt Core holds for a sandbox's session.
     async fn resume_session(&self, _sandbox_id: &str) -> Result<(), CoreError> {
+        Err(CoreError::Status(501))
+    }
+
+    /// The agent's local rule snapshot, as JSON text (tier 0).
+    async fn rule_snapshot(&self) -> Result<String, CoreError> {
+        Err(CoreError::Status(501))
+    }
+
+    /// A Proof Certificate for one chain's records (R6.4).
+    async fn certify_evidence(
+        &self,
+        _public_key: &str,
+        _records: &[Value],
+    ) -> Result<Value, CoreError> {
         Err(CoreError::Status(501))
     }
 
@@ -179,6 +195,16 @@ pub trait Governance: Send + Sync + 'static {
 impl Governance for crate::core_client::CoreClient {
     async fn resume_session(&self, sandbox_id: &str) -> Result<(), CoreError> {
         Self::resume_session(self, sandbox_id).await
+    }
+    async fn rule_snapshot(&self) -> Result<String, CoreError> {
+        Self::rule_snapshot(self).await
+    }
+    async fn certify_evidence(
+        &self,
+        public_key: &str,
+        records: &[Value],
+    ) -> Result<Value, CoreError> {
+        Self::certify_evidence(self, public_key, records).await
     }
     async fn start_session(
         &self,
@@ -371,6 +397,66 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     /// Reloads the rule snapshot if its file changed.
     pub fn refresh_rules(&self) {
         self.rules.refresh();
+    }
+
+    /// Sends every chain's uncertified records to Core in batches and writes
+    /// the certificates it returns. A batch Core refuses or cannot take goes
+    /// back to the outbox for the next round. Returns how many records were
+    /// certified.
+    pub async fn certify_evidence(&self) -> usize {
+        let Some(evidence) = &self.evidence else {
+            return 0;
+        };
+        if !evidence.certifies() {
+            return 0;
+        }
+        let public_key = evidence.public_key_base64();
+        let mut certified = 0;
+        for (chain, batch) in evidence.take_batches(CERTIFY_BATCH) {
+            match self.governance.certify_evidence(&public_key, &batch).await {
+                Ok(certificate) => {
+                    if let Err(error) = evidence.write_certificate(&certificate) {
+                        eprintln!("openbox: certificate for {chain} not written: {error}");
+                    }
+                    certified += batch.len();
+                    self.metrics.evidence_certified(batch.len(), true);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "openbox: Core did not certify {} records of {chain}: {error:?}",
+                        batch.len()
+                    );
+                    self.metrics.evidence_certified(batch.len(), false);
+                    // A refused batch (422) will be refused again: drop it so
+                    // the chain's later records still get certificates.
+                    if !matches!(error, CoreError::Status(422)) {
+                        evidence.restore(&chain, batch);
+                    }
+                }
+            }
+        }
+        certified
+    }
+
+    /// Whether tier 0's snapshot is polled from Core.
+    pub fn rules_from_core(&self) -> bool {
+        self.rules.from_core()
+    }
+
+    /// Fetches Core's rule snapshot and takes it if it changed. A failure
+    /// keeps the loaded snapshot, which stops being used once it expires.
+    pub async fn refresh_rules_from_core(&self) {
+        if !self.rules.from_core() {
+            return;
+        }
+        match self.governance.rule_snapshot().await {
+            Ok(text) => {
+                if let Err(error) = self.rules.accept(&text) {
+                    eprintln!("openbox: rule snapshot from Core refused: {error}");
+                }
+            }
+            Err(error) => eprintln!("openbox: rule snapshot from Core: {error:?}"),
+        }
     }
 
     /// Replaces [`DEFAULT_CORE_BUDGET`].

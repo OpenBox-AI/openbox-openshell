@@ -94,13 +94,20 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: OPENBOX_EVIDENCE_CERTIFY_SECS
+              value: {{ $dg.evidenceCertifySecs | int64 | quote }}
             {{- end }}
             {{- if $dg.adminTokenSecret }}
             - name: OPENBOX_MW_ADMIN_TOKEN_FILE
               value: /var/run/openbox/admin/admin-token
             {{- end }}
             {{- with $dg.fastPath }}
-            {{- if .rulesConfigMap }}
+            {{- if eq .rulesSource "core" }}
+            - name: OPENBOX_RULES_SOURCE
+              value: core
+            - name: OPENBOX_RULES_MODE
+              value: {{ .rulesMode | quote }}
+            {{- else if .rulesConfigMap }}
             - name: OPENBOX_RULES_FILE
               value: /var/run/openbox/rules/rules.json
             - name: OPENBOX_RULES_MODE

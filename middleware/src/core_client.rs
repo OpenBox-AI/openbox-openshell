@@ -39,6 +39,8 @@ const V3_EVALUATE_PATH: &str = "/api/v3/governance/evaluate";
 const V3_APPROVAL_PATH: &str = "/api/v3/governance/approval";
 /// Proposed to Core (R5.4): clears the halt Core holds for a session.
 const V3_RESUME_PATH: &str = "/api/v3/governance/session/resume";
+const V3_RULES_PATH: &str = "/api/v3/governance/rules/snapshot";
+const V3_CERTIFY_PATH: &str = "/api/v3/governance/evidence/certify";
 const V3_BOOTSTRAP_PATH: &str = "/api/v3/auth/bootstrap";
 /// Refresh a workload token this long before Keycloak says it expires.
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
@@ -448,6 +450,40 @@ impl CoreClient {
         } else {
             Err(CoreError::Status(status))
         }
+    }
+
+    /// Fetches the agent's rule snapshot ([`crate::fastpath::Snapshot`] as
+    /// JSON text). Core serves it on the v3 contract only.
+    pub async fn rule_snapshot(&self) -> Result<String, CoreError> {
+        if self.config.workload.is_none() {
+            return Err(CoreError::Status(501));
+        }
+        let response = self.post(V3_RULES_PATH, b"{}".to_vec(), None).await?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(CoreError::Status(status));
+        }
+        response.text().await.map_err(|_| CoreError::Malformed)
+    }
+
+    /// Sends one chain's records to Core, which checks them and returns a
+    /// Proof Certificate (`{certificate, signature}`); v3 only.
+    pub async fn certify_evidence(
+        &self,
+        public_key: &str,
+        records: &[Value],
+    ) -> Result<Value, CoreError> {
+        if self.config.workload.is_none() {
+            return Err(CoreError::Status(501));
+        }
+        let body = serde_json::to_vec(&json!({"public_key": public_key, "records": records}))
+            .map_err(|_| CoreError::Malformed)?;
+        let response = self.post(V3_CERTIFY_PATH, body, None).await?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(CoreError::Status(status));
+        }
+        response.json().await.map_err(|_| CoreError::Malformed)
     }
 
     /// Reads the state of an approval Core is holding for an action. Polling
