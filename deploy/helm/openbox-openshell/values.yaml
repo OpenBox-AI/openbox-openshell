@@ -249,6 +249,13 @@ frontDesk:
   # OPENBOX_FD_OPENSHELL_VERSION. The gateway's OpenShell version, recorded on
   # each AI Inventory row (openbox.ai/openshell-version). Empty: not recorded.
   openshellVersion: ""
+  # OPENBOX_FD_FLEET_CHECKS. Send sandbox creation, policy changes and
+  # approvals of agent-authored policy proposals to OpenBox, scored for how
+  # much they open up, with the fleet's totals, so your policy rules can set
+  # budgets and route risky proposals to approval (docs/install.md, "Fleet
+  # checks"). Needs sessions (OPENBOX_URL); proposal checks also need the
+  # gateway API credential. Refuses the change when OpenBox cannot answer.
+  fleetChecks: false
   terminationGracePeriodSeconds: 30
   extraEnv: []
   podAnnotations: {}

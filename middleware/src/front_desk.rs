@@ -48,25 +48,25 @@ pub struct Patch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal(pub String);
 
-fn field<'a>(object: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
+pub(crate) fn field<'a>(object: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
     object.get(camel).or_else(|| object.get(snake))
 }
 
-fn network_policies(policy: &Value) -> impl Iterator<Item = &Value> {
+pub(crate) fn network_policies(policy: &Value) -> impl Iterator<Item = &Value> {
     field(policy, "networkPolicies", "network_policies")
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(Map::values)
 }
 
-fn endpoints(rule: &Value) -> impl Iterator<Item = &Value> {
+pub(crate) fn endpoints(rule: &Value) -> impl Iterator<Item = &Value> {
     rule.get("endpoints")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
 }
 
-fn is_tls_skip(endpoint: &Value) -> bool {
+pub(crate) fn is_tls_skip(endpoint: &Value) -> bool {
     match endpoint.get("tls") {
         Some(Value::String(mode)) => mode == TLS_SKIP || mode.eq_ignore_ascii_case("skip"),
         Some(Value::Number(mode)) => mode.as_i64() == Some(1),
@@ -74,7 +74,7 @@ fn is_tls_skip(endpoint: &Value) -> bool {
     }
 }
 
-fn sends_uninspected_credentials(endpoint: &Value) -> bool {
+pub(crate) fn sends_uninspected_credentials(endpoint: &Value) -> bool {
     field(
         endpoint,
         "allowUninspectedCredentials",

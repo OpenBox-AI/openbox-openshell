@@ -554,6 +554,46 @@ code, and scoring agent-authored policy proposals into the approval
 workflow. The front desk already refuses turning on automatic approval of
 agent-authored proposals.
 
+## Fleet checks
+
+With `frontDesk.fleetChecks: true` the front desk sends three kinds of
+gateway change to OpenBox before they happen, on the gateway's fleet session
+(`openshell-fleet-<gateway id>`):
+
+| Activity type | Sent when | Refused while |
+|---|---|---|
+| `openshell.create_sandbox` | a sandbox is created | Core blocks it, or it waits for approval |
+| `openshell.policy_change` | `UpdateConfig` sets a policy or adds rules | same |
+| `openshell.policy_proposal` | someone approves an agent-authored proposal (`ApproveDraftChunk`, `ApproveAllDraftChunks`) | same |
+
+Each carries, in `activity_input`, a score of how much the change opens up
+and the fleet's totals:
+
+```json
+{"operation": "openshell.create_sandbox", "sandbox": "build-7", "risk": 9,
+ "factors": {"endpoint": 3, "wildcard_host": 3, "tls_skip": 3},
+ "hosts": ["*.example.com", "api.example.com", "pypi.org"],
+ "fleet": {"sandboxes": 11, "risk": 52, "sandboxes_after": 12, "risk_after": 61}}
+```
+
+Points per endpoint: 1, plus 3 for a wildcard host (5 for `*`/`**`), 3 for
+`tls: skip`, 5 for uninspected credentials, 2 for a full-access preset (1 for
+read-write) and 1 for more than three ports. Nothing else about the change
+leaves the front desk.
+
+Your policy rules decide. A risk budget is a BLOCK rule such as "activity
+type is `openshell.create_sandbox` and `activity_input.fleet.risk_after` is
+greater than 60"; risky proposals going to a person is a REQUIRE_APPROVAL
+rule on `openshell.policy_proposal` and `activity_input.risk`. A change that
+needs approval is refused with "needs approval in OpenBox"; once someone
+approves it there, the same change goes through when it is made again. If
+OpenBox cannot be reached the change is refused (the front desk is fail
+closed).
+
+The fleet's totals come from the gateway, listed every
+`frontDesk.reconcileSecs`, so they need the gateway API credential; so does
+reading a proposal. Without it, proposal approvals are refused.
+
 ## Running next to other middleware
 
 OpenShell runs a sandbox's network middlewares in `order`, lowest first, and
