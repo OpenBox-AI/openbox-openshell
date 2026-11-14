@@ -17,9 +17,15 @@
 //! cargo run --release --example loadgen -- \
 //!   --target https://127.0.0.1:50051 --ca ca.crt \
 //!   --signing-key signing.pem --gateway-id openshell \
-//!   --rate 200 --seconds 60 --body-bytes 1048576 --sandboxes 20
+//!   --rate 200 --seconds 60 --body-bytes 1048576 --sandboxes 20 \
+//!   --max-in-flight 2000
 //! cargo run --release --example loadgen -- --stub-core 127.0.0.1:18086
 //! ```
+//!
+//! Each request in flight holds its own copy of the body, so at most
+//! `--max-in-flight` are outstanding; a tick with none free is not sent and
+//! is reported as `skipped(client saturated)`, so a stalled middleware shows
+//! up in the result instead of running the generator out of memory.
 //!
 //! `--stub-core` instead serves a Core stand-in that allows everything at
 //! once, to measure the middleware on its own.
@@ -169,6 +175,10 @@ async fn main() {
     let seconds = number("--seconds", 60);
     let body = vec![b'x'; usize::try_from(number("--body-bytes", 1024 * 1024)).unwrap_or(0)];
     let sandboxes = number("--sandboxes", 20).max(1);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(
+        usize::try_from(number("--max-in-flight", 2000).max(1)).unwrap_or(2000),
+    ));
+    let skipped = AtomicU64::new(0);
     let prefix = arg("--sandbox-prefix").unwrap_or_else(|| format!("load-{}", now()));
 
     let channel = Endpoint::from_shared(target)
@@ -197,6 +207,10 @@ async fn main() {
     let mut tasks = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
     for index in 0..total {
         ticker.tick().await;
+        let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
+            skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
         let sandbox_id = format!("{prefix}-{}", index % sandboxes);
         let mut request = tonic::Request::new(HttpRequestEvaluation {
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
@@ -237,6 +251,7 @@ async fn main() {
             Arc::clone(&errors),
         );
         tasks.push(tokio::spawn(async move {
+            let _permit = permit;
             let sent = Instant::now();
             match client.evaluate_http_request(request).await {
                 Ok(response) => {
@@ -249,8 +264,10 @@ async fn main() {
                         denied.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Err(_) => {
-                    errors.fetch_add(1, Ordering::Relaxed);
+                Err(status) => {
+                    if errors.fetch_add(1, Ordering::Relaxed) < 3 {
+                        eprintln!("rpc error: {:?} {}", status.code(), status.message());
+                    }
                 }
             }
             latencies.lock().unwrap().push(sent.elapsed());
@@ -273,11 +290,12 @@ async fn main() {
         body.len()
     );
     println!(
-        "allowed={} denied={} unavailable(fail-closed)={} rpc_errors={}",
+        "allowed={} denied={} unavailable(fail-closed)={} rpc_errors={} skipped(client saturated)={}",
         allowed.load(Ordering::Relaxed),
         denied.load(Ordering::Relaxed),
         unavailable.load(Ordering::Relaxed),
-        errors.load(Ordering::Relaxed)
+        errors.load(Ordering::Relaxed),
+        skipped.load(Ordering::Relaxed)
     );
     println!(
         "latency ms p50={} p95={} p99={} max={}",
