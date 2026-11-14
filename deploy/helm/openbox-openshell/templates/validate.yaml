@@ -63,6 +63,12 @@
 {{- fail (printf "doorGuard.%s must be off, hash, findings or text" $key) -}}
 {{- end }}
 {{- end -}}
+{{- if not (has ($v.doorGuard.fastPath.rulesSource | default "") (list "" "core")) -}}
+{{- fail "doorGuard.fastPath.rulesSource must be empty or core" -}}
+{{- end -}}
+{{- if and (eq ($v.doorGuard.fastPath.rulesSource | default "") "core") $v.doorGuard.fastPath.rulesConfigMap -}}
+{{- fail "doorGuard.fastPath.rulesSource=core does not take rulesConfigMap" -}}
+{{- end -}}
 {{- if not (has $v.doorGuard.fastPath.rulesMode (list "off" "shadow" "enforce")) -}}
 {{- fail "doorGuard.fastPath.rulesMode must be off, shadow or enforce" -}}
 {{- end -}}

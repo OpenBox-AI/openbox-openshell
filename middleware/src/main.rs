@@ -55,7 +55,7 @@ use openbox_verdict_middleware::core_client::{
     AgentSigner, CoreClient, CoreConfig, WorkloadIdentity,
 };
 use openbox_verdict_middleware::evidence::{Evidence, Signer, Sink};
-use openbox_verdict_middleware::fastpath::{Rules, RulesMode, SlowCore};
+use openbox_verdict_middleware::fastpath::{Rules, RulesMode, RulesSource, SlowCore};
 use openbox_verdict_middleware::guard::{
     DEFAULT_APPROVAL_TTL, DEFAULT_CORE_BUDGET, Governance, Guard, SandboxStopper,
 };
@@ -109,8 +109,25 @@ fn with_fast_path<G: Governance, S: SandboxStopper + ?Sized>(
 
 /// Keeps the rule snapshot fresh; started once the guard is configured and
 /// shared.
-fn spawn_rules_refresh<G: Governance, S: SandboxStopper + ?Sized>(guard: &Arc<Guard<G, S>>) {
+fn spawn_rules_refresh<G: Governance, S: SandboxStopper + ?Sized>(
+    guard: &Arc<Guard<G, S>>,
+) -> Result<(), String> {
     let refreshing = Arc::clone(guard);
+    if guard.rules_from_core() {
+        let every = Duration::from_secs(number(
+            "OPENBOX_RULES_REFRESH_SECS",
+            CORE_RULES_REFRESH.as_secs(),
+        )?)
+        .max(Duration::from_secs(5));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                refreshing.refresh_rules_from_core().await;
+            }
+        });
+        return Ok(());
+    }
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(RULES_REFRESH);
         loop {
@@ -118,6 +135,7 @@ fn spawn_rules_refresh<G: Governance, S: SandboxStopper + ?Sized>(guard: &Arc<Gu
             refreshing.refresh_rules();
         }
     });
+    Ok(())
 }
 
 /// The admin listener: probes, metrics and, with a token, resume.
@@ -192,21 +210,39 @@ fn with_evidence<G: Governance, S: SandboxStopper + ?Sized>(
 /// How often the rule snapshot file is checked for changes.
 const RULES_REFRESH: Duration = Duration::from_secs(10);
 
-/// Tier 0: `OPENBOX_RULES_FILE` and `OPENBOX_RULES_MODE` (off, shadow,
-/// enforce; shadow when a file is given, off without one).
+/// How often Core's rule snapshot is fetched (`OPENBOX_RULES_REFRESH_SECS`).
+const CORE_RULES_REFRESH: Duration = Duration::from_secs(30);
+
+/// Tier 0: `OPENBOX_RULES_SOURCE` (core, or file with `OPENBOX_RULES_FILE`;
+/// file when a file is given) and `OPENBOX_RULES_MODE` (off, shadow,
+/// enforce; shadow when there is a source, off without one).
 fn rules_from_env() -> Result<Rules, String> {
     let file = env("OPENBOX_RULES_FILE").map(PathBuf::from);
+    let source = match (env("OPENBOX_RULES_SOURCE").as_deref(), file) {
+        (Some("core"), None) => RulesSource::Core,
+        (Some("core"), Some(_)) => {
+            return Err("OPENBOX_RULES_SOURCE=core does not take OPENBOX_RULES_FILE".to_owned());
+        }
+        (Some("file") | None, Some(path)) => RulesSource::File(path),
+        (Some("file"), None) => {
+            return Err("OPENBOX_RULES_SOURCE=file needs OPENBOX_RULES_FILE".to_owned());
+        }
+        (None, None) => RulesSource::None,
+        (Some(_), _) => return Err("OPENBOX_RULES_SOURCE must be core or file".to_owned()),
+    };
     let mode = match env("OPENBOX_RULES_MODE") {
         Some(value) => {
             RulesMode::parse(&value).ok_or("OPENBOX_RULES_MODE must be off, shadow or enforce")?
         }
-        None if file.is_some() => RulesMode::Shadow,
+        None if source != RulesSource::None => RulesMode::Shadow,
         None => RulesMode::Off,
     };
-    if mode != RulesMode::Off && file.is_none() {
-        return Err("OPENBOX_RULES_MODE needs OPENBOX_RULES_FILE".to_owned());
+    if mode != RulesMode::Off && source == RulesSource::None {
+        return Err(
+            "OPENBOX_RULES_MODE needs OPENBOX_RULES_SOURCE=core or OPENBOX_RULES_FILE".to_owned(),
+        );
     }
-    Ok(Rules::new(mode, file))
+    Ok(Rules::with_source(mode, source))
 }
 
 /// Tier 2: `OPENBOX_SLOW_CORE` (inline, or pending with
@@ -410,7 +446,7 @@ async fn run() -> Result<(), String> {
         .with_prompt_capture(capture)
         .with_body_capture(body_capture);
     let guard = Arc::new(with_evidence(with_fast_path(guard)?)?);
-    spawn_rules_refresh(&guard);
+    spawn_rules_refresh(&guard)?;
     let metrics = guard.metrics();
     let draining = Arc::clone(&guard);
     start_admin(&guard).await?;

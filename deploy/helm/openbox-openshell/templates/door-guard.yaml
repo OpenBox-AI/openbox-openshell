@@ -100,7 +100,12 @@ spec:
               value: /var/run/openbox/admin/admin-token
             {{- end }}
             {{- with $dg.fastPath }}
-            {{- if .rulesConfigMap }}
+            {{- if eq .rulesSource "core" }}
+            - name: OPENBOX_RULES_SOURCE
+              value: core
+            - name: OPENBOX_RULES_MODE
+              value: {{ .rulesMode | quote }}
+            {{- else if .rulesConfigMap }}
             - name: OPENBOX_RULES_FILE
               value: /var/run/openbox/rules/rules.json
             - name: OPENBOX_RULES_MODE
