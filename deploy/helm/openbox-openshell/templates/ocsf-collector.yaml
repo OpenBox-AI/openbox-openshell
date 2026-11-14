@@ -56,7 +56,7 @@ spec:
             - --state
             - /state/positions.json
             - --interval-secs
-            - {{ $oc.intervalSecs | int64 | quote }}
+            - {{ $oc.intervalSecs | default 2 | int64 | quote }}
           # Root, to walk the kubelet's root-owned pod directories, with only
           # DAC_READ_SEARCH: it reads files other users own and writes
           # nothing but its positions file.
@@ -70,8 +70,10 @@ spec:
               add: [DAC_READ_SEARCH]
             seccompProfile:
               type: RuntimeDefault
+          {{- with $oc.resources }}
           resources:
-            {{- toYaml $oc.resources | nindent 12 }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: pods
               mountPath: /host/pods
@@ -82,10 +84,10 @@ spec:
       volumes:
         - name: pods
           hostPath:
-            path: {{ $oc.kubeletPodsDir | quote }}
+            path: {{ $oc.kubeletPodsDir | default "/var/lib/kubelet/pods" | quote }}
             type: Directory
         - name: state
           hostPath:
-            path: {{ $oc.stateDir | quote }}
+            path: {{ $oc.stateDir | default "/var/lib/openbox-ocsf-collector" | quote }}
             type: DirectoryOrCreate
 {{- end }}
