@@ -659,13 +659,16 @@ openshell settings set --global --key ocsf_json_enabled --value true
 ```
 
 Each sandbox then writes `/var/log/openshell-ocsf.YYYY-MM-DD.log` (JSON Lines,
-rotated daily, three files kept). Ship those with your log agent.
+rotated daily, three files kept). On Kubernetes, `ocsfCollector.enabled: true`
+writes those lines to a DaemonSet's stdout for your log pipeline to ship
+(`docs/evidence.md`).
 
 **The door guard's log.** One line per verdict on stderr, carrying
 `request_id`, `sandbox_id`, the decision, the reason code and the time taken.
 Ship the pod logs.
 
-Join the two on the sandbox id and time. We planned to key this on
+Join the two on the sandbox id, host and time (`openbox-evidence join`,
+`docs/evidence.md`). We planned to key this on
 `request_id`, but OpenShell v0.1.8 does not put the request id in its OCSF
 events: each event's `metadata.uid` is its own random id. OCSF's
 `container.uid` names the sandbox. Until OpenShell carries the request id,
