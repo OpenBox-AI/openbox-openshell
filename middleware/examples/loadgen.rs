@@ -22,6 +22,10 @@
 //! cargo run --release --example loadgen -- --stub-core 127.0.0.1:18086
 //! ```
 //!
+//! Each allowed request is followed by its response, as a supervisor sends
+//! it (preflight, a small body, end of stream), so the door guard completes
+//! and forgets the request; `--no-responses` leaves that out.
+//!
 //! Each request in flight holds its own copy of the body, so at most
 //! `--max-in-flight` are outstanding; a tick with none free is not sent and
 //! is reported as `skipped(client saturated)`, so a stalled middleware shows
@@ -36,10 +40,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use openshell_core::proto::middleware::v1::http_response_pre_return_client::HttpResponsePreReturnClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::{
-    Decision, HttpHeader, HttpRequestEvaluation, HttpRequestTarget, RequestContext,
-    SupervisorMiddlewarePhase,
+    Decision, HttpHeader, HttpRequestEvaluation, HttpRequestTarget, HttpResponseBodyMode,
+    HttpResponseBodyUnit, HttpResponseEvent, HttpResponsePreflight, RequestContext,
+    SupervisorMiddlewarePhase, http_response_body_unit, http_response_event,
+    http_response_event_result, http_response_preflight_result,
 };
 use ring::signature::Ed25519KeyPair;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -153,6 +160,76 @@ async fn stub_core(address: &str) {
     }
 }
 
+/// The response to an allowed request, as a supervisor sends it.
+async fn respond(
+    mut client: HttpResponsePreReturnClient<tonic::transport::Channel>,
+    token: &str,
+    context: RequestContext,
+) {
+    let (events, outbound) = tokio::sync::mpsc::channel(4);
+    let _ = events
+        .send(HttpResponseEvent {
+            event: Some(http_response_event::Event::Preflight(
+                HttpResponsePreflight {
+                    context: Some(context),
+                    target: Some(HttpRequestTarget {
+                        scheme: "https".to_owned(),
+                        host: "load.example".to_owned(),
+                        port: 443,
+                        method: "POST".to_owned(),
+                        path: "/upload".to_owned(),
+                        query: String::new(),
+                    }),
+                    status_code: 200,
+                    headers: vec![HttpHeader {
+                        name: "content-type".to_owned(),
+                        value: "application/json".to_owned(),
+                    }],
+                    middleware_name: "openbox".to_owned(),
+                    permitted_body_modes: vec![
+                        HttpResponseBodyMode::HeadersOnly as i32,
+                        HttpResponseBodyMode::WholeBodyBytes as i32,
+                    ],
+                    ..HttpResponsePreflight::default()
+                },
+            )),
+        })
+        .await;
+    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(outbound));
+    request
+        .metadata_mut()
+        .insert("authorization", token.parse().unwrap());
+    let Ok(response) = client.evaluate(request).await else {
+        return;
+    };
+    let mut results = response.into_inner();
+    let inspect = matches!(
+        results.message().await,
+        Ok(Some(openshell_core::proto::HttpResponseEventResult {
+            result: Some(http_response_event_result::Result::PreflightResult(
+                openshell_core::proto::HttpResponsePreflightResult {
+                    action: Some(http_response_preflight_result::Action::Inspect(_)),
+                    ..
+                }
+            )),
+        }))
+    );
+    if inspect {
+        let _ = events
+            .send(HttpResponseEvent {
+                event: Some(http_response_event::Event::Body(HttpResponseBodyUnit {
+                    sequence: 1,
+                    payload: Some(http_response_body_unit::Payload::Data(
+                        br#"{"ok":true}"#.to_vec(),
+                    )),
+                    end_of_stream: true,
+                })),
+            })
+            .await;
+        let _ = results.message().await;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -188,6 +265,8 @@ async fn main() {
         .connect()
         .await
         .expect("connect to middleware");
+    let responses = !std::env::args().any(|arg| arg == "--no-responses");
+    let response_client = HttpResponsePreReturnClient::new(channel.clone());
     let client = SupervisorMiddlewareClient::new(channel)
         .max_encoding_message_size(5 * 1024 * 1024)
         .max_decoding_message_size(5 * 1024 * 1024);
@@ -243,6 +322,14 @@ async fn main() {
                 .unwrap(),
         );
         let mut client = client.clone();
+        let response_client = response_client.clone();
+        let response_token = format!("Bearer {}", signer.token(&sandbox_id));
+        let context = RequestContext {
+            request_id: format!("{prefix}-req-{index}"),
+            sandbox_id: sandbox_id.clone(),
+            sandbox: sandbox_id.clone(),
+            ..RequestContext::default()
+        };
         let (latencies, allowed, denied, unavailable, errors) = (
             Arc::clone(&latencies),
             Arc::clone(&allowed),
@@ -258,6 +345,9 @@ async fn main() {
                     let result = response.into_inner();
                     if result.decision == Decision::Allow as i32 {
                         allowed.fetch_add(1, Ordering::Relaxed);
+                        if responses {
+                            respond(response_client, &response_token, context).await;
+                        }
                     } else if result.reason_code == "openbox_unavailable" {
                         unavailable.fetch_add(1, Ordering::Relaxed);
                     } else {
