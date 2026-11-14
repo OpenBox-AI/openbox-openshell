@@ -589,7 +589,7 @@ free-form reason text. Turn the JSON export on for all sandboxes:
 openshell settings set --global --key ocsf_json_enabled --value true
 ```
 
-Each sandbox then writes `/var/log/openshell-ocsf.YYYY-MM-DD.log` (JSON Lines,
+Each sandbox then writes `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl` (JSON Lines,
 rotated daily, three files kept). On Kubernetes, `ocsfCollector.enabled: true`
 writes those lines to a DaemonSet's stdout for your log pipeline to ship
 (`docs/evidence.md`).

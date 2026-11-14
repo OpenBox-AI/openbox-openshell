@@ -2,7 +2,7 @@
 //! it to the door guard's verdict records (R6.3).
 //!
 //! With `ocsf_json_enabled` on, each `OpenShell` supervisor writes
-//! `/var/log/openshell-ocsf.YYYY-MM-DD.log`: JSON Lines, a new file each
+//! `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl` (`.log` before v0.1.8): JSON Lines, a new file each
 //! day, three kept. On Kubernetes `/var/log` is an `emptyDir` named `logs`,
 //! in the sandbox pod or the shared supervisor pod alike, so a node agent
 //! finds every file under the kubelet's pod directory.
@@ -15,7 +15,10 @@
 //!
 //! [`join`] pairs records with events. `OpenShell` v0.1.8 does not put the
 //! request id in its OCSF events (`metadata.uid` is each event's own id), so
-//! the join uses the sandbox, the destination host and the time.
+//! the join uses the sandbox (`device.container.uid`), the destination host
+//! and the time, preferring the event `OpenShell` writes for the `openbox`
+//! middleware's decision (`firewall_rule.type: middleware`), which also
+//! carries that decision, so the two can be compared.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -36,10 +39,13 @@ pub enum Source {
     KubeletPods(PathBuf),
 }
 
-/// True for `openshell-ocsf.YYYY-MM-DD.log`.
+/// True for `openshell-ocsf.YYYY-MM-DD.jsonl` (v0.1.8) or `.log` (earlier).
 pub fn is_ocsf_file(name: &str) -> bool {
     name.strip_prefix("openshell-ocsf.")
-        .and_then(|rest| rest.strip_suffix(".log"))
+        .and_then(|rest| {
+            rest.strip_suffix(".jsonl")
+                .or_else(|| rest.strip_suffix(".log"))
+        })
         .is_some_and(|date| {
             date.len() == 10
                 && date.bytes().enumerate().all(|(i, b)| {
@@ -188,13 +194,18 @@ impl Collector {
     }
 }
 
-/// The sandbox an OCSF event belongs to (`container.uid`, else
-/// `container.name`).
+/// The sandbox an OCSF event belongs to (`device.container.uid` in
+/// v0.1.8, `container.uid` in other OCSF producers).
 fn event_sandbox(event: &Value) -> Option<&str> {
     event
-        .pointer("/container/uid")
-        .or_else(|| event.pointer("/container/name"))
+        .pointer("/device/container/uid")
+        .or_else(|| event.pointer("/container/uid"))
         .and_then(Value::as_str)
+}
+
+/// True for the event `OpenShell` writes for a middleware's decision.
+fn is_middleware_event(event: &Value) -> bool {
+    event.pointer("/firewall_rule/type").and_then(Value::as_str) == Some("middleware")
 }
 
 /// The destination host an OCSF event names.
@@ -219,6 +230,13 @@ pub struct Joined {
     pub host: String,
     pub ocsf_uid: Option<String>,
     pub ocsf_class_uid: Option<u64>,
+    /// `OpenShell`'s `action` (`Allowed`, `Denied`) and `status_detail`
+    /// (`middleware_denied:openbox:<reason code>`).
+    pub ocsf_action: Option<String>,
+    pub ocsf_status_detail: Option<String>,
+    /// Whether `OpenShell` recorded the decision the record holds; only for a
+    /// middleware event.
+    pub agrees: Option<bool>,
     pub delta_ms: Option<i64>,
 }
 
@@ -228,8 +246,8 @@ pub struct Joined {
 /// each event is used once. Records and events with no sandbox, host or
 /// time are left out.
 pub fn join(records: &[Value], events: &[Value], window_ms: i64) -> Vec<Joined> {
-    // (sandbox, host) -> [(time, index)]
-    let mut by_key: BTreeMap<(String, String), Vec<(i64, usize)>> = BTreeMap::new();
+    // (sandbox, host, middleware event) -> [(time, index)]
+    let mut by_key: BTreeMap<(String, String, bool), Vec<(i64, usize)>> = BTreeMap::new();
     for (index, event) in events.iter().enumerate() {
         let (Some(sandbox), Some(host), Some(time)) = (
             event_sandbox(event),
@@ -239,7 +257,7 @@ pub fn join(records: &[Value], events: &[Value], window_ms: i64) -> Vec<Joined> 
             continue;
         };
         by_key
-            .entry((sandbox.to_owned(), host))
+            .entry((sandbox.to_owned(), host, is_middleware_event(event)))
             .or_default()
             .push((time, index));
     }
@@ -256,13 +274,16 @@ pub fn join(records: &[Value], events: &[Value], window_ms: i64) -> Vec<Joined> 
             continue;
         };
         let host = host.to_ascii_lowercase();
-        let best = by_key
-            .get(&(sandbox.to_owned(), host.clone()))
-            .into_iter()
-            .flatten()
-            .filter(|(at, index)| !used[*index] && (at - time).abs() <= window_ms)
-            .min_by_key(|(at, _)| (at - time).abs())
-            .copied();
+        let nearest = |middleware: bool| {
+            by_key
+                .get(&(sandbox.to_owned(), host.clone(), middleware))
+                .into_iter()
+                .flatten()
+                .filter(|(at, index)| !used[*index] && (at - time).abs() <= window_ms)
+                .min_by_key(|(at, _)| (at - time).abs())
+                .copied()
+        };
+        let best = nearest(true).or_else(|| nearest(false));
         if let Some((_, index)) = best {
             used[index] = true;
         }
@@ -286,16 +307,36 @@ pub fn join(records: &[Value], events: &[Value], window_ms: i64) -> Vec<Joined> 
             ocsf_class_uid: event
                 .and_then(|event| event.get("class_uid"))
                 .and_then(Value::as_u64),
+            ocsf_action: text(event, "/action"),
+            ocsf_status_detail: text(event, "/status_detail"),
+            agrees: event
+                .filter(|event| is_middleware_event(event))
+                .map(|event| {
+                    let allowed = event.get("action").and_then(Value::as_str) == Some("Allowed");
+                    let record_allowed =
+                        record.pointer("/openbox/decision").and_then(Value::as_str)
+                            == Some("allow");
+                    allowed == record_allowed
+                }),
             delta_ms: best.map(|(at, _)| at - time),
         });
     }
     joined
 }
 
+fn text(event: Option<&Value>, pointer: &str) -> Option<String> {
+    event
+        .and_then(|event| event.pointer(pointer))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// Totals for a join, for the CLI's last line.
 pub fn join_summary(joined: &[Joined]) -> Value {
     let matched = joined.iter().filter(|j| j.ocsf_uid.is_some()).count();
-    json!({"records": joined.len(), "matched": matched, "unmatched": joined.len() - matched})
+    let disagree = joined.iter().filter(|j| j.agrees == Some(false)).count();
+    json!({"records": joined.len(), "matched": matched, "unmatched": joined.len() - matched,
+           "decisions_disagree": disagree})
 }
 
 #[cfg(test)]
@@ -320,6 +361,7 @@ mod tests {
 
     #[test]
     fn only_daily_ocsf_files_count() {
+        assert!(is_ocsf_file("openshell-ocsf.2026-11-14.jsonl"));
         assert!(is_ocsf_file("openshell-ocsf.2026-11-14.log"));
         assert!(!is_ocsf_file("openshell-ocsf.log"));
         assert!(!is_ocsf_file("openshell-ocsf.2026-11-14.log.gz"));
@@ -351,7 +393,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out), "{\"a\":3}\n");
 
         // a new day's file starts at its beginning
-        let day2 = logs.join("openshell-ocsf.2026-11-14.log");
+        let day2 = logs.join("openshell-ocsf.2026-11-14.jsonl");
         append(&day2, "{\"b\":1}\n");
         let mut out = Vec::new();
         assert_eq!(collector.poll(&mut out).unwrap(), 1);
@@ -379,12 +421,23 @@ mod tests {
 
     fn record(seq: u64, sandbox: &str, host: &str, time: i64) -> Value {
         json!({"metadata": {"uid": format!("chain:{seq}")}, "time": time,
-               "openbox": {"sandbox_id": sandbox, "host": host, "request_id": format!("r{seq}")}})
+               "openbox": {"sandbox_id": sandbox, "host": host, "request_id": format!("r{seq}"), "decision": "allow"}})
     }
 
+    // The shape OpenShell v0.1.8 writes.
     fn event(uid: &str, sandbox: &str, host: &str, time: i64) -> Value {
         json!({"class_uid": 4002, "metadata": {"uid": uid}, "time": time,
-               "container": {"uid": sandbox}, "http_request": {"url": {"hostname": host}}})
+               "device": {"container": {"name": "box", "uid": sandbox}},
+               "http_request": {"url": {"hostname": host}}, "dst_endpoint": {"domain": host},
+               "firewall_rule": {"name": "example", "type": "l7"}, "action": "Allowed"})
+    }
+
+    fn middleware_event(uid: &str, sandbox: &str, host: &str, time: i64, action: &str) -> Value {
+        let mut event = event(uid, sandbox, host, time);
+        event["firewall_rule"]["type"] = json!("middleware");
+        event["action"] = json!(action);
+        event["status_detail"] = json!("middleware_denied:openbox:openbox_blocked");
+        event
     }
 
     #[test]
@@ -417,7 +470,25 @@ mod tests {
         );
         assert_eq!(
             join_summary(&joined),
-            json!({"records": 4, "matched": 3, "unmatched": 1})
+            json!({"records": 4, "matched": 3, "unmatched": 1, "decisions_disagree": 0})
         );
+    }
+
+    #[test]
+    fn join_prefers_the_middleware_event_and_compares_decisions() {
+        let records = [record(1, "sb", "example.com", 1_000)];
+        let events = [
+            event("policy", "sb", "example.com", 1_001),
+            middleware_event("mw", "sb", "example.com", 1_300, "Denied"),
+        ];
+        let joined = join(&records, &events, 2_000);
+        assert_eq!(joined[0].ocsf_uid.as_deref(), Some("mw"));
+        assert_eq!(joined[0].ocsf_action.as_deref(), Some("Denied"));
+        assert_eq!(joined[0].agrees, Some(false), "the record says allow");
+        assert_eq!(join_summary(&joined)["decisions_disagree"], 1);
+        // without a middleware event the policy event is used, no comparison
+        let joined = join(&records, &events[..1], 2_000);
+        assert_eq!(joined[0].ocsf_uid.as_deref(), Some("policy"));
+        assert_eq!(joined[0].agrees, None);
     }
 }

@@ -1,7 +1,7 @@
 {{- $oc := .Values.ocsfCollector -}}
 {{- if $oc.enabled }}
 {{- $component := dict "root" . "component" "ocsf-collector" -}}
-# Follows OpenShell's OCSF JSON Lines log (openshell-ocsf.YYYY-MM-DD.log) in
+# Follows OpenShell's OCSF JSON Lines log (openshell-ocsf.YYYY-MM-DD.jsonl) in
 # every pod's `logs` emptyDir on the node and writes each line to stdout, for
 # the cluster's log pipeline to ship. Reads the kubelet's pod directory
 # read-only; keeps its place in a hostPath so a restart neither repeats nor
