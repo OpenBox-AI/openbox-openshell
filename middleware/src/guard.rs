@@ -502,6 +502,21 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         Arc::clone(&self.metrics)
     }
 
+    /// Queues a background Core call for the sandbox. When Core has fallen
+    /// [`crate::sequence::MAX_BACKLOG`] calls behind for it, the call is
+    /// dropped and counted instead of held in memory.
+    fn background(&self, sandbox_id: &str, job: impl Future<Output = ()> + Send + 'static) {
+        if !self.sequence.push(sandbox_id, job) {
+            let dropped = self.metrics.record_background_dropped();
+            if dropped == 1 || dropped.is_multiple_of(1000) {
+                eprintln!(
+                    "openbox: Core is {} calls behind for sandbox_id={sandbox_id}; dropping background records ({dropped} so far)",
+                    crate::sequence::MAX_BACKLOG
+                );
+            }
+        }
+    }
+
     /// Evaluates one request and records its result. The `openbox.verdict`
     /// span carries identifiers and the outcome only, never request content;
     /// see [`eval_line`] for what the log line carries.
@@ -864,7 +879,10 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         self.remember_request(&action.request_id, &record).await;
         let governance = Arc::clone(&self.governance);
         let metrics = Arc::clone(&self.metrics);
-        let action = action.clone();
+        // The span already carries what the capture mode sends; the raw body
+        // must not wait in the queue with the job (1 MiB a request).
+        let mut action = action.clone();
+        action.body = Vec::new();
         let queue = action.sandbox_id.clone();
         let job = async move {
             match governance
@@ -887,7 +905,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 ),
             }
         };
-        self.sequence.push(
+        self.background(
             &queue,
             telemetry::job("openbox.fast_record", vec![telemetry::sandbox(&queue)], job),
         );
@@ -1152,7 +1170,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 clear_pending(store.as_ref(), &sandbox_id, &request_id).await;
             },
         );
-        self.sequence.push(&queue, job);
+        self.background(&queue, job);
     }
 
     /// The activity Core holds an approval on for this exact action, once a
@@ -1340,7 +1358,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             closes.then_some(outcome),
             tools,
         );
-        self.sequence.push(
+        self.background(
             &queue,
             telemetry::job("openbox.completion", attributes, job),
         );
@@ -1742,7 +1760,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         let args = json!({"findings": counts, "sequence": sequence});
         let sandbox = sandbox_id.to_owned();
         let turn = format!("ws-{sequence}-{}", unix_now());
-        self.sequence.push(
+        self.background(
             sandbox_id,
             telemetry::job("openbox.websocket_findings", vec![telemetry::sandbox(sandbox_id)], async move {
                 if let Err(error) = governance
