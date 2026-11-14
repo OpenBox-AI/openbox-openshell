@@ -23,6 +23,7 @@ use std::time::Duration;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     GetDraftPolicyRequest, ListSandboxesRequest, Sandbox, all_workspaces_selector,
+    workspace_selector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -381,11 +382,12 @@ impl SandboxLister for GatewayLister {
 
 #[tonic::async_trait]
 impl crate::fleet::DraftReader for GatewayLister {
-    async fn pending_chunks(&self, sandbox: &str) -> Result<Vec<Value>, String> {
+    async fn pending_chunks(&self, workspace: &str, sandbox: &str) -> Result<Vec<Value>, String> {
         let mut client = OpenShellClient::new(self.channel.clone());
         let draft = client
             .get_draft_policy(GetDraftPolicyRequest {
-                workspace_scope: None,
+                // v0.1.8 takes only a named workspace here.
+                workspace_scope: Some(workspace_selector(workspace)),
                 status_filter: "pending".to_owned(),
                 sandbox: sandbox.to_owned(),
             })

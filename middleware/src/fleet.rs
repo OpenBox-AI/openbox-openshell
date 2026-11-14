@@ -508,7 +508,8 @@ pub fn update_config_operation(operation: &Value) -> Option<Operation> {
 #[tonic::async_trait]
 pub trait DraftReader: Send + Sync + 'static {
     /// The sandbox's pending chunks, as `PolicyChunk` JSON (snake case).
-    async fn pending_chunks(&self, sandbox: &str) -> Result<Vec<Value>, String>;
+    /// The sandbox's pending chunks, in the workspace the approval names.
+    async fn pending_chunks(&self, workspace: &str, sandbox: &str) -> Result<Vec<Value>, String>;
 }
 
 /// The proposal operations an approval would apply: one chunk, or every

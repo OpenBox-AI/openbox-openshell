@@ -477,7 +477,13 @@ impl<I: Inventory + ?Sized> FrontDesk<I> {
             .get("sandbox")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let chunks = match drafts.pending_chunks(sandbox).await {
+        // The approval names its workspace; one left out is the default.
+        let workspace = front_desk::field(operation, "workspaceScope", "workspace_scope")
+            .and_then(|scope| scope.get("workspace"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("default");
+        let chunks = match drafts.pending_chunks(workspace, sandbox).await {
             Ok(chunks) => chunks,
             Err(error) => {
                 return refuse(&Refusal(format!(
@@ -789,7 +795,8 @@ mod tests {
 
     #[tonic::async_trait]
     impl DraftReader for Drafts {
-        async fn pending_chunks(&self, _: &str) -> Result<Vec<Value>, String> {
+        async fn pending_chunks(&self, workspace: &str, _: &str) -> Result<Vec<Value>, String> {
+            assert_eq!(workspace, "default");
             Ok(self.0.clone())
         }
     }
