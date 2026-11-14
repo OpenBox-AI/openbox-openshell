@@ -594,6 +594,35 @@ The fleet's totals come from the gateway, listed every
 `frontDesk.reconcileSecs`, so they need the gateway API credential; so does
 reading a proposal. Without it, proposal approvals are refused.
 
+Two changes to the governing registration (`name = "openbox"`) above:
+
+```toml
+[[openshell.gateway.interceptors]]
+name = "openbox"
+# ...as above, plus:
+timeout = "10s"
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/ApproveDraftChunk"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/ApproveAllDraftChunks"
+phases = ["validate"]
+```
+
+- **The two bindings.** The registration is an allowlist, so without them
+  the gateway never asks the front desk about proposal approvals.
+- **`timeout`.** OpenShell gives an interceptor 500 ms unless told
+  otherwise, and a Core verdict takes seconds. The front desk waits
+  `frontDesk.fleetWaitMs` for Core (default 400, which fits 500 ms). A
+  change still undecided by then is refused with "OpenBox is still checking
+  this change; make the same change again in a few seconds", and Core's
+  verdict is kept for two minutes for that retry. With `timeout = "10s"` and
+  `fleetWaitMs: 9000` most changes are decided in one go. Keep
+  `fleetWaitMs` under the `timeout`, or the gateway gives up first and fails
+  closed with "evaluation timed out".
+
 ## Running next to other middleware
 
 OpenShell runs a sandbox's network middlewares in `order`, lowest first, and
