@@ -274,7 +274,7 @@ else
 fi
 
 step "B: a request from the sandbox"
-REQ="POST /nightly?run=$RUN HTTP/1.1\r\nHost: $ECHO\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"hello\":\"you\"}"
+REQ="POST /nightly?run=$RUN HTTP/1.1\r\nHost: $ECHO:8080\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"hello\":\"you\"}"
 reply=$(os sandbox exec -n "$BOX" --no-tty --timeout 90 -- bash -c \
   "exec 3<>/dev/tcp/$ECHO/8080; printf '$REQ' >&3; cat <&3" 2>&1 || true)
 if echo "$reply" | grep -q '^HTTP/1.1 200' && echo "$reply" | grep -q "run=$RUN"; then
