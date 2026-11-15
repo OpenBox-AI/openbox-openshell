@@ -103,6 +103,8 @@ v0.1.8, Core on a preview environment taking about 5 s a call):
 | 200 rps, 30 min, before the fixes below | 27% | OOMKilled 19 times | p50 45 ms, p99 > 290 s |
 | 200 rps, 120 s, with the fixes, one connection | 40% (79 rps) | no restarts, under 450 MiB | queued at the client |
 | 200 rps, 120 s, with the fixes, two connections | 49% (98 rps) | no restarts | queued at the client |
+| 100 rps, 60 s, with the Redis pool | 100% | no restarts | p50 19 ms, p99 25 ms |
+| 200 rps, 60 s, with the Redis pool | 100% | no restarts; every Tier 0 answer under 50 ms inside the door guard | p50 10 ms, p99 20 ms |
 
 What the runs found, and what changed:
 
@@ -120,17 +122,27 @@ What the runs found, and what changed:
   so with few supervisors one door guard replica takes all of it. Both
   two-connection runs landed on the same replica.
 
-Still open, and why A9 fails here: a Tier 0 answer waits on the shared
-store. Each process sent every Redis command over one connection, so a
-command waited for all the others, and past the 200 ms store timeout it
-counted as "nothing remembered" and the connection was reopened. Each
-process now keeps a pool of connections (`OPENBOX_REDIS_POOL`, default 16;
-set it through `doorGuard.extraEnv`), and a test holds a Tier 0 request to
-five store commands and its response to one. The measurement below was
-taken before the pool. Redis served about 54 commands for each request and its response,
-and under load only 12% of Tier 0 answers took under 250 ms inside the door
-guard. Fewer and non-blocking store calls on the Tier 0 path come next; then
-A9 runs again on a cluster sized for it, not a laptop.
+What held Tier 0 back was the shared store. Each process sent every Redis
+command over one connection, so a command waited for all the others, and
+past the 200 ms store timeout it counted as "nothing remembered" and the
+connection was reopened (before the pool, Redis served about 54 commands
+for each request and its response, and only 12% of Tier 0 answers took
+under 250 ms inside the door guard). Each process now keeps a pool of
+connections (`OPENBOX_REDIS_POOL`, default 16; set it through
+`doorGuard.extraEnv`), and a test holds a Tier 0 request to five store
+commands and its response to one. With the pool, the 200 rps runs above
+served every request.
+
+Still open before A9 passes:
+
+- **The 30-minute run.** The pool runs above are 60 s smoke runs on a
+  laptop; A9 is 30 minutes, on a cluster sized for it.
+- **Background Core records are dropped under load.** Core takes about 5 s
+  a call (PROD-1151), so at 200 rps the background queue fills and records
+  of locally allowed requests are dropped
+  (`openbox_mw_core_background_dropped_total`, about 27,700 in the 200 rps
+  run). Verdicts are never dropped, but those requests are missing from
+  the session in OpenBox until Core is faster or records are batched.
 
 Sizing until then: give each door guard replica 1 GiB of memory for 1 MiB
 bodies at 100 requests a second or more, and set `MALLOC_ARENA_MAX=2`
