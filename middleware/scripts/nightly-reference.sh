@@ -183,8 +183,15 @@ server:
   extraVolumeMounts:
     - {name: openbox-ca, mountPath: /etc/openshell/openbox, readOnly: true}
 YAML
+# No --wait: the gateway registers the door guard and front desk at start and
+# exits until they answer, and they need the gateway's signing key first. Wait
+# for the key, install OpenBox for OpenShell, then wait for the gateway.
 helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version "$OPENSHELL_VERSION" \
-  -n openshell --kube-context "$CTX" -f "$WORK/openshell-values.yaml" --wait --timeout 10m >/dev/null
+  -n openshell --kube-context "$CTX" -f "$WORK/openshell-values.yaml" --timeout 10m >/dev/null
+for _ in $(seq 1 120); do
+  k -n openshell get secret openshell-jwt-keys >/dev/null 2>&1 && break
+  sleep 5
+done
 k -n openshell get secret openshell-jwt-keys -o jsonpath='{.data.public\.pem}' | base64 -d > "$WORK/gateway-public.pem"
 GATEWAY_ID=$(k -n openshell get configmap openshell-config -o jsonpath='{.data}' |
   python3 -c 'import json,re,sys; t="".join(json.load(sys.stdin).values()); m=re.search(r"gateway_id\s*=\s*\"([^\"]+)\"", t); print(m.group(1) if m else "openshell")')
@@ -199,15 +206,16 @@ helm upgrade --install openbox "$ROOT/deploy/helm/openbox-openshell" -n openbox 
   --set tls.doorGuard.existingSecret=openbox-door-guard-tls \
   --set tls.frontDesk.existingSecret=openbox-front-desk-tls \
   --wait --timeout 5m >/dev/null
-# The gateway reads its interceptors at start: restart it now that they answer.
-k -n openshell rollout restart statefulset,deployment >/dev/null 2>&1 || true
-k -n openshell rollout status statefulset --timeout=300s >/dev/null 2>&1 || true
-k -n openshell rollout status deployment --timeout=300s >/dev/null 2>&1 || true
+# The gateway reads its interceptors at start: restart it now that they answer,
+# and it must come up.
+k -n openshell rollout restart statefulset >/dev/null
+k -n openshell rollout status statefulset --timeout=300s >/dev/null
 
 step "OpenShell CLI"
 curl -fsSL -o "$WORK/$CLI_ASSET" "https://github.com/NVIDIA/OpenShell/releases/download/v$OPENSHELL_VERSION/$CLI_ASSET"
 curl -fsSL -o "$WORK/sums" "https://github.com/NVIDIA/OpenShell/releases/download/v$OPENSHELL_VERSION/openshell-checksums-sha256.txt"
-(cd "$WORK" && grep " $CLI_ASSET\$" sums | { command -v sha256sum >/dev/null && sha256sum -c - || shasum -a 256 -c -; } >/dev/null)
+if command -v sha256sum >/dev/null; then SHA=(sha256sum -c -); else SHA=(shasum -a 256 -c -); fi
+(cd "$WORK" && grep " $CLI_ASSET\$" sums | "${SHA[@]}" >/dev/null)
 tar -xzf "$WORK/$CLI_ASSET" -C "$WORK"
 CLI="$WORK/openshell"
 PORT=$((20000 + RUN % 20000))
