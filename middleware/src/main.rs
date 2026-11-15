@@ -34,6 +34,7 @@
 //!                                     response completions are matched through
 //!                                     it. Without it they are matched in process,
 //!                                     which is only correct for one replica.
+//!   `OPENBOX_REDIS_POOL`              Redis connections per process, default 16
 //!   `OPENBOX_APPROVAL_TTL_SECS`       how long an approval's retry can match it
 //!                                     when Core sends no expiry with the
 //!                                     verdict, default 900. Otherwise Core's
@@ -63,7 +64,7 @@ use openbox_verdict_middleware::halt::{DenyOnlyStopper, GatewayStopper};
 use openbox_verdict_middleware::metrics::{AdminActions, Resume, serve_admin};
 use openbox_verdict_middleware::prompt::Capture;
 use openbox_verdict_middleware::service::VerdictMiddleware;
-use openbox_verdict_middleware::store::{MemoryStore, RedisStore, SharedStore};
+use openbox_verdict_middleware::store::{DEFAULT_REDIS_POOL, MemoryStore, RedisStore, SharedStore};
 use openbox_verdict_middleware::telemetry;
 use openbox_verdict_middleware::token::TokenVerifier;
 use openshell_core::proto::middleware::v1::http_response_pre_return_server::HttpResponsePreReturnServer;
@@ -375,7 +376,12 @@ fn server_from_env(insecure: bool) -> Result<Server, String> {
 /// Where approvals and completions are matched, and for how long.
 fn store_from_env() -> Result<(Arc<dyn SharedStore>, Duration), String> {
     let store: Arc<dyn SharedStore> = if let Some(url) = env("OPENBOX_REDIS_URL") {
-        Arc::new(RedisStore::from_url(&url, Duration::from_millis(200))?)
+        let pool = env("OPENBOX_REDIS_POOL").map_or(Ok(DEFAULT_REDIS_POOL), |value| {
+            value
+                .parse()
+                .map_err(|_| "OPENBOX_REDIS_POOL must be a number".to_owned())
+        })?;
+        Arc::new(RedisStore::from_url(&url, Duration::from_millis(200))?.with_pool(pool)?)
     } else {
         eprintln!(
             "openbox-verdict-middleware: no OPENBOX_REDIS_URL; approvals and completions are matched in this process only (one replica)"

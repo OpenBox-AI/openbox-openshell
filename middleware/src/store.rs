@@ -161,15 +161,26 @@ impl SharedStore for MemoryStore {
     }
 }
 
-/// Redis over RESP, one connection reused and reopened after any error.
-/// Every command is bounded by `timeout` so a slow Redis cannot hold up a
-/// verdict.
+/// Connections a [`RedisStore`] opens by default.
+pub const DEFAULT_REDIS_POOL: usize = 16;
+
+/// Redis over RESP, through a small pool of connections.
+///
+/// At most `pool` commands are in flight at once, each on a connection of its
+/// own; a connection is reused after a clean exchange and dropped after any
+/// error. Every command, including its wait for a free connection, is bounded
+/// by `timeout` so a slow Redis cannot hold up a verdict.
+///
+/// One connection for every request made each command wait for all the
+/// others: under load (SPEC-001 A9) the wait alone ran past the timeout, and
+/// a timed-out read counts as "nothing remembered".
 pub struct RedisStore {
     address: String,
     password: Option<String>,
     db: u32,
     timeout: Duration,
-    connection: tokio::sync::Mutex<Option<BufReader<TcpStream>>>,
+    idle: Mutex<Vec<BufReader<TcpStream>>>,
+    slots: tokio::sync::Semaphore,
 }
 
 enum Reply {
@@ -214,8 +225,18 @@ impl RedisStore {
             password,
             db,
             timeout,
-            connection: tokio::sync::Mutex::new(None),
+            idle: Mutex::new(Vec::new()),
+            slots: tokio::sync::Semaphore::new(DEFAULT_REDIS_POOL),
         })
+    }
+
+    /// At most `size` connections (and commands in flight), 1 to 256.
+    pub fn with_pool(mut self, size: usize) -> Result<Self, String> {
+        if !(1..=256).contains(&size) {
+            return Err("OPENBOX_REDIS_POOL must be between 1 and 256".to_owned());
+        }
+        self.slots = tokio::sync::Semaphore::new(size);
+        Ok(self)
     }
 
     async fn open(&self) -> Result<BufReader<TcpStream>, String> {
@@ -238,18 +259,23 @@ impl RedisStore {
 
     async fn command(&self, args: &[&[u8]]) -> Result<Reply, String> {
         let attempt = async {
-            let mut slot = self.connection.lock().await;
-            // Out of the slot while in use: if this future is dropped mid
+            let _slot = self
+                .slots
+                .acquire()
+                .await
+                .map_err(|_| "redis pool closed".to_owned())?;
+            // Out of the pool while in use: if this future is dropped mid
             // exchange (a timeout, or OpenShell cancelling the request), the
             // half-used connection goes with it instead of desynchronising
             // the next caller.
-            let mut connection = match slot.take() {
+            let idle = self.idle.lock().expect("redis pool lock").pop();
+            let mut connection = match idle {
                 Some(connection) => connection,
                 None => self.open().await?,
             };
             let outcome = exchange(&mut connection, args).await;
             if outcome.is_ok() {
-                *slot = Some(connection);
+                self.idle.lock().expect("redis pool lock").push(connection);
             }
             outcome
         };
@@ -469,5 +495,46 @@ mod tests {
         store.remove_member(&set, "a").await.unwrap();
         store.remove_member(&set, "b").await.unwrap();
         assert_eq!(store.count_members(&set).await.unwrap(), 0);
+    }
+
+    /// Many commands at once share a small pool without mixing up replies.
+    #[tokio::test]
+    async fn redis_store_pool_under_concurrency() {
+        let Ok(url) = std::env::var("OBX_TEST_REDIS_URL") else {
+            return;
+        };
+        let store = std::sync::Arc::new(
+            RedisStore::from_url(&url, Duration::from_secs(2))
+                .unwrap()
+                .with_pool(4)
+                .unwrap(),
+        );
+        let base = format!("openbox:test:pool:{}", std::process::id());
+        let tasks: Vec<_> = (0..200)
+            .map(|i| {
+                let store = std::sync::Arc::clone(&store);
+                let key = format!("{base}:{i}");
+                tokio::spawn(async move {
+                    let value = format!("v{i}");
+                    store
+                        .set(&key, &value, Some(Duration::from_secs(5)))
+                        .await
+                        .unwrap();
+                    assert_eq!(store.take(&key).await.unwrap(), Some(value));
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(store.idle.lock().unwrap().len() <= 4);
+    }
+
+    #[test]
+    fn redis_pool_size_is_bounded() {
+        let store = || RedisStore::from_url("redis://localhost", Duration::from_secs(1)).unwrap();
+        assert!(store().with_pool(0).is_err());
+        assert!(store().with_pool(257).is_err());
+        assert!(store().with_pool(64).is_ok());
     }
 }

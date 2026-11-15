@@ -4039,4 +4039,89 @@ pub(crate) mod tests {
         );
         assert!(line.len() < 1024, "{}", line.len());
     }
+
+    /// Counts the shared-store commands it is given, by command and key kind.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryStore,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl CountingStore {
+        fn note(&self, command: &str, key: &str) {
+            let kind = key.split(':').take(2).collect::<Vec<_>>().join(":");
+            self.calls.lock().unwrap().push(format!("{command} {kind}"));
+        }
+        fn take_calls(&self) -> Vec<String> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    #[tonic::async_trait]
+    impl SharedStore for CountingStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, String> {
+            self.note("GET", key);
+            self.inner.get(key).await
+        }
+        async fn set(&self, key: &str, value: &str, ttl: Option<Duration>) -> Result<(), String> {
+            self.note("SET", key);
+            self.inner.set(key, value, ttl).await
+        }
+        async fn take(&self, key: &str) -> Result<Option<String>, String> {
+            self.note("GETDEL", key);
+            self.inner.take(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), String> {
+            self.note("DEL", key);
+            self.inner.delete(key).await
+        }
+        async fn add_member(&self, key: &str, member: &str, ttl: Duration) -> Result<(), String> {
+            self.note("SADD+PEXPIRE", key);
+            self.inner.add_member(key, member, ttl).await
+        }
+        async fn remove_member(&self, key: &str, member: &str) -> Result<(), String> {
+            self.note("SREM", key);
+            self.inner.remove_member(key, member).await
+        }
+        async fn count_members(&self, key: &str) -> Result<u64, String> {
+            self.note("SCARD", key);
+            self.inner.count_members(key).await
+        }
+    }
+
+    /// SPEC-001 A9: a request answered by tier 0 and its response cost a
+    /// handful of shared-store commands, never one per byte or per rule. Under
+    /// load every command is a round trip to Redis, so a new one on this path
+    /// should be a deliberate choice: this test makes it one.
+    #[tokio::test]
+    async fn a_tier_zero_request_costs_few_store_commands() {
+        let store = Arc::new(CountingStore::default());
+        let shared: Arc<dyn SharedStore> = store.clone();
+        let core = Arc::new(FakeCore::with_verdicts(&[Verdict::Allow; 4]));
+        let guard = Guard::with_store(
+            Arc::clone(&core),
+            Arc::new(FakeStopper::default()),
+            shared,
+            DEFAULT_APPROVAL_TTL,
+        )
+        .with_rules(Rules::fixed(
+            RulesMode::Enforce,
+            snapshot(r#"[{"id": "reads", "decision": "allow", "methods": ["GET"]}]"#),
+        ));
+        for n in 1..=3 {
+            let mut read = evaluation("GET", "/docs", b"");
+            read.context.as_mut().unwrap().request_id = format!("req-{n}");
+            let verdict = guard
+                .evaluate(&Action::from_evaluation(&read), ApprovalMode::Queue)
+                .await;
+            assert!(is_allow(&verdict));
+            let request_path = store.take_calls();
+            assert!(request_path.len() <= 5, "request path: {request_path:?}");
+            guard
+                .complete(response(&format!("req-{n}"), 200, b"ok"))
+                .await;
+            let response_path = store.take_calls();
+            assert!(response_path.len() <= 1, "response path: {response_path:?}");
+        }
+    }
 }
