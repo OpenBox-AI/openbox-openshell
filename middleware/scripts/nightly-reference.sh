@@ -206,10 +206,11 @@ helm upgrade --install openbox "$ROOT/deploy/helm/openbox-openshell" -n openbox 
   --set tls.doorGuard.existingSecret=openbox-door-guard-tls \
   --set tls.frontDesk.existingSecret=openbox-front-desk-tls \
   --wait --timeout 5m >/dev/null
-# The gateway reads its interceptors at start: restart it now that they answer,
-# and it must come up.
-k -n openshell rollout restart statefulset >/dev/null
+# The gateway and the supervisor pool read the door guard and front desk
+# registrations at start: restart both now that they answer; both must come up.
+k -n openshell rollout restart statefulset,deployment >/dev/null
 k -n openshell rollout status statefulset --timeout=300s >/dev/null
+k -n openshell rollout status deployment --timeout=300s >/dev/null
 
 step "OpenShell CLI"
 curl -fsSL -o "$WORK/$CLI_ASSET" "https://github.com/NVIDIA/OpenShell/releases/download/v$OPENSHELL_VERSION/$CLI_ASSET"
@@ -279,7 +280,7 @@ reply=$(os sandbox exec -n "$BOX" --no-tty --timeout 90 -- bash -c \
 if echo "$reply" | grep -q '^HTTP/1.1 200' && echo "$reply" | grep -q "run=$RUN"; then
   pass "B the request reached the echo server"
 else
-  fail "B no 200 from the echo server: $(echo "$reply" | head -3 | tr '\r\n' '  ')"
+  fail "B no 200 from the echo server: $(echo "$reply" | tr '\r\n' '  ' | cut -c1-400)"
 fi
 if k -n openbox logs deploy/$DG --since=5m | grep -E "openbox: eval" | grep -q "decision=allow"; then
   pass "B the door guard judged it (decision=allow)"
