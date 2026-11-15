@@ -12,6 +12,9 @@
 //! pipeline ships it). It remembers how far it read in each file, by path
 //! and inode, in a positions file, so a restart neither repeats nor skips
 //! lines; a file that shrank or was replaced is read again from the start.
+//! An inode number alone does not tell a replaced file apart (Linux reuses a
+//! deleted file's inode at once), so each position also keeps a fingerprint
+//! of the file's first bytes.
 //!
 //! [`join`] pairs records with events. `OpenShell` v0.1.8 does not put the
 //! request id in its OCSF events (`metadata.uid` is each event's own id), so
@@ -22,7 +25,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -95,6 +98,46 @@ impl Source {
 pub struct Position {
     pub inode: u64,
     pub offset: u64,
+    /// How many of the file's first bytes `head` covers (0 = none yet, as in
+    /// a positions file written before fingerprints).
+    #[serde(default)]
+    pub head_len: u64,
+    /// FNV-1a of the file's first `head_len` bytes.
+    #[serde(default)]
+    pub head: u64,
+}
+
+/// Bytes at the start of a file that identify it, with its inode.
+const HEAD_BYTES: u64 = 256;
+
+/// FNV-1a of the first `len` bytes of `file` (fewer if it is shorter).
+fn head_hash(file: &mut File, len: u64) -> io::Result<u64> {
+    let mut bytes = Vec::new();
+    file.seek(SeekFrom::Start(0))?;
+    (&mut *file).take(len).read_to_end(&mut bytes)?;
+    Ok(bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    }))
+}
+
+impl Position {
+    fn at(file: &mut File, inode: u64, offset: u64) -> io::Result<Self> {
+        let head_len = offset.min(HEAD_BYTES);
+        Ok(Self {
+            inode,
+            offset,
+            head_len,
+            head: head_hash(file, head_len)?,
+        })
+    }
+
+    /// True when `file` is the file this position was taken in.
+    fn same_file(&self, file: &mut File, inode: u64, len: u64) -> io::Result<bool> {
+        if self.inode != inode || self.offset > len {
+            return Ok(false);
+        }
+        Ok(self.head_len == 0 || head_hash(file, self.head_len)? == self.head)
+    }
 }
 
 /// Follows the OCSF files of every source.
@@ -136,24 +179,19 @@ impl Collector {
         self.positions.retain(|path, _| files.contains(path));
         let mut lines = 0;
         for path in files {
-            let Ok(file) = File::open(&path) else {
+            let Ok(mut file) = File::open(&path) else {
                 continue;
             };
             let meta = file.metadata()?;
             let known = self.positions.get(&path).copied().unwrap_or_default();
-            let mut offset = if known.inode == meta.ino() && known.offset <= meta.len() {
+            let mut offset = if known.same_file(&mut file, meta.ino(), meta.len())? {
                 known.offset
             } else {
                 0
             };
             if offset == meta.len() {
-                self.positions.insert(
-                    path,
-                    Position {
-                        inode: meta.ino(),
-                        offset,
-                    },
-                );
+                let position = Position::at(&mut file, meta.ino(), offset)?;
+                self.positions.insert(path, position);
                 continue;
             }
             let mut reader = BufReader::new(file);
@@ -171,13 +209,8 @@ impl Collector {
                     lines += 1;
                 }
             }
-            self.positions.insert(
-                path,
-                Position {
-                    inode: meta.ino(),
-                    offset,
-                },
-            );
+            let position = Position::at(reader.get_mut(), meta.ino(), offset)?;
+            self.positions.insert(path, position);
         }
         out.flush()?;
         self.save()?;
@@ -359,6 +392,21 @@ mod tests {
         file.write_all(text.as_bytes()).unwrap();
     }
 
+    /// A positions file written before fingerprints still loads, and its
+    /// offsets are trusted until the fingerprint is taken.
+    #[test]
+    fn positions_without_a_fingerprint_still_load() {
+        let old: BTreeMap<PathBuf, Position> = serde_json::from_str(
+            r#"{"/var/log/openshell-ocsf.2026-11-13.log": {"inode": 7, "offset": 42}}"#,
+        )
+        .unwrap();
+        let position = old[Path::new("/var/log/openshell-ocsf.2026-11-13.log")];
+        assert_eq!(
+            (position.inode, position.offset, position.head_len),
+            (7, 42, 0)
+        );
+    }
+
     #[test]
     fn only_daily_ocsf_files_count() {
         assert!(is_ocsf_file("openshell-ocsf.2026-11-14.jsonl"));
@@ -399,12 +447,19 @@ mod tests {
         assert_eq!(collector.poll(&mut out).unwrap(), 1);
         assert_eq!(String::from_utf8_lossy(&out), "{\"b\":1}\n");
 
-        // a replaced file (new inode) is read again from the start
+        // a replaced file is read again from the start, whether it has a new
+        // inode or (as Linux does at once) the deleted file's inode again
         std::fs::remove_file(&day2).unwrap();
         append(&day2, "{\"c\":1}\n");
         let mut out = Vec::new();
         assert_eq!(collector.poll(&mut out).unwrap(), 1);
         assert_eq!(String::from_utf8_lossy(&out), "{\"c\":1}\n");
+
+        // the same inode and length but different content is a new file too
+        std::fs::write(&day2, "{\"d\":1}\n").unwrap();
+        let mut out = Vec::new();
+        assert_eq!(collector.poll(&mut out).unwrap(), 1);
+        assert_eq!(String::from_utf8_lossy(&out), "{\"d\":1}\n");
 
         // a file rotated out is forgotten
         std::fs::remove_file(&day1).unwrap();
