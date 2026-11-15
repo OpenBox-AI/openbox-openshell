@@ -1,0 +1,30 @@
+name: Build for Environment
+
+# Builds the door guard and front desk image for a preview env and bumps the
+# env's manifest, as openbox-backend, -core and -fe do. Called by
+# openbox-manifest-k8s-cluster's Create Environment once the env template
+# has an openshell app (PROD-1150), or run by hand after pushing a branch.
+# Delegates to common-pipeline's build-push-bump: OIDC through the org's
+# STAGING_ACTION_ROLE and MANIFEST_PUSH_TOKEN secrets, which this repository
+# must be granted, and an `openbox-openshell` image repository in ECR and
+# Artifact Registry.
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: 'Target env slug (must exist in manifest envs/)'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    uses: OpenBox-AI/common-pipeline/.github/workflows/build-push-bump.yml@main
+    with:
+      ecr_repository: openbox-openshell
+      env_name: ${{ inputs.env_name }}
+      bump_path: .imageTag.openshell
+    secrets: inherit
