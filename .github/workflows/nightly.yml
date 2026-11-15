@@ -14,10 +14,6 @@ on:
       openshell_version:
         description: OpenShell release to run against (default the pinned one)
         required: false
-  # Temporary: run on pushes to this branch while the workflow is tested.
-  # Removed before the pull request.
-  push:
-    branches: [feat/PROD-1142-nightly-reference]
 
 permissions:
   contents: read
