@@ -121,7 +121,13 @@ What the runs found, and what changed:
   two-connection runs landed on the same replica.
 
 Still open, and why A9 fails here: a Tier 0 answer waits on the shared
-store. Redis served about 54 commands for each request and its response,
+store. Each process sent every Redis command over one connection, so a
+command waited for all the others, and past the 200 ms store timeout it
+counted as "nothing remembered" and the connection was reopened. Each
+process now keeps a pool of connections (`OPENBOX_REDIS_POOL`, default 16;
+set it through `doorGuard.extraEnv`), and a test holds a Tier 0 request to
+five store commands and its response to one. The measurement below was
+taken before the pool. Redis served about 54 commands for each request and its response,
 and under load only 12% of Tier 0 answers took under 250 ms inside the door
 guard. Fewer and non-blocking store calls on the Tier 0 path come next; then
 A9 runs again on a cluster sized for it, not a laptop.
