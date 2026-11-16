@@ -567,6 +567,48 @@ mod tests {
         }
     }
 
+    /// An `OpenShell` release on another protocol major cannot register the
+    /// front desk (either role); a newer minor on the same major still can.
+    #[tokio::test]
+    async fn describe_refuses_a_gateway_on_another_protocol_major() {
+        use openshell_core::extension_protocol::PROTOCOL_MAJOR;
+        use openshell_core::proto::extension::v1::ProtocolVersion;
+        let signer = TestSigner::new();
+        for role in [Role::Govern, Role::Inventory] {
+            let (service, _) = service_as(role, &signer);
+            for (major, minor, accepted) in
+                [(PROTOCOL_MAJOR + 1, 0, false), (PROTOCOL_MAJOR, 99, true)]
+            {
+                let mut gateway = extension_metadata(
+                    ExtensionFamily::GatewayInterceptor,
+                    "openshell/gateway",
+                    "9.9.9",
+                    [],
+                );
+                gateway.protocol_version = Some(ProtocolVersion { major, minor });
+                let result = service
+                    .describe(authed(
+                        DescribeRequest {
+                            gateway: Some(gateway),
+                        },
+                        &gateway_token(&signer),
+                    ))
+                    .await;
+                if accepted {
+                    assert!(result.is_ok(), "protocol {major}.{minor}: {result:?}");
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                    assert!(
+                        error.message().contains("unsupported protocol"),
+                        "{}",
+                        error.message()
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn modify_returns_patches_and_validate_refuses_a_weakened_policy() {
         let signer = TestSigner::new();
