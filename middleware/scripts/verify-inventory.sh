@@ -115,9 +115,15 @@ start_fd() {
   echo $! >"$WORK/fd.pid"
   wait_listen "$INV_PORT" "$WORK/fd.pid" "$2"
 }
+# Waits for the front desk to exit, not only for its ports: on SIGTERM it
+# closes its listeners first and then drains session ends for up to 20 s,
+# and its reconciler keeps writing to the inventory meanwhile.
 stop_fd() {
-  kill "$(cat "$WORK/fd.pid")"
+  local pid
+  pid=$(cat "$WORK/fd.pid")
+  kill "$pid"
   rm "$WORK/fd.pid"
+  while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
   while ! free "$INV_PORT"; do sleep 0.2; done
 }
 
