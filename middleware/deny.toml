@@ -43,4 +43,5 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Must equal openshell-core's git source in Cargo.toml; tests/pin.rs checks it.
 allow-git = ["https://github.com/NVIDIA/OpenShell.git"]

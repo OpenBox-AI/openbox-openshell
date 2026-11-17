@@ -16,7 +16,7 @@
 # Needs the OpenShell v0.1.8 release binaries: set OPENSHELL_PREFIX to a
 # directory with bin/openshell, bin/openshell-gateway and
 # libexec/openshell-driver-vm (default ~/openshell-repro). If they are not
-# there, they are downloaded from NVIDIA's release and checksum-verified
+# there, they are downloaded from OpenShell's release and checksum-verified
 # (macOS arm64 only).
 #
 # Optional: OBX_GATEWAY_PORT (default 17690; +1 health, +2 metrics),
@@ -28,6 +28,13 @@ PREFIX=${OPENSHELL_PREFIX:-$HOME/openshell-repro}
 GW_PORT=${OBX_GATEWAY_PORT:-17690}
 FD_PORT=${OBX_FD_PORT:-50071}
 REV=$(sed -n 's/^openshell-core = .*rev = "\([0-9a-f]*\)".*/\1/p' "$HERE/Cargo.toml")
+# The OpenShell source and release, from the one place that names them.
+OPENSHELL_REPO=$(sed -n 's/^openshell-core = .*git = "\([^"]*\)".*/\1/p' "$HERE/Cargo.toml")
+OPENSHELL_REPO=${OPENSHELL_REPO%.git}
+RELEASE=$(sed -n '/^\[package\.metadata\.openshell\]/,/^\[/s/^release = "\(.*\)"/\1/p' "$HERE/Cargo.toml")
+if [ -z "$REV" ] || [ -z "$OPENSHELL_REPO" ] || [ -z "$RELEASE" ]; then
+  echo "cannot read the OpenShell pin from $HERE/Cargo.toml"; exit 1
+fi
 # A short path: the VM driver's unix socket must fit in SUN_LEN.
 WORK=$(mktemp -d /tmp/obx-verify.XXXXXX)
 FAILED=0
@@ -57,12 +64,12 @@ for port in "$GW_PORT" $((GW_PORT + 1)) $((GW_PORT + 2)) "$FD_PORT" $((FD_PORT +
   free "$port" || { echo "port $port is in use; set OBX_GATEWAY_PORT / OBX_FD_PORT"; exit 1; }
 done
 
-echo "== OpenShell v0.1.8 binaries"
+echo "== OpenShell $RELEASE binaries"
 if [ ! -x "$PREFIX/bin/openshell-gateway" ] || [ ! -x "$PREFIX/libexec/openshell-driver-vm" ]; then
-  [ "$(uname -sm)" = "Darwin arm64" ] || { echo "set OPENSHELL_PREFIX to an OpenShell v0.1.8 install"; exit 1; }
+  [ "$(uname -sm)" = "Darwin arm64" ] || { echo "set OPENSHELL_PREFIX to an OpenShell $RELEASE install"; exit 1; }
   PREFIX=$WORK/openshell
   mkdir -p "$PREFIX/bin" "$PREFIX/libexec" "$PREFIX/dl"
-  R=https://github.com/NVIDIA/OpenShell/releases/download/v0.1.8
+  R=$OPENSHELL_REPO/releases/download/$RELEASE
   (
     cd "$PREFIX/dl"
     for f in openshell-aarch64-apple-darwin.tar.gz openshell-gateway-aarch64-apple-darwin.tar.gz \
@@ -87,7 +94,7 @@ fi
 
 echo "== Profiles from OpenShell at the pinned rev $REV"
 for p in copilot github anthropic; do
-  curl -fsSL -o "$WORK/$p.yaml" "https://raw.githubusercontent.com/NVIDIA/OpenShell/$REV/providers/$p.yaml"
+  curl -fsSL -o "$WORK/$p.yaml" "${OPENSHELL_REPO/github.com/raw.githubusercontent.com}/$REV/providers/$p.yaml"
 done
 grep -q 'allow_uninspected_credentials: true' "$WORK/copilot.yaml" ||
   { echo "copilot.yaml no longer has uninspected endpoints; this test needs a new fixture"; exit 1; }
