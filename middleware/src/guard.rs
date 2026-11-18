@@ -135,6 +135,11 @@ pub trait Governance: Send + Sync + 'static {
         Err(CoreError::Status(501))
     }
 
+    /// The agent's local rule snapshot, as JSON text (tier 0).
+    async fn rule_snapshot(&self) -> Result<String, CoreError> {
+        Err(CoreError::Status(501))
+    }
+
     async fn start_session(
         &self,
         sandbox_id: &str,
@@ -179,6 +184,9 @@ pub trait Governance: Send + Sync + 'static {
 impl Governance for crate::core_client::CoreClient {
     async fn resume_session(&self, sandbox_id: &str) -> Result<(), CoreError> {
         Self::resume_session(self, sandbox_id).await
+    }
+    async fn rule_snapshot(&self) -> Result<String, CoreError> {
+        Self::rule_snapshot(self).await
     }
     async fn start_session(
         &self,
@@ -371,6 +379,27 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     /// Reloads the rule snapshot if its file changed.
     pub fn refresh_rules(&self) {
         self.rules.refresh();
+    }
+
+    /// Whether tier 0's snapshot is polled from Core.
+    pub fn rules_from_core(&self) -> bool {
+        self.rules.from_core()
+    }
+
+    /// Fetches Core's rule snapshot and takes it if it changed. A failure
+    /// keeps the loaded snapshot, which stops being used once it expires.
+    pub async fn refresh_rules_from_core(&self) {
+        if !self.rules.from_core() {
+            return;
+        }
+        match self.governance.rule_snapshot().await {
+            Ok(text) => {
+                if let Err(error) = self.rules.accept(&text) {
+                    eprintln!("openbox: rule snapshot from Core refused: {error}");
+                }
+            }
+            Err(error) => eprintln!("openbox: rule snapshot from Core: {error:?}"),
+        }
     }
 
     /// Replaces [`DEFAULT_CORE_BUDGET`].

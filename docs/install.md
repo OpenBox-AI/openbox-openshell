@@ -354,7 +354,7 @@ answer sooner where that is safe:
 
 | Tier | Answers | Setting |
 |---|---|---|
-| 0, local rules | Requests a rule in a local snapshot matches | `doorGuard.fastPath.rulesConfigMap` (a ConfigMap with `rules.json`), `rulesMode` |
+| 0, local rules | Requests a rule in a local snapshot matches | `doorGuard.fastPath.rulesSource: core` (from Core) or `rulesConfigMap` (a ConfigMap with `rules.json`), `rulesMode` |
 | 1, recent verdict | An action identical to one Core allowed within a TTL | Core's `verdict_ttl_secs` on the verdict, else `doorGuard.fastPath.verdictTtlSecs` (default 0: off) |
 | 2, Core | Everything else | `doorGuard.fastPath.slowCore`: `pending` (default) or `inline` (wait, as before v0.3) |
 
@@ -365,8 +365,18 @@ the door guard logs it and counts it in
 Model calls always go to Core, because their prompt and tool bookkeeping
 happens there. An approved retry is never reused: approvals stay single use.
 
-**Local rules.** The snapshot is JSON, reloaded within 10 s of a change. A
-snapshot past `expires_at` is not used, and requests go to Core:
+**Local rules from Core.** With `rulesSource: core` the door guard fetches
+the agent's snapshot from Core every 30 s
+(`POST /api/v3/governance/rules/snapshot`, v3 credentials). Core builds it
+from the agent's `config.openshell.fast_rules`, in the format below, sets its
+expiry from `config.openshell.fast_rules_ttl_secs` (30 s to 1 h, default
+5 min) and leaves out malformed rules. A door guard that cannot reach Core
+keeps the last snapshot until it expires, then asks Core for everything.
+Core also sends `verdict_ttl_secs` on an allow when the agent's
+`config.openshell.verdict_ttl_secs` is set (tier 1).
+
+**Local rules from a file.** The snapshot is JSON, reloaded within 10 s of a
+change. A snapshot past `expires_at` is not used, and requests go to Core:
 
 ```json
 {

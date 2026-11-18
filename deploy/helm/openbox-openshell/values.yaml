@@ -175,7 +175,11 @@ doorGuard:
   evidenceKeySecret: ""
   # Fast-path verdicts (docs/install.md, "Fast-path verdicts").
   fastPath:
-    # Tier 0: a local rule snapshot, as JSON under `rules.json` in this
+    # Tier 0: where the local rule snapshot comes from. "core": fetched from
+    # Core every 30 s (the agent's config.openshell.fast_rules,
+    # OPENBOX_RULES_SOURCE=core). Empty: the ConfigMap below, if any.
+    rulesSource: ""
+    # Tier 0 from a file: a rule snapshot as JSON under `rules.json` in this
     # ConfigMap (OPENBOX_RULES_FILE). Empty: no local rules.
     rulesConfigMap: ""
     # OPENBOX_RULES_MODE: shadow (count agreement with Core, Core decides)
