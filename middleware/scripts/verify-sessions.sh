@@ -320,7 +320,7 @@ else
   os logs "$A" --source sandbox >"$WORK/sandbox.log" 2>&1 || true
   echo "      sandbox log saved: $WORK/sandbox.log"
 fi
-PROMPTS="select string_agg(input->0->>'prompt', ' | ' order by created_at) $EV and event_type='SignalReceived' and signal_name='user_prompt'"
+PROMPTS="select string_agg(signal_args::jsonb->0->>'prompt', ' | ' order by created_at) $EV and event_type='SignalReceived' and signal_name='user_prompt'"
 if wait_q 30 "select count(*) $EV and event_type='SignalReceived' and signal_name='user_prompt'" 2 &&
   [ "$($PSQL "$PROMPTS")" = "refactor the payment module | now add tests" ]; then
   pass "9 each new user turn is one user_prompt signal; the tool-loop call adds none"
@@ -328,7 +328,7 @@ else
   fail "9 each new user turn is one user_prompt signal; the tool-loop call adds none (got '$($PSQL "$PROMPTS")')"
 fi
 ORDER="select string_agg(case when event_type='SignalReceived' then 'S' else 'A' end, '' order by created_at)
-       $EV and (event_type='SignalReceived' or (event_type='ActivityStarted' and activity_type='POST $MODEL_HOST'))"
+       $EV and (event_type='SignalReceived' or (event_type='ActivityStarted' and activity_type='llm_call'))"
 if [ "$(q "$ORDER")" = "SAASA" ]; then
   pass "10 each prompt is recorded before the model call that carries it (SAASA)"
 else
