@@ -299,6 +299,8 @@ pub struct Guard<G, S: ?Sized> {
     verdict_ttl: Duration,
     /// Tier 2: what to do while Core is slow.
     slow_core: SlowCore,
+    /// Signed, hash-chained verdict records (W6).
+    evidence: Option<Arc<crate::evidence::Evidence>>,
 }
 
 impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
@@ -333,7 +335,15 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             rules: Rules::off(),
             verdict_ttl: Duration::ZERO,
             slow_core: SlowCore::Inline,
+            evidence: None,
         }
+    }
+
+    /// Writes a signed, hash-chained record of every verdict.
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: Arc<crate::evidence::Evidence>) -> Self {
+        self.evidence = Some(evidence);
+        self
     }
 
     /// Tier 0: decide matching requests from a local rule snapshot.
@@ -458,6 +468,30 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         self.metrics
             .record_result(allowed, &result.reason_code, elapsed);
         eprintln!("{}", eval_line(action, &result, elapsed));
+        if let Some(evidence) = &self.evidence {
+            let url = request_url(action);
+            let written = evidence.record(&crate::evidence::Verdict {
+                sandbox_id: &action.sandbox_id,
+                request_id: &action.request_id,
+                method: &action.method,
+                host: &action.host,
+                url: &url,
+                allowed,
+                reason_code: &result.reason_code,
+                governance_event_id: result
+                    .metadata
+                    .get("openbox.governance_event_id")
+                    .map(String::as_str),
+                fast_path: result.metadata.contains_key("openbox.fast_path"),
+            });
+            self.metrics.record_evidence(written.is_ok());
+            if let Err(error) = written {
+                eprintln!(
+                    "openbox: evidence for request_id={} not written: {error}",
+                    action.request_id
+                );
+            }
+        }
         result
     }
 

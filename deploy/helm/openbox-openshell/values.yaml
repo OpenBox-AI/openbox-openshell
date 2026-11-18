@@ -168,6 +168,11 @@ doorGuard:
   # (OPENBOX_MW_ADMIN_TOKEN_FILE). Empty: resume is off; the admin port
   # serves only probes and metrics.
   adminTokenSecret: ""
+  # Signed verdict records (docs/evidence.md): a Secret holding an Ed25519
+  # private key (PKCS#8 PEM) under `evidence.pem`
+  # (OPENBOX_EVIDENCE_KEY_FILE). Empty: no records. Records go to stdout,
+  # one JSON line each, for your log pipeline; chains are per pod.
+  evidenceKeySecret: ""
   # Fast-path verdicts (docs/install.md, "Fast-path verdicts").
   fastPath:
     # Tier 0: a local rule snapshot, as JSON under `rules.json` in this

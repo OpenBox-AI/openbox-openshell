@@ -87,6 +87,14 @@ spec:
               value: {{ $dg.promptCapture | quote }}
             - name: OPENBOX_BODY_CAPTURE
               value: {{ $dg.bodyCapture | quote }}
+            {{- if $dg.evidenceKeySecret }}
+            - name: OPENBOX_EVIDENCE_KEY_FILE
+              value: /var/run/openbox/evidence/evidence.pem
+            - name: OPENBOX_REPLICA_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
             {{- if $dg.adminTokenSecret }}
             - name: OPENBOX_MW_ADMIN_TOKEN_FILE
               value: /var/run/openbox/admin/admin-token
@@ -144,12 +152,26 @@ spec:
               mountPath: /var/run/openbox/admin
               readOnly: true
             {{- end }}
+            {{- if $dg.evidenceKeySecret }}
+            - name: evidence-key
+              mountPath: /var/run/openbox/evidence
+              readOnly: true
+            {{- end }}
       volumes:
         {{- include "obx.commonVolumes" . | nindent 8 }}
         {{- if $dg.fastPath.rulesConfigMap }}
         - name: rules
           configMap:
             name: {{ $dg.fastPath.rulesConfigMap }}
+        {{- end }}
+        {{- if $dg.evidenceKeySecret }}
+        - name: evidence-key
+          secret:
+            secretName: {{ $dg.evidenceKeySecret }}
+            defaultMode: 0400
+            items:
+              - key: evidence.pem
+                path: evidence.pem
         {{- end }}
         {{- if $dg.adminTokenSecret }}
         - name: admin-token

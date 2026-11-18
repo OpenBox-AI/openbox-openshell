@@ -54,6 +54,7 @@ use std::time::Duration;
 use openbox_verdict_middleware::core_client::{
     AgentSigner, CoreClient, CoreConfig, WorkloadIdentity,
 };
+use openbox_verdict_middleware::evidence::{Evidence, Signer, Sink};
 use openbox_verdict_middleware::fastpath::{Rules, RulesMode, SlowCore};
 use openbox_verdict_middleware::guard::{
     DEFAULT_APPROVAL_TTL, DEFAULT_CORE_BUDGET, Governance, Guard, SandboxStopper,
@@ -96,16 +97,20 @@ fn read_secret(key: &str) -> Result<String, String> {
 
 /// Tiers 0 to 2 from the environment, and the rule snapshot kept fresh.
 fn with_fast_path<G: Governance, S: SandboxStopper + ?Sized>(
-    guard: Arc<Guard<G, S>>,
-) -> Result<Arc<Guard<G, S>>, String> {
-    let guard = Arc::into_inner(guard)
-        .ok_or("guard is shared before it is configured")?
+    guard: Guard<G, S>,
+) -> Result<Guard<G, S>, String> {
+    let guard = guard
         .with_rules(rules_from_env()?)
         .with_verdict_ttl(Duration::from_secs(number("OPENBOX_VERDICT_TTL_SECS", 0)?))
         .with_slow_core(slow_core_from_env()?);
     guard.refresh_rules();
-    let guard = Arc::new(guard);
-    let refreshing = Arc::clone(&guard);
+    Ok(guard)
+}
+
+/// Keeps the rule snapshot fresh; started once the guard is configured and
+/// shared.
+fn spawn_rules_refresh<G: Governance, S: SandboxStopper + ?Sized>(guard: &Arc<Guard<G, S>>) {
+    let refreshing = Arc::clone(guard);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(RULES_REFRESH);
         loop {
@@ -113,7 +118,6 @@ fn with_fast_path<G: Governance, S: SandboxStopper + ?Sized>(
             refreshing.refresh_rules();
         }
     });
-    Ok(guard)
 }
 
 /// The admin listener: probes, metrics and, with a token, resume.
@@ -159,6 +163,30 @@ fn admin_actions<G: Governance, S: SandboxStopper + ?Sized>(
         Box::pin(async move { guard.resume(&sandbox_id).await })
     });
     Ok(Some(AdminActions { token, resume }))
+}
+
+/// Signed verdict records, when `OPENBOX_EVIDENCE_KEY_FILE` names a key:
+/// to `OPENBOX_EVIDENCE_DIR` (daily files) or stdout. Chains are per
+/// replica, named by `OPENBOX_REPLICA_ID` (the pod name by default).
+fn with_evidence<G: Governance, S: SandboxStopper + ?Sized>(
+    guard: Guard<G, S>,
+) -> Result<Guard<G, S>, String> {
+    let Some(key_file) = env("OPENBOX_EVIDENCE_KEY_FILE") else {
+        return Ok(guard);
+    };
+    let pem = std::fs::read_to_string(&key_file)
+        .map_err(|error| format!("OPENBOX_EVIDENCE_KEY_FILE: {error}"))?;
+    let signer = Signer::from_pem(&pem)?;
+    let sink =
+        env("OPENBOX_EVIDENCE_DIR").map_or(Sink::Stdout, |dir| Sink::Directory(PathBuf::from(dir)));
+    let replica = env("OPENBOX_REPLICA_ID")
+        .or_else(|| env("HOSTNAME"))
+        .unwrap_or_else(|| "door-guard".to_owned());
+    eprintln!(
+        "openbox-verdict-middleware: signing verdict records with key {} as replica {replica}",
+        signer.key_id
+    );
+    Ok(guard.with_evidence(Arc::new(Evidence::new(signer, sink, replica))))
 }
 
 /// How often the rule snapshot file is checked for changes.
@@ -376,13 +404,13 @@ async fn run() -> Result<(), String> {
     let (store, approval_ttl) = store_from_env()?;
     let capture = capture_from("OPENBOX_PROMPT_CAPTURE")?;
     let body_capture = capture_from("OPENBOX_BODY_CAPTURE")?;
-    let guard = Arc::new(
-        Guard::with_store(Arc::new(core), stopper, store, approval_ttl)
-            .with_core_budget(core_budget()?)
-            .with_prompt_capture(capture)
-            .with_body_capture(body_capture),
-    );
-    let guard = with_fast_path(guard)?;
+    // Configured in full before it is shared: nothing holds it yet.
+    let guard = Guard::with_store(Arc::new(core), stopper, store, approval_ttl)
+        .with_core_budget(core_budget()?)
+        .with_prompt_capture(capture)
+        .with_body_capture(body_capture);
+    let guard = Arc::new(with_evidence(with_fast_path(guard)?)?);
+    spawn_rules_refresh(&guard);
     let metrics = guard.metrics();
     let draining = Arc::clone(&guard);
     start_admin(&guard).await?;
