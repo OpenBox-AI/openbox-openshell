@@ -4,7 +4,7 @@
 #
 #   middleware/scripts/verify-core-timeout.sh
 #
-# Real OpenShell v0.1.2 gateway and sandbox (VM driver), the real door guard,
+# Real OpenShell v0.1.8 gateway and sandbox (VM driver), the real door guard,
 # and a fake Core whose answer delay is set per scenario. A sandbox's first
 # request through a fresh door guard makes three Core calls (session start,
 # the plain ActivityStarted that opens the activity, and the hook carrying its
@@ -32,7 +32,7 @@
 # up and prints a CLI wrapper, so you can poke at it). Takes about 5 minutes; most of
 # it is the sandbox booting.
 #
-# Needs the OpenShell v0.1.2 release binaries in OPENSHELL_PREFIX (default
+# Needs the OpenShell v0.1.8 release binaries in OPENSHELL_PREFIX (default
 # ~/openshell-repro: bin/openshell, bin/openshell-gateway,
 # libexec/openshell-driver-vm), python3 and cargo.
 # Optional: OBX_GATEWAY_PORT (default 17790; +1, +2 health and metrics),
@@ -78,7 +78,7 @@ for port in "$GW_PORT" $((GW_PORT + 1)) $((GW_PORT + 2)) "$MW_PORT" $((MW_PORT +
   free "$port" || { echo "port $port is in use; set OBX_GATEWAY_PORT / OBX_MW_PORT / OBX_CORE_PORT / OBX_UPSTREAM_PORT"; exit 1; }
 done
 [ -x "$PREFIX/bin/openshell-gateway" ] && [ -x "$PREFIX/libexec/openshell-driver-vm" ] ||
-  { echo "set OPENSHELL_PREFIX to an OpenShell v0.1.2 install"; exit 1; }
+  { echo "set OPENSHELL_PREFIX to an OpenShell v0.1.8 install"; exit 1; }
 "$PREFIX/bin/openshell" --version
 
 # Fake Core: answers the door guard's v1 evaluate and approval calls after

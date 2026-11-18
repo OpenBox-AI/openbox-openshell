@@ -130,7 +130,8 @@ pub trait InventoryBackend: Send + Sync + 'static {
     async fn upsert(&self, environment: &RuntimeEnvironment) -> Result<(), String>;
     async fn delete(&self, external_id: &str) -> Result<(), String>;
     /// Ids of the rows this workload currently has active.
-    async fn list_active(&self) -> Result<Vec<String>, String>;
+    /// Every active row of the agent, from every gateway that uses it.
+    async fn list_active(&self) -> Result<Vec<ActiveRow>, String>;
 }
 
 /// Where the sandboxes really are.
@@ -195,10 +196,14 @@ impl BackendInventory {
     }
 }
 
-#[derive(Deserialize)]
+/// An active row as the backend lists it: the sandbox and the gateway that
+/// recorded it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-struct ActiveRow {
-    external_id: String,
+pub struct ActiveRow {
+    pub external_id: String,
+    #[serde(default)]
+    pub gateway: Option<String>,
 }
 
 /// The backend wraps every response as `{"status": 200, "data": ...}`.
@@ -209,14 +214,10 @@ struct Envelope<T> {
 
 /// External ids from a `GET` of the runtime environments; the backend
 /// already filters to active rows.
-fn parse_active_list(body: &[u8]) -> Result<Vec<String>, String> {
+fn parse_active_list(body: &[u8]) -> Result<Vec<ActiveRow>, String> {
     let envelope: Envelope<Vec<ActiveRow>> =
         serde_json::from_slice(body).map_err(|_| "backend list was malformed".to_owned())?;
-    Ok(envelope
-        .data
-        .into_iter()
-        .map(|row| row.external_id)
-        .collect())
+    Ok(envelope.data)
 }
 
 #[tonic::async_trait]
@@ -237,7 +238,7 @@ impl InventoryBackend for BackendInventory {
             .map(|_| ())
     }
 
-    async fn list_active(&self) -> Result<Vec<String>, String> {
+    async fn list_active(&self) -> Result<Vec<ActiveRow>, String> {
         let body = self
             .send(
                 self.http
@@ -337,10 +338,13 @@ pub async fn reconcile(
             }
         }
     }
-    for external_id in backend.list_active().await? {
-        if present.contains(&external_id) {
+    // The agent's rows from every gateway that shares its identity: only
+    // this gateway's rows are this pass's to delete (PROD-1148).
+    for row in backend.list_active().await? {
+        if row.gateway.as_deref() != gateway || present.contains(&row.external_id) {
             continue;
         }
+        let external_id = row.external_id;
         match backend.delete(&external_id).await {
             Ok(()) => stats.deleted += 1,
             Err(error) => {
@@ -517,11 +521,20 @@ mod tests {
             Ok(())
         }
 
-        async fn list_active(&self) -> Result<Vec<String>, String> {
+        async fn list_active(&self) -> Result<Vec<ActiveRow>, String> {
             if self.fail_list {
                 return Err("down".to_owned());
             }
-            Ok(self.rows.lock().unwrap().keys().cloned().collect())
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .map(|row| ActiveRow {
+                    external_id: row.external_id.clone(),
+                    gateway: row.gateway.clone(),
+                })
+                .collect())
         }
     }
 
@@ -561,6 +574,7 @@ mod tests {
         RuntimeEnvironment {
             external_id: id.to_owned(),
             name: id.to_owned(),
+            gateway: Some("gw-1".to_owned()),
             ..RuntimeEnvironment::default()
         }
     }
@@ -639,6 +653,48 @@ mod tests {
         let rows = backend.rows.lock().unwrap();
         assert_eq!(rows.keys().collect::<Vec<_>>(), ["kept", "new"]);
         assert_eq!(rows["kept"].policy_version, Some(3));
+    }
+
+    /// PROD-1148: two gateways share one agent identity and one backend. The
+    /// reconciler of a gateway with no sandboxes deletes none of the other
+    /// gateway's rows.
+    #[tokio::test]
+    async fn reconcile_leaves_other_gateways_rows_alone() {
+        let backend = FakeBackend::default();
+        let mut other = environment("running-elsewhere");
+        other.gateway = Some("gw-prod".to_owned());
+        backend
+            .rows
+            .lock()
+            .unwrap()
+            .insert(other.external_id.clone(), other);
+        backend
+            .rows
+            .lock()
+            .unwrap()
+            .insert("mine-gone".to_owned(), environment("mine-gone"));
+        let empty = FakeLister(Ok(Vec::new()));
+
+        let stats = reconcile(&backend, &empty, Some("gw-1")).await.unwrap();
+
+        assert_eq!(stats.deleted, 1);
+        let rows = backend.rows.lock().unwrap();
+        assert_eq!(rows.keys().collect::<Vec<_>>(), ["running-elsewhere"]);
+    }
+
+    #[test]
+    fn the_backend_list_carries_each_rows_gateway() {
+        let rows = parse_active_list(
+            br#"{"status": 200, "data": [
+                {"external_id": "a", "gateway": "gw-1", "name": "a"},
+                {"external_id": "b", "gateway": null, "name": "b"},
+                {"external_id": "c", "name": "c"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(rows[0].gateway.as_deref(), Some("gw-1"));
+        assert_eq!(rows[1].gateway, None);
+        assert_eq!(rows[2].gateway, None);
     }
 
     #[tokio::test]
@@ -781,10 +837,12 @@ mod tests {
                 {"id": "9c0e2f11", "external_id": "sbx-2", "status": "active"}
             ]
         });
-        assert_eq!(
-            parse_active_list(body.to_string().as_bytes()).unwrap(),
-            ["sbx-1", "sbx-2"]
-        );
+        let ids: Vec<String> = parse_active_list(body.to_string().as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.external_id)
+            .collect();
+        assert_eq!(ids, ["sbx-1", "sbx-2"]);
         assert!(
             parse_active_list(br#"{"status":200,"data":[]}"#)
                 .unwrap()

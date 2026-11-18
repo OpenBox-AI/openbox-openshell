@@ -24,7 +24,7 @@
 #   - the front desk, twice: governing (fail closed: attaches the door guard
 #     on CreateSandbox, refuses weakening policy and uninspected credentials)
 #     and inventory (fail open: AI Inventory, session start and end)
-#   - an OpenShell v0.1.2 gateway (VM driver) with its own state and CLI
+#   - an OpenShell v0.1.8 gateway (VM driver) with its own state and CLI
 #     config, so no gateway you already run is touched
 #
 # Local development only: the gateway-to-extension legs run plaintext without
@@ -39,7 +39,7 @@
 #   OPENBOX_REDIS_URL       shared store (default redis://localhost:6379/7)
 #   OBX_DASHBOARD_URL       for links (default http://localhost:3233)
 #   OBX_HOST_IP             host IPv4 the sandbox VM reaches the door guard on
-#   OPENSHELL_PREFIX        OpenShell v0.1.2 install (default ~/openshell-repro)
+#   OPENSHELL_PREFIX        OpenShell v0.1.8 install (default ~/openshell-repro)
 #   OBX_GATEWAY_PORT        default 17990 (+1 health, +2 metrics)
 #   OBX_MW_PORT             door guard, default 50351 (+1 admin)
 #   OBX_FD_PORT             front desk, default 50371 (+1 inventory)
@@ -147,7 +147,7 @@ up() {
   [ -f "$agent_env" ] || die "no such file: $agent_env"
   running gateway && die "already up; run '$0 down' first"
   [ -x "$PREFIX/bin/openshell-gateway" ] && [ -x "$PREFIX/libexec/openshell-driver-vm" ] ||
-    die "OpenShell v0.1.2 not found in $PREFIX (set OPENSHELL_PREFIX; see verify-provider-profiles.sh)"
+    die "OpenShell v0.1.8 not found in $PREFIX (set OPENSHELL_PREFIX; see verify-provider-profiles.sh)"
   for port in "$GW_PORT" $((GW_PORT + 1)) $((GW_PORT + 2)) "$MW_PORT" $((MW_PORT + 1)) "$FD_PORT" "$INV_PORT" "$MODEL_PORT"; do
     free "$port" || die "port $port is in use (set OBX_GATEWAY_PORT / OBX_MW_PORT / OBX_FD_PORT / OBX_MODEL_PORT)"
   done
