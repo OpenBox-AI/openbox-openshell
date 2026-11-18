@@ -15,7 +15,7 @@
 #     middleware/scripts/verify-sessions.sh
 #
 # Runs against a real OpenBox stack (Core, its workers and Temporal) and
-# starts its own OpenShell v0.1.2 gateway (VM driver) with its own state,
+# starts its own OpenShell v0.1.8 gateway (VM driver) with its own state,
 # ports and CLI config, plus the front desk and the verdict middleware. The
 # gateway-to-extension legs run plaintext (OPENBOX_*_INSECURE=1, no gateway
 # token check); the legs to Core are the real ones (Keycloak workload token,
@@ -48,7 +48,7 @@
 #   OBX_MW_TIMEOUT          OpenShell's timeout for the middleware, default 30s
 #   OBX_REDIS_URL           shared store for both services, default the local
 #                           stack's Redis, database 7
-#   OPENSHELL_PREFIX        OpenShell v0.1.2 install (default ~/openshell-repro)
+#   OPENSHELL_PREFIX        OpenShell v0.1.8 install (default ~/openshell-repro)
 #   OBX_GATEWAY_PORT        default 17890 (+1 health, +2 metrics)
 #   OBX_MW_PORT             default 50251 (+1 admin)
 #   OBX_FD_PORT             default 50271 (+1 inventory)
@@ -145,7 +145,7 @@ for port in "$GW_PORT" $((GW_PORT + 1)) $((GW_PORT + 2)) "$MW_PORT" "$ADMIN_PORT
   free "$port" || { echo "port $port is in use; set OBX_GATEWAY_PORT / OBX_MW_PORT / OBX_FD_PORT"; exit 1; }
 done
 [ -x "$PREFIX/bin/openshell-gateway" ] && [ -x "$PREFIX/libexec/openshell-driver-vm" ] ||
-  { echo "set OPENSHELL_PREFIX to an OpenShell v0.1.2 install (see verify-provider-profiles.sh)"; exit 1; }
+  { echo "set OPENSHELL_PREFIX to an OpenShell v0.1.8 install (see verify-provider-profiles.sh)"; exit 1; }
 
 echo "== OpenBox stack"
 curl -fsS -o /dev/null "$CORE/" || { echo "Core not reachable at $CORE"; exit 1; }

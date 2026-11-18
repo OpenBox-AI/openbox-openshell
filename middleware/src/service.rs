@@ -460,7 +460,9 @@ mod tests {
     use crate::guard::tests::{FakeCore, FakeStopper};
     use crate::guard::{REASON_BLOCKED, REASON_UNAVAILABLE};
     use crate::token::tests::{AUDIENCE, TestSigner};
+    use openshell_core::extension_protocol::PROTOCOL_MAJOR;
     use openshell_core::proto::Decision;
+    use openshell_core::proto::extension::v1::ProtocolVersion;
     use prost_types::Value;
 
     fn service(
@@ -751,6 +753,47 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// An `OpenShell` release on another protocol major cannot register the
+    /// door guard; a newer minor on the same major still can.
+    #[tokio::test]
+    async fn describe_refuses_a_gateway_on_another_protocol_major() {
+        let signer = TestSigner::new();
+        let service = service(FakeCore::default(), Some(&signer));
+        let token = signer.sign(
+            &serde_json::json!({"typ": "openshell-ext+jwt", "alg": "EdDSA"}),
+            &serde_json::json!({"iss": "openshell-gateway:gw-1", "aud": AUDIENCE, "exp": unix_now() + 60, "caller_kind": "gateway"}),
+        );
+        for (major, minor, accepted) in [(PROTOCOL_MAJOR + 1, 0, false), (PROTOCOL_MAJOR, 99, true)]
+        {
+            let mut gateway = extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/gateway",
+                "9.9.9",
+                [],
+            );
+            gateway.protocol_version = Some(ProtocolVersion { major, minor });
+            let result = service
+                .describe(with_token(
+                    MiddlewareDescribeRequest {
+                        gateway: Some(gateway),
+                    },
+                    &token,
+                ))
+                .await;
+            if accepted {
+                assert!(result.is_ok(), "protocol {major}.{minor}: {result:?}");
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                assert!(
+                    error.message().contains("unsupported protocol"),
+                    "{}",
+                    error.message()
+                );
+            }
+        }
     }
 
     #[tokio::test]

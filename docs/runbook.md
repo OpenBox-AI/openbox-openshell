@@ -115,7 +115,7 @@ metrics and the time taken:
 |---|---|---|
 | `ms=` near 29000 in the log line | Core slower than the budget (`OpenBox did not return a verdict within 29000 ms`) | The slow-verdict steps above |
 | `openbox_mw_core_requests_total{outcome="error"}` rising, short `ms=` | Core refused, failed or is unreachable (`core returned HTTP <code>`, `core unreachable or timed out`, `core response was malformed`) | Core health; the agent's API key and workload key; DNS, network policy, Core's certificate, `OPENBOX_URL` |
-| No Core call recorded for the request | The supervisor sent no sandbox id | OpenShell version; should not happen on v0.1.2 |
+| No Core call recorded for the request | The supervisor sent no sandbox id | OpenShell version; should not happen on v0.1.8 |
 
 Then check:
 

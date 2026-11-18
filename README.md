@@ -12,7 +12,7 @@ step by step.
 You keep using OpenShell exactly as before. Nothing changes in your sandbox
 images, your agents or the `openshell` commands you run.
 
-Built for OpenShell v0.1.2.
+Built for OpenShell v0.1.8.
 
 ## Quick start
 
@@ -21,7 +21,7 @@ clone this repository or build anything.
 
 **You need**
 
-- An OpenShell v0.1.2 gateway on Kubernetes, with extension tokens on (the
+- An OpenShell v0.1.8 gateway on Kubernetes, with extension tokens on (the
   `[openshell.gateway.gateway_jwt]` section of its TOML). Note its
   `gateway_id` and the PEM file at `public_key_path`.
 - An agent in the OpenBox dashboard with a workload identity. The dashboard
@@ -347,7 +347,7 @@ Put internal systems behind HTTP or MCP to govern them per request.
 
 ## Try it on one machine
 
-With the OpenShell v0.1.2 binaries installed and an agent's credentials saved
+With the OpenShell v0.1.8 binaries installed and an agent's credentials saved
 from the dashboard as `agent.env`:
 
 ```sh

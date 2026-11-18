@@ -1,13 +1,7 @@
 [advisories]
 version = 2
 yanked = "deny"
-# RUSTSEC-2025-0134 (rustls-pemfile archived, unmaintained): transitive via the
-# LOCKED upstream openshell-core crate at OpenShell v0.1.2. No known
-# vulnerability; this workspace parses PEM through rustls-pki-types. Revisit
-# when the OpenShell lock bumps.
-ignore = [
-  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; locked upstream openshell-core dep; no vulnerability; revisit on lock bump" },
-]
+ignore = []
 
 [licenses]
 version = 2
@@ -49,4 +43,5 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Must equal openshell-core's git source in Cargo.toml; tests/pin.rs checks it.
 allow-git = ["https://github.com/NVIDIA/OpenShell.git"]

@@ -14,7 +14,7 @@
 # agent.env is the dashboard snippet for an agent with a workload identity
 # (OPENBOX_API_URL, OPENBOX_API_KEY, OPENBOX_WORKLOAD_PRIVATE_KEY), on any
 # OpenBox: shared staging or the local stack. The script brings up its own
-# OpenShell v0.1.2 gateway, front desk and door guard with
+# OpenShell v0.1.8 gateway, front desk and door guard with
 # openbox-openshell.sh, in its own directory and on its own ports, so it never
 # touches a dev environment you already run.
 #
@@ -99,7 +99,7 @@ else
   fail "1 the sandbox's effective policy keeps profile: $PROFILE on the OpenBox attachment"
 fi
 i=0
-until os logs "$BOX" --source sandbox 2>/dev/null | grep -q 'Settings poll'; do
+until os logs "$BOX" --source sandbox 2>/dev/null | grep -qE 'Settings poll|Acknowledged initial policy revision'; do
   i=$((i + 1)); [ $i -le 30 ] || break; sleep 1
 done
 
