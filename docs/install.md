@@ -347,6 +347,58 @@ bypassed OpenBox.
 The trade-off: a policy shipped inside the sandbox image is ignored. Pass
 `--policy` to use it.
 
+## Fast-path verdicts
+
+By default every request waits for Core. Three tiers let the door guard
+answer sooner where that is safe:
+
+| Tier | Answers | Setting |
+|---|---|---|
+| 0, local rules | Requests a rule in a local snapshot matches | `doorGuard.fastPath.rulesConfigMap` (a ConfigMap with `rules.json`), `rulesMode` |
+| 1, recent verdict | An action identical to one Core allowed within a TTL | Core's `verdict_ttl_secs` on the verdict, else `doorGuard.fastPath.verdictTtlSecs` (default 0: off) |
+| 2, Core | Everything else | `doorGuard.fastPath.slowCore`: `pending` (default) or `inline` (wait, as before v0.3) |
+
+A request a fast tier allows is still recorded in Core, in order with the
+sandbox's other events, after it has been answered. If Core then refuses it,
+the door guard logs it and counts it in
+`openbox_mw_fast_path_disagreements_total`; the request has already gone.
+Model calls always go to Core, because their prompt and tool bookkeeping
+happens there. An approved retry is never reused: approvals stay single use.
+
+**Local rules.** The snapshot is JSON, reloaded within 10 s of a change. A
+snapshot past `expires_at` is not used, and requests go to Core:
+
+```json
+{
+  "version": "2026-11-13#42",
+  "expires_at": 1795000000,
+  "rules": [
+    {"id": "no-paste", "decision": "block", "hosts": ["pastebin.com", "*.pastebin.com"]},
+    {"id": "docs-read", "decision": "allow", "hosts": ["docs.example.com"], "methods": ["GET", "HEAD"]},
+    {"id": "safe-tools", "decision": "allow", "tools": ["search"]}
+  ]
+}
+```
+
+Every condition a rule sets must match (`hosts`, `methods`, `path_prefixes`,
+`tools`); the first matching rule decides. Run new rules in `shadow` first:
+Core still decides, and `openbox_mw_rule_shadow_total{agreement=...}` shows
+how often the snapshot agrees. Switch to `enforce` once it does.
+
+**Pending** (the default). With `slowCore: pending`, the door guard waits
+`pendingWaitMs` (2 s) for Core. If Core is slower, the request is denied with
+`openbox_pending` while the door guard keeps evaluating; the agent's identical
+retry gets the verdict at once. This avoids holding a connection open for the
+whole of a slow verdict, which destinations with short idle timeouts drop.
+Agents must retry on `openbox_pending`; the helpers in `clients/` do. An
+agent that cannot retry needs `slowCore: inline`, and with it the full wait
+for every verdict. With
+more than one door guard replica it needs Redis, since the retry can land on
+another replica.
+
+`openbox_mw_tier_total{tier=...}` and `openbox_mw_tier_duration_seconds`
+show how many requests each tier answered and how fast.
+
 ## CONSTRAIN: rewriting a request
 
 When Core's verdict is CONSTRAIN and carries `constraints`, the door guard

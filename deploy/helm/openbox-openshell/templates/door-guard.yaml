@@ -87,6 +87,20 @@ spec:
               value: {{ $dg.promptCapture | quote }}
             - name: OPENBOX_BODY_CAPTURE
               value: {{ $dg.bodyCapture | quote }}
+            {{- with $dg.fastPath }}
+            {{- if .rulesConfigMap }}
+            - name: OPENBOX_RULES_FILE
+              value: /var/run/openbox/rules/rules.json
+            - name: OPENBOX_RULES_MODE
+              value: {{ .rulesMode | quote }}
+            {{- end }}
+            - name: OPENBOX_VERDICT_TTL_SECS
+              value: {{ .verdictTtlSecs | int64 | quote }}
+            - name: OPENBOX_SLOW_CORE
+              value: {{ .slowCore | quote }}
+            - name: OPENBOX_PENDING_WAIT_MS
+              value: {{ .pendingWaitMs | int64 | quote }}
+            {{- end }}
             {{- include "obx.credentialEnv" . | trim | nindent 12 }}
             {{- if eq .Values.credentials.identity "signed" }}
             - name: OPENBOX_AGENT_DID
@@ -116,8 +130,18 @@ spec:
             {{- toYaml $dg.resources | nindent 12 }}
           volumeMounts:
             {{- include "obx.commonMounts" . | nindent 12 }}
+            {{- if $dg.fastPath.rulesConfigMap }}
+            - name: rules
+              mountPath: /var/run/openbox/rules
+              readOnly: true
+            {{- end }}
       volumes:
         {{- include "obx.commonVolumes" . | nindent 8 }}
+        {{- if $dg.fastPath.rulesConfigMap }}
+        - name: rules
+          configMap:
+            name: {{ $dg.fastPath.rulesConfigMap }}
+        {{- end }}
         - name: tls
           secret:
             secretName: {{ include "obx.doorGuardTlsSecret" . }}
