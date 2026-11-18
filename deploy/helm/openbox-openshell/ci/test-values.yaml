@@ -2,7 +2,7 @@
 # real credentials.
 image:
   repository: registry.example.com/openbox/openbox-openshell
-  tag: "0.1.0"
+  tag: "0.2.0"
 openbox:
   url: https://core.example.com
   backendUrl: https://api.example.com

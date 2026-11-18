@@ -103,7 +103,7 @@ redis:
 
 ```sh
 helm install openbox oci://ghcr.io/openbox-ai/charts/openbox-openshell \
-  --version 0.1.0 -n openbox -f openbox-values.yaml \
+  --version 0.2.0 -n openbox -f openbox-values.yaml \
   --set-file gateway.publicKey=<public_key_path>
 
 kubectl -n openbox wait --for=condition=Available deploy --all --timeout=3m
