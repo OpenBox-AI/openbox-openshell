@@ -145,9 +145,21 @@ No Kubernetes? See [Try it on one machine](#try-it-on-one-machine).
   weaken that attachment is refused.
 - **A readable record.** Each sandbox is one OpenBox session: the user's
   prompts, each model call, each tool the model asked for, and the requests
-  made inside that tool, in order, with their inputs, outputs and timing.
+  made inside that tool, in order, with their timing.
+- **Content stays inside by default.** Core gets a hash of each prompt and
+  body, the kinds of sensitive data found in it, and the shape of its JSON,
+  not the content itself. Sending the text is opt-in, per host if you like
+  (`docs/install.md`, "What Core receives").
 - **An inventory.** Every sandbox is registered in the OpenBox AI Inventory
-  and kept up to date as it changes and is deleted.
+  and kept up to date as it changes and is deleted. Each row says whether the
+  sandbox is `compliant`, `weakened` or `ungoverned`.
+- **No stalls when Core is slow.** When Core takes more than 2 s, the agent
+  is told `openbox_pending` and its retry gets the verdict. You can also have
+  the door guard answer from local rules, or reuse a verdict Core gave for an
+  identical request (`docs/install.md`, "Fast-path verdicts").
+- **Signed evidence, if you want it.** With a signing key, the door guard
+  writes a signed, hash-chained record of every verdict, which anyone can
+  check with the public key alone (`openbox-evidence`, `docs/evidence.md`).
 - **Fail closed.** If OpenBox cannot give a verdict in time, the request is
   denied with an explicit reason, never silently allowed.
 
@@ -162,7 +174,7 @@ No Kubernetes? See [Try it on one machine](#try-it-on-one-machine).
 | Require approval | does not go out yet | HTTP 403, `openbox_approval_required`. Retrying the identical request after a person approves it lets it through |
 | Halt | does not go out | HTTP 403, `openbox_halted`. The sandbox is stopped, and nothing else from it gets out |
 | No verdict in time | does not go out | HTTP 403, `openbox_unavailable` |
-| Still deciding (`pending` mode) | does not go out yet | HTTP 403, `openbox_pending`. The identical retry gets the verdict |
+| Still deciding (the default when Core takes more than 2 s) | does not go out yet | HTTP 403, `openbox_pending`. The identical retry gets the verdict |
 | A response carries a secret, under `responses: block` | went out; its response is not delivered | HTTP 403, `openbox_response_blocked` |
 
 OpenShell cannot hold a request open while a person decides, so approval is
@@ -251,6 +263,9 @@ flowchart LR
         sequence["<b>Ordering</b><br/>sequence.rs<br/>Core hears each sandbox's<br/>events in order"]
         client["<b>Core client</b><br/>core_client.rs<br/>Governance API, workload<br/>identity, 29 s budget"]
         halt["<b>Halt</b><br/>halt.rs<br/>Stops a halted sandbox"]
+        fast["<b>Fast path</b><br/>fastpath.rs<br/>Local rules, recent verdicts,<br/>pending answers"]
+        shape["<b>Content and rewrites</b><br/>capture.rs, constrain.rs, responses.rs<br/>What Core sees; CONSTRAIN rewrites;<br/>response checks"]
+        evidence["<b>Evidence</b><br/>evidence.rs<br/>Signed, chained verdict records"]
         obsv["<b>Observability</b><br/>metrics.rs, telemetry.rs<br/>Prometheus, OpenTelemetry"]
     end
 
@@ -265,6 +280,9 @@ flowchart LR
     guard --> halt --> gw
     guard --- store
     guard --> obsv
+    guard --> fast
+    guard --> shape
+    guard --> evidence
 ```
 
 One request, start to finish:
@@ -294,7 +312,8 @@ flowchart LR
         token["<b>Token check</b><br/>token.rs"]
         policy["<b>Governance policy</b><br/>front_desk.rs<br/>Attach OpenBox on create;<br/>refuse weakening changes"]
         sessions["<b>Sessions</b><br/>sessions.rs<br/>Open a sandbox's session on create,<br/>close it on delete"]
-        inventory["<b>Inventory</b><br/>inventory.rs<br/>Register sandboxes; reconcile<br/>against the gateway"]
+        inventory["<b>Inventory</b><br/>inventory.rs<br/>Register sandboxes with their<br/>posture; reconcile against the gateway"]
+        fleet["<b>Fleet checks</b><br/>fleet.rs<br/>Creates, policy changes and<br/>proposals, judged by Core"]
     end
 
     core["OpenBox Core"]
@@ -304,6 +323,7 @@ flowchart LR
     interceptor --> policy
     interceptor --> sessions --> core
     interceptor --> inventory --> backend
+    interceptor --> fleet --> core
     inventory -- "list sandboxes" --> gateway
 ```
 
@@ -345,6 +365,8 @@ Put internal systems behind HTTP or MCP to govern them per request.
 | `docs/runbook.md` | Metrics, alerts, slow verdicts, break-glass |
 | `docs/agent-approvals.md` | Approvals, for agent authors |
 | `docs/websocket.md` | What is governed on a WebSocket |
+| `docs/evidence.md` | Signed verdict records, checking them with `openbox-evidence`, and joining them to OpenShell's OCSF log |
+| `clients/` | Retry helpers for agents, in Python and TypeScript (`openbox_pending`, approvals) |
 | `middleware/scripts/openbox-openshell.sh` | Run OpenShell governed by OpenBox on one machine |
 | `middleware/scripts/verify-*.sh` | Live checks against a real gateway and OpenBox |
 | `middleware/scripts/nightly-reference.sh` | The nightly: OpenShell at the pinned version on kind, this checkout in front of it, a scripted agent |
