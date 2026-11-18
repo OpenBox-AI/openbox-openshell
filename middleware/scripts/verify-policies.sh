@@ -11,8 +11,9 @@
 # session back. OPENBOX_BACKEND_URL is the backend (default the shared
 # staging one, https://openbox-api.node.lat).
 #
-# Creates four policy rules on the agent, each matching only requests whose
-# URL carries its marker, so no other traffic of the agent is affected:
+# Creates four policy rules in the organisation's control library and attaches
+# them to the agent, each matching only requests whose URL carries its marker,
+# so no other traffic of the agent is affected:
 #
 #   0  uat=plain      (no rule)          200, decision=allow
 #   1  uat=block      BLOCK              403, openbox_blocked, the rule's reason
@@ -24,16 +25,16 @@
 #                                        stopped, and a plain request after it
 #                                        is denied too
 #
-# The rules are demoted (DELETE, which retains them) on exit. A rule matching
-# uat=approve that already exists is reused rather than duplicated.
+# The script waits until the backend reports all four enforced on the agent,
+# and deletes them from the library on exit.
 #
 # The door guard is restarted with the gateway's client certificate so a halt
 # can stop the sandbox (openbox-openshell.sh does not give it one).
 #
 # Optional: OBX_DEV_DIR (default /tmp/obx-pol), OBX_GATEWAY_PORT (18490),
 # OBX_MW_PORT (50851), OBX_FD_PORT (50871), OBX_MODEL_PORT (18495),
-# OPENBOX_REDIS_URL, OBX_RULE_WAIT (seconds for a new rule set to reach OPA,
-# default 45), KEEP=1 to leave the stack and the rules in place.
+# OPENBOX_REDIS_URL, OBX_RULE_WAIT (seconds to wait for the rules to be
+# enforced, default 180), KEEP=1 to leave the stack and the rules in place.
 set -eu
 
 [ $# = 1 ] && [ -f "$1" ] || { echo "usage: OBX_ORG_KEY_FILE=... $0 agent.env" >&2; exit 2; }
@@ -64,7 +65,7 @@ api() { # method path [json]
 }
 cleanup() {
   if [ "${KEEP:-0}" = 1 ]; then echo "kept: $DIR, rules:$CREATED"; return; fi
-  for id in $CREATED; do api DELETE "/agent/$AGENT_ID/policy-rule/$id" >/dev/null 2>&1 && echo "demoted rule $id"; done
+  for id in $CREATED; do api DELETE "/governance/controls/$id" >/dev/null 2>&1 && echo "deleted rule $id"; done
   os sandbox delete "$BOX" >/dev/null 2>&1 || true
   "$BRINGUP" down >/dev/null 2>&1 || true
 }
@@ -78,12 +79,13 @@ request() {
 }
 last_eval() { grep 'openbox: eval ' "$DIR/door-guard.log" | tail -1; }
 
-# Creates a rule matching URLs that contain $1; prints its id.
+# Creates a library rule matching URLs that contain $1 and attaches it to
+# the agent; prints its id.
 rule() { # marker decision
-  api POST "/agent/$AGENT_ID/policy-rule" "$(python3 - "$1" "$2" "$RUN" <<'PY'
+  id=$(api POST "/governance/controls" "$(python3 - "$1" "$2" "$RUN" <<'PY'
 import json, sys
 marker, decision, run = sys.argv[1:]
-print(json.dumps({
+print(json.dumps({"kind": "policy_rule", "body": {
     "rule_name": f"OpenShell verify {decision.lower()} {run}",
     "description": f"verify-policies.sh: matches only URLs carrying {marker}",
     "priority": 20, "match_mode": "any", "decision": decision,
@@ -92,33 +94,26 @@ print(json.dumps({
         "left": {"kind": "field", "field": "spans[_].attributes.http.url", "transform": "value", "valueType": "string"},
         "operator": "contains",
         "right": {"kind": "literal", "value": marker, "valueType": "string"}}],
-}))
+}}))
 PY
-)" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["data"]["id"])'
+)" | python3 -c 'import sys,json; d=json.load(sys.stdin); d=d.get("data",d); print(d["id"])') || return 1
+  api PUT "/agent/$AGENT_ID/governance-controls/$id" '{}' | python3 -c '
+import sys, json
+d = json.load(sys.stdin); d = d.get("data", d)
+sys.exit(0 if d.get("desiredState") == "attached" else 1)' || { echo "could not attach rule $id" >&2; api DELETE "/governance/controls/$id" >/dev/null 2>&1; return 1; }
+  echo "$id"
 }
 
 "$BRINGUP" up --agent-env "$1"
 . "$DIR/agent"
 
-echo "== Policy rules on agent $AGENT_ID"
-existing=$(api GET "/agent/$AGENT_ID/policy-rule" | python3 -c '
-import sys, json
-for r in json.load(sys.stdin)["data"]["data"]:
-    if r["is_active"] and r["decision"] == "REQUIRE_APPROVAL" and any(
-        c["right"].get("value") == "uat=approve" for c in r["conditions"]):
-        print(r["id"]); break')
-for spec in "uat=halt HALT" "uat=block BLOCK" "uat=constrain CONSTRAIN"; do
+echo "== Policy rules attached to agent $AGENT_ID"
+for spec in "uat=halt HALT" "uat=block BLOCK" "uat=constrain CONSTRAIN" "uat=approve REQUIRE_APPROVAL"; do
   set -- $spec
   id=$(rule "$1" "$2") || { echo "could not create the $2 rule" >&2; exit 1; }
   CREATED="$CREATED $id"
   echo "   $2 rule $id"
 done
-if [ -n "$existing" ]; then
-  echo "   REQUIRE_APPROVAL rule $existing (already there, reused)"
-else
-  id=$(rule uat=approve REQUIRE_APPROVAL); CREATED="$CREATED $id"
-  echo "   REQUIRE_APPROVAL rule $id"
-fi
 
 echo "== Door guard restarted with the gateway's client certificate (halt can stop)"
 kill "$(cat "$DIR/door-guard.pid")"
@@ -146,10 +141,24 @@ done
 SANDBOX_ID=$(os sandbox get "$BOX" -o json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("id") or d.get("metadata",{}).get("id",""))')
 echo "   sandbox id $SANDBOX_ID"
 
-# A new rule set reaches OPA when it next polls the bundle.
-wait=${OBX_RULE_WAIT:-45}
-echo "== Waiting ${wait}s for the rule set to reach OPA"
-sleep "$wait"
+# Attaching is asynchronous: wait until the backend reports every rule
+# enforced on the agent (applied, and confirmed live by the policy runtime).
+wait=${OBX_RULE_WAIT:-180}
+echo "== Waiting up to ${wait}s for the rules to be enforced"
+start=$(date +%s)
+while :; do
+  state=$(api GET "/agent/$AGENT_ID/effective-governance-controls?kind=policy_rule" | python3 -c '
+import sys, json
+want = sys.argv[1].split()
+d = json.load(sys.stdin); d = d.get("data", d)
+rows = {r["control"]["id"]: r for r in d.get("controls", []) if isinstance(r, dict) and "control" in r}
+states = [rows[i]["enforcement"] if i in rows else "missing" for i in want]
+print("enforced" if all(s == "enforced" for s in states) else " ".join(states))' "$CREATED" 2>/dev/null || echo unreadable)
+  [ "$state" = enforced ] && break
+  if [ $(($(date +%s) - start)) -ge "$wait" ]; then echo "rules not enforced after ${wait}s: $state" >&2; exit 1; fi
+  sleep 3
+done
+echo "   enforced after $(($(date +%s) - start))s"
 
 echo "== 0 no rule matches"
 code=$(request "uat=plain&run=$RUN"); line=$(last_eval)
