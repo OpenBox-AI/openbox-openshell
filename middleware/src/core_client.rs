@@ -79,6 +79,9 @@ pub struct CoreDecision {
     /// Unix seconds after which a pending approval lapses.
     pub approval_expires_at: Option<i64>,
     pub policy_id: Option<String>,
+    /// With CONSTRAIN: what to change before the request goes out
+    /// ([`crate::constrain`]). `None` when Core sent none.
+    pub constraints: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -603,6 +606,7 @@ struct EvaluateResponse {
     risk_score: Option<f64>,
     approval_expiration_time: Option<String>,
     policy_id: Option<String>,
+    constraints: Option<Value>,
 }
 
 impl EvaluateResponse {
@@ -625,6 +629,7 @@ impl EvaluateResponse {
                 .as_deref()
                 .and_then(parse_rfc3339),
             policy_id: self.policy_id.filter(|id| !id.is_empty()),
+            constraints: self.constraints.filter(|value| !value.is_null()),
         })
     }
 }
@@ -1144,6 +1149,7 @@ mod tests {
             risk_score: None,
             approval_expiration_time: None,
             policy_id: None,
+            constraints: None,
         };
         assert!(matches!(
             response.into_decision(),

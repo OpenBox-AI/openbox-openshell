@@ -156,7 +156,8 @@ No Kubernetes? See [Try it on one machine](#try-it-on-one-machine).
 | OpenBox decides | The request | The agent sees |
 |---|---|---|
 | Allow | goes out | the normal response |
-| Allow with a constraint | goes out; the constraint is recorded | the normal response |
+| Allow with a constraint | goes out rewritten as the constraint says (redacted, narrowed, headers stripped), or as sent when the constraint asks for nothing | the response to the rewritten request |
+| A constraint that cannot be met | does not go out | HTTP 403, `openbox_constrain_failed` |
 | Block | does not go out | HTTP 403, reason code `openbox_blocked` |
 | Require approval | does not go out yet | HTTP 403, `openbox_approval_required`. Retrying the identical request after a person approves it lets it through |
 | Halt | does not go out | HTTP 403, `openbox_halted`. The sandbox is stopped, and nothing else from it gets out |
