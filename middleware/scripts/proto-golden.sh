@@ -37,6 +37,8 @@ for name in sorted(os.listdir(root)):
         if opened:
             scope.append(f"{opened.group(1)} {opened.group(2)}")
             out.append(f"{name}: {' > '.join(scope)}")
+            if line.endswith("}"):  # an empty one-liner: message X {}
+                scope.pop()
             continue
         if line.startswith("}"):
             if scope:
