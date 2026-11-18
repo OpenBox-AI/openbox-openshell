@@ -1,0 +1,65 @@
+name: Nightly reference stack
+
+# OpenShell at the pinned version on Kubernetes (kind), with this checkout's
+# door guard and front desk in front of it, driven by a scripted agent:
+# middleware/scripts/nightly-reference.sh. Catches an OpenShell-side break
+# (chart, gateway config, extension contract) between pin bumps, which the
+# pull-request CI's unit tests and proto golden cannot see.
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      openshell_version:
+        description: OpenShell release to run against (default the pinned one)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-reference
+  cancel-in-progress: false
+
+env:
+  KIND_VERSION: v0.32.0
+  # Agent Sandbox controller release (kubernetes-sigs/agent-sandbox).
+  AGENT_SANDBOX_VERSION: v1.0.10
+
+jobs:
+  reference:
+    name: Reference stack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: kind
+        run: |
+          curl -fsSLo kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          curl -fsSLo kind.sha256 "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum"
+          echo "$(cut -d' ' -f1 kind.sha256)  kind" | sha256sum -c -
+          sudo install -m 0755 kind /usr/local/bin/kind
+      - name: The OpenShell version
+        run: |
+          pinned=$(sed -n 's/^Built for OpenShell v\([0-9.]*\)\.$/\1/p' README.md | head -1)
+          echo "OPENSHELL_VERSION=${INPUT_VERSION:-$pinned}" >> "$GITHUB_ENV"
+        env:
+          INPUT_VERSION: ${{ inputs.openshell_version }}
+      - name: Reference stack and scripted agent
+        run: middleware/scripts/nightly-reference.sh
+        env:
+          # The runner is thrown away; keep the cluster for the logs below.
+          KEEP_CLUSTER: "1"
+      - name: Logs on failure
+        if: failure()
+        run: |
+          for ns in openbox openshell; do
+            kubectl --context kind-obx-nightly -n "$ns" get pods -o wide || true
+            for p in $(kubectl --context kind-obx-nightly -n "$ns" get pods -o name 2>/dev/null); do
+              echo "::group::$ns $p"
+              kubectl --context kind-obx-nightly -n "$ns" logs "$p" --all-containers --tail=200 || true
+              echo "::endgroup::"
+            done
+          done
