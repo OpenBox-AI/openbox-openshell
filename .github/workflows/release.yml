@@ -247,6 +247,8 @@ jobs:
 
           ## Verify
 
+          With cosign v3 or later (cosign 2 reports "no signatures found" for these bundles):
+
           \`\`\`sh
           cosign verify $IMAGE:$VERSION \\
             --certificate-identity-regexp '$id' \\

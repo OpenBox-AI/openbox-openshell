@@ -405,7 +405,9 @@ Release candidates (`X.Y.Z-rc.N`) move neither and are marked as prereleases.
 
 The image and the chart are signed with [cosign](https://docs.sigstore.dev)
 by the release workflow, and the image carries an SBOM and build provenance.
-Check a release before you install it:
+Check a release before you install it, with cosign v3 or later. The
+signatures are Sigstore bundles that GHCR stores under the digest's referrer
+tag, and cosign 2 does not find them there ("no signatures found"):
 
 ```sh
 cosign verify ghcr.io/openbox-ai/openbox-openshell:<version> \
