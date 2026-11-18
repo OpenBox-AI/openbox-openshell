@@ -34,6 +34,7 @@ use serde_json::Value;
 use tonic::{Request, Response, Status};
 
 use crate::core_client::unix_now;
+use crate::fleet::{self, DraftReader, FleetCore, FleetGovernance, Operation};
 use crate::front_desk::{self, Refusal};
 use crate::telemetry;
 use crate::token::{Caller, TokenVerifier};
@@ -116,6 +117,10 @@ pub struct FrontDesk<I: ?Sized> {
     role: Role,
     verifier: Option<TokenVerifier>,
     inventory: Arc<I>,
+    /// Fleet checks in Core (R8.1, R8.2); off when `None`.
+    fleet: Option<Arc<FleetGovernance<dyn FleetCore>>>,
+    /// Reads pending proposals for the proposal check.
+    drafts: Option<Arc<dyn DraftReader>>,
 }
 
 impl<I: Inventory + ?Sized> FrontDesk<I> {
@@ -124,7 +129,22 @@ impl<I: Inventory + ?Sized> FrontDesk<I> {
             role,
             verifier,
             inventory,
+            fleet: None,
+            drafts: None,
         }
+    }
+
+    /// Turns on the fleet checks: sandbox creation, policy changes and, with
+    /// a draft reader, approvals of agent-authored proposals go to Core.
+    #[must_use]
+    pub fn with_fleet(
+        mut self,
+        fleet: Arc<FleetGovernance<dyn FleetCore>>,
+        drafts: Option<Arc<dyn DraftReader>>,
+    ) -> Self {
+        self.fleet = Some(fleet);
+        self.drafts = drafts;
+        self
     }
 
     fn authenticate<T>(&self, request: &Request<T>) -> Result<(), Status> {
@@ -192,27 +212,48 @@ impl<I: Inventory + ?Sized> GatewayInterceptor for FrontDesk<I> {
         let manifest = InterceptorManifest {
             name: MANIFEST_NAME.to_owned(),
             bindings: match self.role {
-                Role::Govern => vec![
-                    binding(
-                        "create-sandbox",
-                        "CreateSandbox",
-                        &[ModifyOperation, Validate],
-                        "fail_closed",
-                    ),
-                    binding("update-config", "UpdateConfig", &[Validate], "fail_closed"),
-                    binding(
-                        "import-provider-profiles",
-                        "ImportProviderProfiles",
-                        &[Validate],
-                        "fail_closed",
-                    ),
-                    binding(
-                        "update-provider-profiles",
-                        "UpdateProviderProfiles",
-                        &[Validate],
-                        "fail_closed",
-                    ),
-                ],
+                Role::Govern => [
+                    vec![
+                        binding(
+                            "create-sandbox",
+                            "CreateSandbox",
+                            &[ModifyOperation, Validate],
+                            "fail_closed",
+                        ),
+                        binding("update-config", "UpdateConfig", &[Validate], "fail_closed"),
+                        binding(
+                            "import-provider-profiles",
+                            "ImportProviderProfiles",
+                            &[Validate],
+                            "fail_closed",
+                        ),
+                        binding(
+                            "update-provider-profiles",
+                            "UpdateProviderProfiles",
+                            &[Validate],
+                            "fail_closed",
+                        ),
+                    ],
+                    if self.fleet.is_some() {
+                        vec![
+                            binding(
+                                "approve-draft-chunk",
+                                "ApproveDraftChunk",
+                                &[Validate],
+                                "fail_closed",
+                            ),
+                            binding(
+                                "approve-all-draft-chunks",
+                                "ApproveAllDraftChunks",
+                                &[Validate],
+                                "fail_closed",
+                            ),
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                ]
+                .concat(),
                 Role::Inventory => vec![
                     binding(
                         "create-sandbox",
@@ -347,13 +388,28 @@ impl<I: Inventory + ?Sized> FrontDesk<I> {
             }
             ("CreateSandbox", Some(interceptor_evaluation::Phase::Validate(phase))) => {
                 let operation = struct_to_json(phase.proposed_operation.as_ref());
-                front_desk::validate_create_sandbox(&operation)
-                    .map_or_else(|refusal| refuse(&refusal), |()| allow())
+                if let Err(refusal) = front_desk::validate_create_sandbox(&operation) {
+                    return refuse(&refusal);
+                }
+                self.fleet_check(&[fleet::create_sandbox_operation(&operation)])
+                    .await
             }
             ("UpdateConfig", Some(interceptor_evaluation::Phase::Validate(phase))) => {
                 let operation = struct_to_json(phase.proposed_operation.as_ref());
-                front_desk::validate_update_config(&operation)
-                    .map_or_else(|refusal| refuse(&refusal), |()| allow())
+                if let Err(refusal) = front_desk::validate_update_config(&operation) {
+                    return refuse(&refusal);
+                }
+                let operations: Vec<Operation> = fleet::update_config_operation(&operation)
+                    .into_iter()
+                    .collect();
+                self.fleet_check(&operations).await
+            }
+            (
+                method @ ("ApproveDraftChunk" | "ApproveAllDraftChunks"),
+                Some(interceptor_evaluation::Phase::Validate(phase)),
+            ) => {
+                let operation = struct_to_json(phase.proposed_operation.as_ref());
+                self.proposal_check(method, &operation).await
             }
             ("ImportProviderProfiles", Some(interceptor_evaluation::Phase::Validate(phase))) => {
                 let operation = struct_to_json(phase.proposed_operation.as_ref());
@@ -384,6 +440,89 @@ impl<I: Inventory + ?Sized> FrontDesk<I> {
             }
             _ => allow(),
         }
+    }
+}
+
+impl<I: Inventory + ?Sized> FrontDesk<I> {
+    /// Asks Core about each operation; the first refusal refuses the call.
+    async fn fleet_check(&self, operations: &[Operation]) -> InterceptorResult {
+        let Some(fleet) = &self.fleet else {
+            return allow();
+        };
+        for operation in operations {
+            match fleet.check(operation).await {
+                Ok(score) => {
+                    if let Operation::CreateSandbox { sandbox, .. } = operation {
+                        fleet.state.set(sandbox, score);
+                    }
+                }
+                Err(refusal) => return refuse(&Refusal(refusal.0)),
+            }
+        }
+        allow()
+    }
+
+    /// Checks the proposals an approval would apply (R8.2).
+    async fn proposal_check(&self, method: &str, operation: &Value) -> InterceptorResult {
+        if self.fleet.is_none() {
+            return allow();
+        }
+        let Some(drafts) = &self.drafts else {
+            return refuse(&Refusal(
+                "OpenBox cannot read the proposal without a gateway credential, so it cannot approve it"
+                    .to_owned(),
+            ));
+        };
+        let sandbox = operation
+            .get("sandbox")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // The approval names its workspace; one left out is the default.
+        let workspace = front_desk::field(operation, "workspaceScope", "workspace_scope")
+            .and_then(|scope| scope.get("workspace"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("default");
+        let chunks = match drafts.pending_chunks(workspace, sandbox).await {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                return refuse(&Refusal(format!(
+                    "OpenBox could not read the proposal ({error}); try again"
+                )));
+            }
+        };
+        let (ids, include_flagged): (Vec<String>, bool) = if method == "ApproveDraftChunk" {
+            let id = front_desk::field(operation, "chunkId", "chunk_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            (vec![id.to_owned()], true)
+        } else {
+            let ids = operation
+                .get("approvals")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|approval| {
+                    front_desk::field(approval, "chunkId", "chunk_id").and_then(Value::as_str)
+                })
+                .map(str::to_owned)
+                .collect();
+            let flagged = front_desk::field(
+                operation,
+                "includeSecurityFlagged",
+                "include_security_flagged",
+            )
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+            (ids, flagged)
+        };
+        self.fleet_check(&fleet::proposal_operations(
+            sandbox,
+            &chunks,
+            &ids,
+            include_flagged,
+        ))
+        .await
     }
 }
 
@@ -661,6 +800,144 @@ mod tests {
             .into_inner();
         assert!(!validate.allowed);
         assert_eq!(validate.status_code, "PERMISSION_DENIED");
+    }
+
+    struct FleetCoreFake {
+        verdict: crate::core_client::Verdict,
+        judged: Mutex<Vec<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl FleetCore for FleetCoreFake {
+        async fn start(&self, _: &str) -> Result<(), crate::core_client::CoreError> {
+            Ok(())
+        }
+        async fn approval(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::core_client::ApprovalState, crate::core_client::CoreError> {
+            Ok(crate::core_client::ApprovalState::Gone)
+        }
+        async fn judge(
+            &self,
+            _: &str,
+            activity: &crate::core_client::Activity,
+        ) -> Result<(crate::core_client::Verdict, Option<String>), crate::core_client::CoreError>
+        {
+            self.judged
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", activity.kind, activity.input[0]["risk"]));
+            Ok((self.verdict, Some("over budget".to_owned())))
+        }
+    }
+
+    struct Drafts(Vec<Value>);
+
+    #[tonic::async_trait]
+    impl DraftReader for Drafts {
+        async fn pending_chunks(&self, workspace: &str, _: &str) -> Result<Vec<Value>, String> {
+            assert_eq!(workspace, "default");
+            Ok(self.0.clone())
+        }
+    }
+
+    fn validate(method: &str, operation: &Value) -> InterceptorEvaluation {
+        InterceptorEvaluation {
+            service: SERVICE.to_owned(),
+            method: method.to_owned(),
+            phase: Some(interceptor_evaluation::Phase::Validate(
+                ValidateEvaluation {
+                    proposed_operation: Some(to_struct(operation)),
+                    current_state: None,
+                },
+            )),
+            ..InterceptorEvaluation::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_checks_send_changes_and_proposals_to_core() {
+        let signer = TestSigner::new();
+        let core = Arc::new(FleetCoreFake {
+            verdict: crate::core_client::Verdict::Block,
+            judged: Mutex::new(Vec::new()),
+        });
+        let as_core: Arc<dyn FleetCore> = core.clone();
+        let drafts: Arc<dyn DraftReader> = Arc::new(Drafts(vec![json!({
+            "id": "c1", "rule_name": "paste", "security_notes": "",
+            "proposed_rule": {"endpoints": [{"host": "*.pastebin.com", "port": 443}]},
+        })]));
+        let (service, _) = service(&signer);
+        let service = service.with_fleet(
+            Arc::new(FleetGovernance::new(as_core, "gw-1")),
+            Some(drafts),
+        );
+
+        let gateway = extension_metadata(
+            ExtensionFamily::GatewayInterceptor,
+            "openshell/gateway",
+            "0.1.8",
+            [],
+        );
+        let manifest = service
+            .describe(authed(
+                DescribeRequest {
+                    gateway: Some(gateway),
+                },
+                &gateway_token(&signer),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let rpcs: Vec<String> = manifest
+            .bindings
+            .iter()
+            .map(|binding| binding.selector.as_ref().unwrap().rpc.clone())
+            .collect();
+        assert!(
+            rpcs.iter().any(|rpc| rpc.ends_with("/ApproveDraftChunk")),
+            "{rpcs:?}"
+        );
+        assert!(
+            rpcs.iter()
+                .any(|rpc| rpc.ends_with("/ApproveAllDraftChunks")),
+            "{rpcs:?}"
+        );
+
+        let update = service
+            .intercept(validate(
+                "UpdateConfig",
+                &json!({"sandbox": "sbx", "mergeOperations": [{"addRule": {"rule": {"endpoints": [{"host": "api.example.com", "port": 443}]}}}]}),
+            ))
+            .await;
+        assert!(!update.allowed);
+        assert!(update.reason.contains("over budget"), "{}", update.reason);
+
+        let approve = service
+            .intercept(validate(
+                "ApproveDraftChunk",
+                &json!({"sandbox": "sbx", "chunkId": "c1"}),
+            ))
+            .await;
+        assert!(!approve.allowed);
+        assert_eq!(
+            core.judged.lock().unwrap().as_slice(),
+            ["openshell.policy_change 1", "openshell.policy_proposal 4"]
+        );
+
+        // Without fleet checks nothing goes to Core and the bindings stay as they were.
+        let (plain, _) = service_as(Role::Govern, &signer);
+        assert!(
+            plain
+                .intercept(validate(
+                    "ApproveDraftChunk",
+                    &json!({"sandbox": "sbx", "chunkId": "c1"})
+                ))
+                .await
+                .allowed
+        );
     }
 
     #[tokio::test]

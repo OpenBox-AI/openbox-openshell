@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openbox_verdict_middleware::core_client::{CoreClient, CoreConfig, WorkloadIdentity};
+use openbox_verdict_middleware::fleet::{self, DraftReader, FleetCore, FleetGovernance};
 use openbox_verdict_middleware::interceptor::{FrontDesk, Inventory, LogInventory, Role};
 use openbox_verdict_middleware::inventory::{
     BackendInventory, GatewayLister, HttpInventory, SandboxLister,
@@ -183,6 +184,74 @@ fn inventory_from_env(
     )))
 }
 
+/// The fleet checks and the proposal reader, for the govern registration.
+type FleetSetup = (
+    Arc<FleetGovernance<dyn FleetCore>>,
+    Option<Arc<dyn DraftReader>>,
+);
+
+/// Fleet checks in Core (R8.1, R8.2) when `OPENBOX_FD_FLEET_CHECKS=on`:
+/// sandbox creation and policy changes always, and proposal approvals when a
+/// gateway credential lets the front desk read proposals. The fleet's totals
+/// are refreshed from the gateway every `OPENBOX_FD_RECONCILE_SECS`.
+fn fleet_from_env(core: Option<Arc<CoreClient>>) -> Result<Option<FleetSetup>, String> {
+    match env("OPENBOX_FD_FLEET_CHECKS").as_deref() {
+        None | Some("off") => return Ok(None),
+        Some("on") => {}
+        Some(_) => return Err("OPENBOX_FD_FLEET_CHECKS must be on or off".to_owned()),
+    }
+    let core = core.ok_or("OPENBOX_FD_FLEET_CHECKS=on needs OPENBOX_URL")?;
+    let gateway_id = env("OPENBOX_FD_GATEWAY_ID").unwrap_or_else(|| "gateway".to_owned());
+    let core: Arc<dyn FleetCore> = core;
+    let wait = match env("OPENBOX_FD_FLEET_WAIT_MS") {
+        None => fleet::DEFAULT_WAIT,
+        Some(value) => Duration::from_millis(
+            value
+                .parse()
+                .map_err(|_| "OPENBOX_FD_FLEET_WAIT_MS must be a number of milliseconds")?,
+        ),
+    };
+    let checks = Arc::new(FleetGovernance::new(core, &gateway_id).with_wait(wait));
+    let lister = if let (Some(endpoint), Some(dir)) = (
+        env("OPENBOX_GATEWAY_ENDPOINT"),
+        env("OPENBOX_GATEWAY_MTLS_DIR"),
+    ) {
+        Some(Arc::new(GatewayLister::connect_lazy(
+            &endpoint,
+            &PathBuf::from(dir),
+        )?))
+    } else {
+        eprintln!(
+            "openbox-governance-interceptor: fleet checks without a gateway credential: proposal approvals are refused and the fleet totals start empty"
+        );
+        None
+    };
+    if let Some(lister) = lister.clone() {
+        let refreshing = Arc::clone(&checks);
+        let every: u64 = env("OPENBOX_FD_RECONCILE_SECS")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(every.max(5)));
+            loop {
+                tick.tick().await;
+                match lister.list().await {
+                    Ok(sandboxes) => refreshing.state.replace(fleet::sandbox_risks(&sandboxes)),
+                    Err(error) => eprintln!("openbox: fleet totals not refreshed: {error}"),
+                }
+            }
+        });
+    }
+    eprintln!(
+        "openbox-governance-interceptor: fleet checks on (session openshell-fleet-{gateway_id})"
+    );
+    let drafts = lister.map(|lister| {
+        let reader: Arc<dyn DraftReader> = lister;
+        reader
+    });
+    Ok(Some((checks, drafts)))
+}
+
 fn address(key: &str, default: &str) -> Result<SocketAddr, String> {
     env(key)
         .unwrap_or_else(|| default.to_owned())
@@ -228,6 +297,7 @@ async fn serve(
     verifier: Option<TokenVerifier>,
     tls: Option<ServerTlsConfig>,
     inventory: Arc<dyn Inventory>,
+    fleet: Option<FleetSetup>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut server = Server::builder();
@@ -240,7 +310,10 @@ async fn serve(
         "openbox-governance-interceptor: {role:?} registration on {}://{listen}",
         if verifier.is_some() { "https" } else { "http" }
     );
-    let service = FrontDesk::new(role, verifier, inventory);
+    let mut service = FrontDesk::new(role, verifier, inventory);
+    if let Some((checks, drafts)) = fleet {
+        service = service.with_fleet(checks, drafts);
+    }
     server
         .add_service(GatewayInterceptorServer::new(service))
         .serve_with_shutdown(listen, async move {
@@ -266,6 +339,7 @@ async fn run() -> Result<(), String> {
         DEFAULT_INVENTORY_AUDIENCE,
     )?;
     let core = core_from_env()?;
+    let fleet = fleet_from_env(core.clone())?;
     let mut inventory_sink = inventory_from_env(env("OPENBOX_FD_GATEWAY_ID"), core.clone())?;
     let sessions = if let Some(core) = core {
         let store: Arc<dyn SharedStore> = if let Some(url) = env("OPENBOX_REDIS_URL") {
@@ -319,6 +393,7 @@ async fn run() -> Result<(), String> {
             govern_verifier,
             tls(insecure)?,
             Arc::new(LogInventory),
+            fleet,
             stopped.clone()
         ),
         serve(
@@ -327,6 +402,7 @@ async fn run() -> Result<(), String> {
             inventory_verifier,
             tls(insecure)?,
             inventory_sink,
+            None,
             stopped
         ),
     )?;
