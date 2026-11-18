@@ -17,6 +17,7 @@ pub mod halt;
 pub mod interceptor;
 pub mod inventory;
 pub mod metrics;
+pub mod ocsf;
 pub mod prompt;
 pub mod responses;
 pub mod sequence;

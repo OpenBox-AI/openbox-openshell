@@ -289,3 +289,31 @@ securityContext:
   readOnlyRootFilesystem: true
   capabilities:
     drop: ["ALL"]
+
+# -- Ship OpenShell's OCSF log (docs/install.md, "Forwarding to your SIEM").
+# Turn the export on first: openshell settings set --global --key
+# ocsf_json_enabled --value true. A DaemonSet then follows every
+# openshell-ocsf.YYYY-MM-DD.jsonl on each node (sandbox pods and shared
+# supervisor pods alike keep it in their `logs` emptyDir) and writes each
+# line, unchanged, to stdout, so the log pipeline that ships pod logs ships
+# these too, within a few seconds of OpenShell writing them.
+ocsfCollector:
+  enabled: false
+  # How often to look for new lines (the lag is at most this plus the log
+  # pipeline's own).
+  intervalSecs: 2
+  # The kubelet's pod directory on the nodes.
+  kubeletPodsDir: /var/lib/kubelet/pods
+  # On each node: where the collector keeps how far it has read.
+  stateDir: /var/lib/openbox-ocsf-collector
+  nodeSelector: {}
+  tolerations: []
+  podLabels: {}
+  podAnnotations: {}
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 64Mi
+

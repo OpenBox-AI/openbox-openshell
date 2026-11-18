@@ -1,0 +1,93 @@
+{{- $oc := .Values.ocsfCollector -}}
+{{- if $oc.enabled }}
+{{- $component := dict "root" . "component" "ocsf-collector" -}}
+# Follows OpenShell's OCSF JSON Lines log (openshell-ocsf.YYYY-MM-DD.jsonl) in
+# every pod's `logs` emptyDir on the node and writes each line to stdout, for
+# the cluster's log pipeline to ship. Reads the kubelet's pod directory
+# read-only; keeps its place in a hostPath so a restart neither repeats nor
+# skips lines.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "obx.fullname" . | trunc 48 | trimSuffix "-" }}-ocsf-collector
+  labels:
+    {{- include "obx.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ocsf-collector
+spec:
+  selector:
+    matchLabels:
+      {{- include "obx.selector" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "obx.labels" . | nindent 8 }}
+        app.kubernetes.io/component: ocsf-collector
+        {{- with $oc.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $oc.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "obx.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $oc.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $oc.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ocsf-collector
+          image: {{ include "obx.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - openbox-evidence
+            - collect-ocsf
+            - --kubelet-pods
+            - /host/pods
+            - --state
+            - /state/positions.json
+            - --interval-secs
+            - {{ $oc.intervalSecs | default 2 | int64 | quote }}
+          # Root, to walk the kubelet's root-owned pod directories, with only
+          # DAC_READ_SEARCH: it reads files other users own and writes
+          # nothing but its positions file.
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [DAC_READ_SEARCH]
+            seccompProfile:
+              type: RuntimeDefault
+          {{- with $oc.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: pods
+              mountPath: /host/pods
+              readOnly: true
+              mountPropagation: HostToContainer
+            - name: state
+              mountPath: /state
+      volumes:
+        - name: pods
+          hostPath:
+            path: {{ $oc.kubeletPodsDir | default "/var/lib/kubelet/pods" | quote }}
+            type: Directory
+        - name: state
+          hostPath:
+            path: {{ $oc.stateDir | default "/var/lib/openbox-ocsf-collector" | quote }}
+            type: DirectoryOrCreate
+{{- end }}

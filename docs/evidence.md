@@ -116,12 +116,49 @@ in `openbox_mw_evidence_certified_records_total{outcome="failed"}`, so the
 chain's later records still get certificates. The records stay in the
 output either way.
 
-## What is not done yet
-- **Collecting OpenShell's OCSF log.** Each sandbox writes
-  `/var/log/openshell-ocsf.YYYY-MM-DD.log` (JSON Lines, daily, three kept)
-  when `ocsf_json_enabled` is on. Shipping it within 60 s needs a collector
-  per compute driver: on Kubernetes, a log agent that reads the sandbox pods'
-  file; on the Docker and VM drivers, one on the host. Not built yet.
-- **Joining OCSF events to our records.** OpenShell v0.1.8's OCSF events do
-  not carry the request id, so a join uses the sandbox (`container.uid` in
-  OCSF, `openbox.sandbox_id` here), the destination host and the time.
+## OpenShell's OCSF log next to our records
+
+OpenShell writes its own OCSF log, `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl`
+(JSON Lines, daily, three kept; `.log` before v0.1.8), once
+`ocsf_json_enabled` is on:
+
+```bash
+openshell settings set --global --key ocsf_json_enabled --value true
+```
+
+**Collecting it.** On Kubernetes, set `ocsfCollector.enabled: true`. A
+DaemonSet follows every OCSF file on each node (whichever pod runs the
+supervisor, the shared supervisor pods or the sandbox pod, keeps it in an
+`emptyDir` named `logs`) and writes each
+line, unchanged, to stdout every `ocsfCollector.intervalSecs` (2 s), so the
+pipeline that ships your pod logs ships these too. It keeps its place in a
+hostPath, so a restart neither repeats nor skips lines, and a new day's file
+or a replaced one is read from its start. Elsewhere, run the same command
+where the files are:
+
+```bash
+openbox-evidence collect-ocsf --dir /var/log --state /var/lib/openbox-ocsf.json
+```
+
+The Docker and VM drivers keep the file inside the sandbox; collecting from
+those hosts is not covered yet.
+
+**Joining it to our records.** OpenShell v0.1.8's OCSF events do not carry
+the request id (each event's `metadata.uid` is its own), so `join` pairs a
+record with the event for the same sandbox (`device.container.uid`) and
+destination host nearest in time, within `--window-ms` (default 2000), using
+each event once. For each request OpenShell writes one event for its own
+policy and one for the `openbox` middleware's decision
+(`firewall_rule.type: middleware`, `status_detail:
+middleware_denied:openbox:<reason code>`); `join` prefers the latter and
+reports whether OpenShell recorded the same decision the record holds
+(`agrees`, and `decisions_disagree` in the totals):
+
+```bash
+openbox-evidence join --ocsf openshell-ocsf.2026-11-14.jsonl records.jsonl
+```
+
+One JSON line per record (`record`, `request_id`, `sandbox_id`, `host`,
+`ocsf_uid`, `ocsf_class_uid`, `ocsf_action`, `ocsf_status_detail`, `agrees`,
+`delta_ms`), and the totals on stderr. A record
+with no event in the window has `ocsf_uid: null`.
