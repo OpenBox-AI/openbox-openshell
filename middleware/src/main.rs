@@ -185,7 +185,9 @@ fn admin_actions<G: Governance, S: SandboxStopper + ?Sized>(
 
 /// Signed verdict records, when `OPENBOX_EVIDENCE_KEY_FILE` names a key:
 /// to `OPENBOX_EVIDENCE_DIR` (daily files) or stdout. Chains are per
-/// replica, named by `OPENBOX_REPLICA_ID` (the pod name by default).
+/// replica, named by `OPENBOX_REPLICA_ID` (the pod name by default). With
+/// `OPENBOX_EVIDENCE_CERTIFY_SECS` above 0 the records also go to Core in
+/// batches that often, and its Proof Certificates join the records.
 fn with_evidence<G: Governance, S: SandboxStopper + ?Sized>(
     guard: Guard<G, S>,
 ) -> Result<Guard<G, S>, String> {
@@ -204,7 +206,32 @@ fn with_evidence<G: Governance, S: SandboxStopper + ?Sized>(
         "openbox-verdict-middleware: signing verdict records with key {} as replica {replica}",
         signer.key_id
     );
-    Ok(guard.with_evidence(Arc::new(Evidence::new(signer, sink, replica))))
+    let mut evidence = Evidence::new(signer, sink, replica);
+    if number("OPENBOX_EVIDENCE_CERTIFY_SECS", 0_u64)? > 0 {
+        evidence = evidence.with_outbox();
+    }
+    Ok(guard.with_evidence(Arc::new(evidence)))
+}
+
+/// Sends the records to Core for Proof Certificates every
+/// `OPENBOX_EVIDENCE_CERTIFY_SECS` (0, the default: never).
+fn spawn_evidence_certify<G: Governance, S: SandboxStopper + ?Sized>(
+    guard: &Arc<Guard<G, S>>,
+) -> Result<(), String> {
+    let every = number("OPENBOX_EVIDENCE_CERTIFY_SECS", 0_u64)?;
+    if every == 0 {
+        return Ok(());
+    }
+    let certifying = Arc::clone(guard);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(every.max(5)));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            certifying.certify_evidence().await;
+        }
+    });
+    Ok(())
 }
 
 /// How often the rule snapshot file is checked for changes.
@@ -447,6 +474,7 @@ async fn run() -> Result<(), String> {
         .with_body_capture(body_capture);
     let guard = Arc::new(with_evidence(with_fast_path(guard)?)?);
     spawn_rules_refresh(&guard)?;
+    spawn_evidence_certify(&guard)?;
     let metrics = guard.metrics();
     let draining = Arc::clone(&guard);
     start_admin(&guard).await?;
@@ -488,6 +516,9 @@ async fn run() -> Result<(), String> {
 /// Completions and activity ends are sent in the background; send what is
 /// still queued, or Core never hears how those requests ended.
 async fn drain<G: Governance, S: SandboxStopper + ?Sized>(guard: &Guard<G, S>) {
+    // Records not yet certified would otherwise wait for this replica's
+    // chain to be read by hand.
+    guard.certify_evidence().await;
     if !guard.drain(DRAIN_LIMIT).await {
         eprintln!(
             "openbox-verdict-middleware: Core calls still queued after {} s were dropped",

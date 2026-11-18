@@ -94,6 +94,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: OPENBOX_EVIDENCE_CERTIFY_SECS
+              value: {{ $dg.evidenceCertifySecs | int64 | quote }}
             {{- end }}
             {{- if $dg.adminTokenSecret }}
             - name: OPENBOX_MW_ADMIN_TOKEN_FILE

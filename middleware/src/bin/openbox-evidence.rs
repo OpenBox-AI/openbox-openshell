@@ -4,6 +4,7 @@
 //! openbox-evidence verify --key <public key> [--partial] <records.jsonl>...
 //! openbox-evidence seal --signing-key <private key> --chain <chain_uid> <records.jsonl>...
 //! openbox-evidence check --key <public key> --certificate <cert.json> <records.jsonl>...
+//! openbox-evidence check --core-key <org public key> --certificate <cert.json> <records.jsonl>...
 //! ```
 //!
 //! `verify` checks every record's fingerprint and signature and each chain's
@@ -11,7 +12,12 @@
 //! included), and exits 1 on any problem: an edited, missing, duplicated or
 //! reordered record. `--partial` accepts a chain that starts after record 1.
 //! `seal` writes a certificate for one chain: the Merkle root of its records,
-//! signed. `check` verifies a certificate against the records it covers.
+//! signed. `check` verifies a certificate against the records it covers:
+//! one `seal` wrote (`--key`), or a Proof Certificate Core issued
+//! (`--core-key`, the organisation's attestation key as an SPKI PEM or base64
+//! DER; pin the key you trust, not the one the certificate carries). A
+//! certificate line from the evidence sink (`{"openbox_certificate": ...}`)
+//! can be passed as the certificate file.
 //!
 //! Keys: a PEM (`openssl genpkey -algorithm ed25519`, `openssl pkey -pubout`)
 //! or a raw base64 public key. `--key` may be given more than once.
@@ -22,7 +28,7 @@ use openbox_verdict_middleware::evidence::{self, Signer};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage:\n  openbox-evidence verify --key <public key> [--partial] <records.jsonl>...\n  openbox-evidence seal --signing-key <private key> --chain <chain_uid> <records.jsonl>...\n  openbox-evidence check --key <public key> --certificate <cert.json> <records.jsonl>..."
+        "usage:\n  openbox-evidence verify --key <public key> [--partial] <records.jsonl>...\n  openbox-evidence seal --signing-key <private key> --chain <chain_uid> <records.jsonl>...\n  openbox-evidence check --key <public key> --certificate <cert.json> <records.jsonl>...\n  openbox-evidence check --core-key <org public key> --certificate <cert.json> <records.jsonl>..."
     );
     ExitCode::from(2)
 }
@@ -34,6 +40,7 @@ fn read(path: &str) -> Result<String, String> {
 fn run(args: &[String]) -> Result<bool, String> {
     let command = args.first().ok_or("no command")?;
     let mut keys = Vec::new();
+    let mut core_keys = Vec::new();
     let (mut partial, mut signing, mut chain, mut certificate) = (false, None, None, None);
     let mut files = Vec::new();
     let mut rest = args[1..].iter();
@@ -45,6 +52,7 @@ fn run(args: &[String]) -> Result<bool, String> {
         };
         match arg.as_str() {
             "--key" => keys.push(evidence::public_key(&read(&value()?)?)?),
+            "--core-key" => core_keys.push(evidence::core_public_key(&read(&value()?)?)?),
             "--partial" => partial = true,
             "--signing-key" => signing = Some(Signer::from_pem(&read(&value()?)?)?),
             "--chain" => chain = Some(value()?),
@@ -94,13 +102,27 @@ fn run(args: &[String]) -> Result<bool, String> {
             let path = certificate.ok_or("check needs --certificate")?;
             let certificate: serde_json::Value =
                 serde_json::from_str(&read(&path)?).map_err(|error| format!("{path}: {error}"))?;
-            match evidence::check_certificate(&certificate, &lines, &keys) {
+            let (checked, body) = if core_keys.is_empty() {
+                (
+                    evidence::check_certificate(&certificate, &lines, &keys),
+                    &certificate,
+                )
+            } else {
+                let issued = certificate
+                    .get(evidence::CERTIFICATE_KEY)
+                    .unwrap_or(&certificate);
+                (
+                    evidence::check_core_certificate(&certificate, &lines, &core_keys),
+                    issued.get("certificate").unwrap_or(issued),
+                )
+            };
+            match checked {
                 Ok(()) => {
                     println!(
                         "ok  {} records {}..{} match the certificate",
-                        certificate["chain_uid"].as_str().unwrap_or(""),
-                        certificate["first_sequence"],
-                        certificate["last_sequence"]
+                        body["chain_uid"].as_str().unwrap_or(""),
+                        body["first_sequence"],
+                        body["last_sequence"]
                     );
                     Ok(true)
                 }
