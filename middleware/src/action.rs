@@ -51,6 +51,8 @@ pub struct Action {
     /// The sandbox's profile, from the middleware config in its policy. Sent
     /// to Core as `profile_id` on each of its activities.
     pub profile: Option<String>,
+    /// What the sandbox policy says Core may see of this request's content.
+    pub capture: crate::capture::Policy,
     pub scheme: String,
     pub host: String,
     pub port: u32,
@@ -116,6 +118,7 @@ impl Action {
             process_binary: (!process.binary.is_empty()).then_some(process.binary),
             process_ancestors: process.ancestors,
             profile: None,
+            capture: crate::capture::Policy::default(),
             scheme: target.scheme,
             host: target.host,
             port: target.port,

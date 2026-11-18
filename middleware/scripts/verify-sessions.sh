@@ -168,8 +168,10 @@ env $CORE_ENV OPENBOX_FD_INSECURE=1 OPENBOX_FD_LISTEN=127.0.0.1:$FD_PORT \
   "$HERE/target/debug/openbox-governance-interceptor" >"$WORK/fd.log" 2>&1 &
 echo $! >"$WORK/fd.pid"
 wait_listen "$INV_PORT" "$WORK/fd.pid" "$WORK/fd.log"
+# Scenario 9 reads the prompts Core stored, so this run opts in to sending
+# their text (the default sends findings only).
 env $CORE_ENV OPENBOX_MW_INSECURE=1 OPENBOX_MW_LISTEN=0.0.0.0:$MW_PORT \
-  OPENBOX_MW_ADMIN_LISTEN=127.0.0.1:$ADMIN_PORT \
+  OPENBOX_MW_ADMIN_LISTEN=127.0.0.1:$ADMIN_PORT OPENBOX_PROMPT_CAPTURE=text \
   "$HERE/target/debug/openbox-verdict-middleware" >"$WORK/mw.log" 2>&1 &
 echo $! >"$WORK/mw.pid"
 wait_listen "$MW_PORT" "$WORK/mw.pid" "$WORK/mw.log"

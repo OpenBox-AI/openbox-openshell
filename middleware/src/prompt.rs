@@ -32,28 +32,9 @@ pub struct Prompt {
     pub turn: String,
 }
 
-/// What Core receives for a prompt.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Capture {
-    /// The prompt text, as the SDK sends it.
-    #[default]
-    Text,
-    /// SHA-256 and length only.
-    Hash,
-    /// No prompt signals.
-    Off,
-}
-
-impl Capture {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "text" => Some(Self::Text),
-            "hash" => Some(Self::Hash),
-            "off" => Some(Self::Off),
-            _ => None,
-        }
-    }
-}
+/// What Core receives for a prompt: the same modes as every other piece of
+/// content ([`crate::capture`]).
+pub use crate::capture::Mode as Capture;
 
 /// The newest user prompt in a model call, if this is one and it has one.
 pub fn extract(action: &Action) -> Option<Prompt> {
@@ -117,6 +98,10 @@ pub fn signal_args(prompt: &Prompt, capture: Capture, limit: usize) -> Value {
         Capture::Text => args["prompt"] = Value::String(truncate(&prompt.text, limit)),
         Capture::Hash | Capture::Off => {
             args["sha256"] = Value::String(hex(&Sha256::digest(prompt.text.as_bytes())));
+        }
+        Capture::Findings => {
+            args["sha256"] = Value::String(hex(&Sha256::digest(prompt.text.as_bytes())));
+            args["findings"] = crate::capture::findings(&prompt.text);
         }
     }
     args

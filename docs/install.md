@@ -118,6 +118,56 @@ scored as a new activity and needs a new approval.
 `redis.enabled=true` runs a single Redis in the release. Use it for evaluation
 only.
 
+### What Core receives
+
+Every request the door guard scores sends Core a description of it. What
+part of the request's content leaves your boundary is set by a capture mode.
+
+| Mode | Core receives |
+|---|---|
+| `off` | Nothing of the content. |
+| `hash` | Its SHA-256 and length. |
+| `findings` (default) | Its SHA-256 and length, the kinds of sensitive data found in it with a count each (`email`, `payment_card`, `us_ssn`, `aws_access_key`, `private_key`, `jwt`, `api_key`), and for JSON its shape: the keys and the type of each value, never the values. |
+| `text` | The content itself, up to the body limit (64 KiB). Opt-in. |
+
+The mode applies to each piece of content:
+
+| Content | Setting |
+|---|---|
+| The user's prompt in a model call | `doorGuard.promptCapture` (`OPENBOX_PROMPT_CAPTURE`) |
+| Request and response bodies, MCP tool arguments and results, tool calls a model asks for and their results, a model's reply text | `doorGuard.bodyCapture` (`OPENBOX_BODY_CAPTURE`) |
+
+Whatever the mode, Core always receives the request's metadata: method, URL
+(including its query string), host and port, status code, header names and
+values with credential headers (`Authorization`, `Cookie`, `X-API-Key` and
+similar) replaced by `[REDACTED]`, the sandbox and process that made the
+request, the model's name and token counts, and the name of each tool. Put
+secrets in headers or bodies, not in URLs.
+
+A sandbox policy can choose its own capture, for the whole sandbox or per
+host, in the `openbox` middleware's config. The front desk keeps these keys
+when it attaches the door guard, and the door guard refuses an unknown mode
+or a malformed host at policy load:
+
+```yaml
+network_middlewares:
+  openbox:
+    middleware: openbox
+    config:
+      capture: hash                      # every host, unless listed below
+      capture_hosts:
+        api.internal.example: text       # an exact host
+        "*.corp.example": off            # any subdomain of corp.example
+```
+
+An exact host wins over a wildcard that also matches it. A policy can opt a
+host in to `text`; the deployment default applies to every host the policy
+does not name.
+
+Policies and guardrails in OpenBox that read content (for example a
+guardrail on the prompt's text) see only what the capture sends. With the
+default, they see findings and shapes; opt the hosts they need in to `text`.
+
 ## 4. Register OpenBox with the gateway
 
 Start OpenBox first. The gateway does not start while a registered service is
@@ -273,7 +323,8 @@ to the policy:
 - middleware `openbox`, every host (`**`), `on_error: fail_closed`
 - `order` 1000, or higher than any other entry, so it runs after operator
   middleware such as redaction and the verdict covers what actually leaves
-- `config: { approval_mode: queue }`
+- `config: { approval_mode: queue }`, plus the author's `profile`, `capture`
+  and `capture_hosts` when the policy sets them
 - hosts on `tls: skip` endpoints excluded, because OpenShell cannot inspect
   them and refuses a fail-closed middleware that selects them
 

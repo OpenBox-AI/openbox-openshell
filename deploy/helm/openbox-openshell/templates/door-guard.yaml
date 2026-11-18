@@ -85,6 +85,8 @@ spec:
               value: {{ $dg.approvalTtlSecs | int64 | quote }}
             - name: OPENBOX_PROMPT_CAPTURE
               value: {{ $dg.promptCapture | quote }}
+            - name: OPENBOX_BODY_CAPTURE
+              value: {{ $dg.bodyCapture | quote }}
             {{- include "obx.credentialEnv" . | trim | nindent 12 }}
             {{- if eq .Values.credentials.identity "signed" }}
             - name: OPENBOX_AGENT_DID

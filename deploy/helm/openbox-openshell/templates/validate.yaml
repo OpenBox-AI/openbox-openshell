@@ -58,8 +58,10 @@
 {{- if and $v.redis.enabled (or $v.externalRedis.url $v.externalRedis.existingSecret) -}}
 {{- fail "set redis.enabled or externalRedis, not both" -}}
 {{- end -}}
-{{- if not (has $v.doorGuard.promptCapture (list "text" "hash" "off")) -}}
-{{- fail "doorGuard.promptCapture must be text, hash or off" -}}
+{{- range $key := list "promptCapture" "bodyCapture" }}
+{{- if not (has (index $v.doorGuard $key) (list "off" "hash" "findings" "text")) -}}
+{{- fail (printf "doorGuard.%s must be off, hash, findings or text" $key) -}}
+{{- end }}
 {{- end -}}
 {{- if ge (int $v.doorGuard.coreTimeoutMs) 30000 -}}
 {{- fail "doorGuard.coreTimeoutMs must stay under the gateway's 30 s middleware timeout" -}}

@@ -130,9 +130,10 @@ pub fn required_attachment(policy: &Value) -> Value {
             }
             order
         });
-    // The author's door guard settings survive: an approval mode it accepts
-    // and the sandbox's profile. Anything else is dropped, since the door
-    // guard refuses unknown keys at policy load.
+    // The author's door guard settings survive: an approval mode it accepts,
+    // the sandbox's profile, and what Core may see of its content (`capture`,
+    // `capture_hosts`; the door guard validates them at policy load).
+    // Anything else is dropped, since the door guard refuses unknown keys.
     let authored = field(policy, "networkMiddlewares", "network_middlewares")
         .and_then(|existing| existing.get(ATTACHMENT_KEY))
         .and_then(|attachment| attachment.get("config"));
@@ -149,6 +150,11 @@ pub fn required_attachment(policy: &Value) -> Value {
         .and_then(Value::as_str)
     {
         config["profile"] = json!(profile);
+    }
+    for key in ["capture", "capture_hosts"] {
+        if let Some(value) = authored.and_then(|config| config.get(key)) {
+            config[key] = value.clone();
+        }
     }
     let mut endpoints = json!({ "include": [ALL_HOSTS] });
     let excluded = uninspectable_hosts(policy);
@@ -504,6 +510,22 @@ mod tests {
         let operation = json!({"spec": {"policy": policy}});
         assert!(modify_create_sandbox(&operation).is_err());
         assert!(validate_create_sandbox(&operation).is_err());
+    }
+
+    #[test]
+    fn create_keeps_the_authors_capture() {
+        let mut authored = policy();
+        authored["networkMiddlewares"] = json!({"openbox": {
+            "middleware": "openbox",
+            "config": {"capture": "hash", "capture_hosts": {"api.internal.example": "text"}},
+        }});
+        let operation = json!({"spec": {"policy": authored}});
+        let created = apply(&operation, &modify_create_sandbox(&operation).unwrap());
+        assert_eq!(
+            created["spec"]["policy"]["networkMiddlewares"]["openbox"]["config"],
+            json!({"approval_mode": "queue", "capture": "hash",
+                   "capture_hosts": {"api.internal.example": "text"}})
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
 
 use crate::action::{Action, Payload};
+use crate::capture::Mode;
 
 const EVALUATE_PATH: &str = "/api/v1/governance/evaluate";
 const APPROVAL_PATH: &str = "/api/v1/governance/approval";
@@ -703,7 +704,9 @@ pub struct Completion {
     pub span: Value,
     pub status_code: u32,
     pub response_headers: Value,
-    pub response_body: Option<String>,
+    /// The response body as captured ([`crate::capture`]); null when there
+    /// was none.
+    pub response_body: Value,
 }
 
 fn form_encode(fields: &[(&str, &str)]) -> String {
@@ -849,6 +852,7 @@ pub fn started_span(
     action: &Action,
     activity_id: &str,
     body_limit: usize,
+    capture: Mode,
     now: SystemTime,
 ) -> Value {
     let (span_id, trace_id) = span_ids(&action.request_id);
@@ -887,11 +891,11 @@ pub fn started_span(
             attributes["mcp.method"] = json!("callTool");
             attributes["mcp.server_id"] = json!(action.host);
             attributes["mcp.operation"] = json!(tool);
-            attributes["mcp.input"] = json!(
-                call.arguments
-                    .as_ref()
-                    .map_or_else(String::new, Value::to_string)
-            );
+            let arguments = call.arguments.clone().unwrap_or_else(|| json!({}));
+            attributes["mcp.input"] = json!(match capture {
+                Mode::Text => arguments.to_string(),
+                _ => crate::capture::value(&arguments, capture, body_limit).to_string(),
+            });
         }
     }
     json!({
@@ -917,7 +921,7 @@ pub fn started_span(
         "request_headers": crate::agent::headers_object(
             action.headers.iter().map(|(name, value)| (name.as_str(), value.as_str()))
         ),
-        "request_body": body_text(&action.body, body_limit),
+        "request_body": crate::capture::span_body(&action.body, capture, body_limit),
         "response_headers": null,
         "response_body": null,
         "error": null,
@@ -941,7 +945,7 @@ fn completed_span_event(completion: &Completion, now: SystemTime) -> Value {
     span["attributes"]["http.status_code"] = json!(completion.status_code);
     span["attributes"]["http.response.status_code"] = json!(completion.status_code);
     span["response_headers"] = completion.response_headers.clone();
-    span["response_body"] = json!(completion.response_body);
+    span["response_body"] = completion.response_body.clone();
     // Core marks a span failed from its status, as the Python SDK sets it.
     if completion.status_code >= 400 {
         let failed = format!("HTTP {}", completion.status_code);
@@ -991,14 +995,6 @@ pub fn target_url(scheme: &str, host: &str, port: u32, path: &str, query: &str) 
         format!("?{query}")
     };
     format!("{scheme}://{authority}{path}{query}")
-}
-
-fn body_text(body: &[u8], limit: usize) -> Value {
-    if body.is_empty() {
-        return Value::Null;
-    }
-    let slice = &body[..body.len().min(limit)];
-    Value::String(String::from_utf8_lossy(slice).into_owned())
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -1119,6 +1115,25 @@ mod tests {
         assert_eq!(Verdict::parse("maybe"), None);
     }
 
+    /// Core refuses a hook whose span `request_body` or `response_body` is
+    /// not a string or null (HTTP 400, seen on the ash-barriers env).
+    #[test]
+    fn span_bodies_are_always_strings_or_null() {
+        let action = Action::from_evaluation(&evaluation(
+            "POST",
+            "/",
+            br#"{"card":"4111 1111 1111 1111"}"#,
+        ));
+        for mode in [Mode::Off, Mode::Hash, Mode::Findings, Mode::Text] {
+            let span = started_span(&action, "oshx-1", 1024, mode, UNIX_EPOCH);
+            assert!(
+                span["request_body"].is_string() || span["request_body"].is_null(),
+                "{mode:?}: {}",
+                span["request_body"]
+            );
+        }
+    }
+
     #[test]
     fn refuses_disagreeing_verdict_and_action() {
         let response = EvaluateResponse {
@@ -1174,7 +1189,7 @@ mod tests {
         assert_eq!(activity_name(&action), "delete_database");
         let tool = activity("oshx-req-1", "delete_database");
         let now = UNIX_EPOCH + Duration::from_secs(1_790_674_275);
-        let span = started_span(&action, &tool.id, 1024, now);
+        let span = started_span(&action, &tool.id, 1024, Mode::Text, now);
         let event = action_event(&action, &tool, &span, now);
         assert_eq!(event["event_type"], "ActivityStarted");
         assert_eq!(event["hook_trigger"], true);
@@ -1211,6 +1226,7 @@ mod tests {
             &action,
             "oshx-req-1",
             4,
+            Mode::Text,
             UNIX_EPOCH + Duration::from_secs(2),
         );
         assert_eq!(
@@ -1250,7 +1266,7 @@ mod tests {
         let mut evaluation = evaluation("GET", "/", b"");
         evaluation.context.as_mut().unwrap().originating_process = None;
         let action = Action::from_evaluation(&evaluation);
-        let span = started_span(&action, "oshx-req-1", 4, UNIX_EPOCH);
+        let span = started_span(&action, "oshx-req-1", 4, Mode::Text, UNIX_EPOCH);
         let attributes = &span["attributes"];
         assert!(attributes.get("process.executable.path").is_none());
         assert!(attributes.get("openbox.process.ancestors").is_none());
@@ -1271,7 +1287,7 @@ mod tests {
             ..plain
         };
         let action = Action::from_evaluation(&evaluation("GET", "/", b""));
-        let span = started_span(&action, &profiled.id, 4, UNIX_EPOCH);
+        let span = started_span(&action, &profiled.id, 4, Mode::Text, UNIX_EPOCH);
         let events = [
             activity_started_event("sbx-id-1", &profiled, UNIX_EPOCH),
             action_event(&action, &profiled, &span, UNIX_EPOCH),
@@ -1333,6 +1349,7 @@ mod tests {
             &action,
             &fetch.id,
             1024,
+            Mode::Text,
             UNIX_EPOCH + Duration::from_secs(1),
         );
         let completion = Completion {
@@ -1342,7 +1359,7 @@ mod tests {
             span: started.clone(),
             status_code: 503,
             response_headers: json!({"content-type": "text/html"}),
-            response_body: Some("<html>busy</html>".to_owned()),
+            response_body: json!("<html>busy</html>"),
         };
         let event = completed_span_event(&completion, UNIX_EPOCH + Duration::from_secs(3));
         assert_eq!(event["event_type"], "ActivityStarted");

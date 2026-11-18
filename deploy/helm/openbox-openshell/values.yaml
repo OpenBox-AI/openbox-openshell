@@ -153,9 +153,16 @@ doorGuard:
   # OPENBOX_APPROVAL_TTL_SECS. How long an approval's retry can match it,
   # when Core sends no expiry with the verdict.
   approvalTtlSecs: 900
-  # OPENBOX_PROMPT_CAPTURE. What Core receives for a user prompt: text,
-  # hash (SHA-256 and length) or off.
-  promptCapture: text
+  # What leaves your boundary for Core (docs/install.md, "What Core
+  # receives"): off, hash (SHA-256 and length), findings (hash, the kinds of
+  # sensitive data found, and the shape of JSON without its values) or text.
+  # A sandbox policy can choose per host with the middleware config's
+  # `capture` and `capture_hosts`.
+  # OPENBOX_PROMPT_CAPTURE: the user's prompt.
+  promptCapture: findings
+  # OPENBOX_BODY_CAPTURE: request and response bodies, tool arguments and
+  # results, and model replies.
+  bodyCapture: findings
   # Seconds Kubernetes waits after SIGTERM. The door guard stops taking
   # calls, finishes the ones in flight, and sends what it still owes Core.
   terminationGracePeriodSeconds: 30
