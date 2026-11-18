@@ -90,6 +90,27 @@ def fold_proof(leaf, proof):
     return node
 
 
+def signed_bytes(metadata, session_id, root_hex):
+    """The bytes Core signed, rebuilt from the attestation's metadata as Core
+    builds them (openbox-core content.AttestationEnvelope.SignedBytes), and a
+    note on which scheme. (None, reason) when the envelope does not belong to
+    this session and root, or the scheme is unknown."""
+    scheme = metadata.get("attestation_scheme") or "session-root-v0"
+    if scheme == "session-root-v0":
+        # Signed before the bound scheme: the root alone.
+        return root_hex, "scheme session-root-v0"
+    if scheme != "session-root-bound-v1":
+        return None, f"unknown attestation scheme {scheme!r}"
+    envelope = metadata.get("envelope") or {}
+    if envelope.get("session_id") != session_id:
+        return None, f"envelope names session {envelope.get('session_id')!r}, not {session_id}"
+    if envelope.get("session_root") != root_hex:
+        return None, "envelope root differs from the root rebuilt from the leaves"
+    fields = [scheme, envelope.get("organization_id", ""), envelope.get("agent_id", ""),
+              envelope.get("session_id", ""), envelope.get("session_root", "")]
+    return "\n".join(fields), "scheme session-root-bound-v1"
+
+
 def main():
     if len(sys.argv) != 2 or not UUID.match(sys.argv[1].lower()):
         sys.exit(__doc__)
@@ -191,23 +212,28 @@ def main():
     result(not undetected, "6 changing any one leaf changes the root",
            f"undetected at {undetected}" if undetected else "flipped one bit in each leaf in turn")
 
-    public = base64.b64decode((attestation.get("metadata") or {}).get("public_key", "") or b"").decode(
-        "utf-8", "replace"
-    )
-    if public.startswith("local-kms-public-key:"):
+    metadata = attestation.get("metadata") or {}
+    public = base64.b64decode(metadata.get("public_key", "") or b"").decode("utf-8", "replace")
+    signed, why = signed_bytes(metadata, sid, root.hex())
+    if signed is None:
+        result(False, "7 the root's signature", why)
+    elif public.startswith("local-kms-public-key:"):
         key_id = public.removeprefix("local-kms-public-key:")
         secret = os.environ.get("OBX_LOCAL_KMS_SECRET")
         if not secret:
             result(None, "7 the root's signature",
-                   f"local KMS HMAC (key {key_id}); set OBX_LOCAL_KMS_SECRET to check it")
+                   f"local KMS HMAC (key {key_id}, {why}); set OBX_LOCAL_KMS_SECRET to check it")
         else:
+            # Core's local signer keys the HMAC with the key's ARN,
+            # "local:kms:<id>"; the public key string carries only "<id>".
+            arn = key_id if key_id.startswith("local:kms:") else f"local:kms:{key_id}"
             expected = base64.b64encode(
-                hmac.new(f"{secret}:{key_id}".encode(), root.hex().encode(), hashlib.sha256).digest()
+                hmac.new(f"{secret}:{arn}".encode(), signed.encode(), hashlib.sha256).digest()
             ).decode()
             result(hmac.compare_digest(expected, attestation["signature"]),
-                   "7 the root's signature (local KMS HMAC)", f"key {key_id}")
+                   "7 the root's signature (local KMS HMAC)", f"key {key_id}, {why}")
     else:
-        result(None, "7 the root's signature", "AWS KMS signature, not checked by this script")
+        result(None, "7 the root's signature", f"AWS KMS signature ({why}), not checked by this script")
 
     print()
     print("ALL PASS" if not failed else "SOME FAILED")
