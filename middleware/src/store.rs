@@ -1,6 +1,6 @@
 //! Small shared state the door guard and the front desk keep between calls.
 //!
-//! Five kinds of entry, all short and non-secret:
+//! Six kinds of entry, all short and non-secret:
 //!
 //! - **Approvals**: `sandbox + action fingerprint → activity id`, written when
 //!   Core requires approval, so the identical retry (on any replica) asks Core
@@ -16,6 +16,9 @@
 //!   completion (its span and the end of its activity) the door guard has not
 //!   sent yet, so the front desk ends a deleted sandbox's session only after
 //!   them.
+//! - **Session ends owed**: `sandbox id → duration, last attempt`, plus the
+//!   set of those ids, from a sandbox's delete until Core accepts its session
+//!   end, so a failed end is retried by this or any later front desk.
 //!
 //! Every reader treats a store failure as "nothing remembered": an approval
 //! retry is then scored as a new activity (fail closed, never auto-approved),
@@ -45,6 +48,11 @@ pub trait SharedStore: Send + Sync + 'static {
     async fn remove_member(&self, key: &str, member: &str) -> Result<(), String>;
     /// How many members the set at `key` has; 0 when there is none.
     async fn count_members(&self, key: &str) -> Result<u64, String>;
+    /// The members of the set at `key`, in no order; empty when there is none.
+    async fn members(&self, key: &str) -> Result<Vec<String>, String> {
+        let _ = key;
+        Err("this store cannot list set members".to_owned())
+    }
 }
 
 pub fn approval_key(sandbox_id: &str, fingerprint: &str) -> String {
@@ -77,6 +85,16 @@ pub fn session_key(sandbox_id: &str) -> String {
 /// The request ids of a sandbox whose completion is still to be sent.
 pub fn pending_key(sandbox_id: &str) -> String {
     format!("openbox:pending:{sandbox_id}")
+}
+
+/// The sandbox ids whose session end Core has not accepted yet.
+pub fn ends_owed_key() -> String {
+    "openbox:sessions:end-owed".to_owned()
+}
+
+/// A sandbox's owed session end: its duration and when it was last tried.
+pub fn end_owed_key(sandbox_id: &str) -> String {
+    format!("openbox:session-end:{sandbox_id}")
 }
 
 /// In-process store. Expired entries are dropped when read.
@@ -159,6 +177,15 @@ impl SharedStore for MemoryStore {
             .filter(|(_, expires)| *expires > Instant::now())
             .map_or(0, |(members, _)| members.len() as u64))
     }
+
+    async fn members(&self, key: &str) -> Result<Vec<String>, String> {
+        let sets = self.sets.lock().expect("store lock");
+        Ok(sets
+            .get(key)
+            .filter(|(_, expires)| *expires > Instant::now())
+            .map(|(members, _)| members.iter().cloned().collect())
+            .unwrap_or_default())
+    }
 }
 
 /// Redis over RESP, one connection reused and reopened after any error.
@@ -176,6 +203,8 @@ enum Reply {
     Ok,
     Integer(i64),
     Bulk(Option<Vec<u8>>),
+    /// An array of bulk strings (`SMEMBERS`); nil elements are dropped.
+    Array(Vec<Vec<u8>>),
 }
 
 impl RedisStore {
@@ -284,23 +313,48 @@ async fn exchange(connection: &mut BufReader<TcpStream>, args: &[&[u8]]) -> Resu
             .map(Reply::Integer)
             .map_err(|_| "redis: bad integer".to_owned()),
         Some(b'-') => Err(format!("redis error: {}", &line[1..])),
-        Some(b'$') => {
-            let length: i64 = line[1..]
+        Some(b'$') => read_bulk(connection, line).await.map(Reply::Bulk),
+        Some(b'*') => {
+            let count: i64 = line[1..]
                 .parse()
-                .map_err(|_| "redis: bad bulk length".to_owned())?;
-            if length < 0 {
-                return Ok(Reply::Bulk(None));
+                .map_err(|_| "redis: bad array length".to_owned())?;
+            let mut items = Vec::new();
+            for _ in 0..count.max(0) {
+                let mut item = String::new();
+                connection
+                    .read_line(&mut item)
+                    .await
+                    .map_err(|error| format!("redis read: {error}"))?;
+                let item = item.trim_end_matches("\r\n");
+                if !item.starts_with('$') {
+                    return Err(format!("redis: unexpected array element {item:?}"));
+                }
+                items.extend(read_bulk(connection, item).await?);
             }
-            let mut data = vec![0; usize::try_from(length).unwrap_or(0) + 2];
-            connection
-                .read_exact(&mut data)
-                .await
-                .map_err(|error| format!("redis read: {error}"))?;
-            data.truncate(data.len() - 2);
-            Ok(Reply::Bulk(Some(data)))
+            Ok(Reply::Array(items))
         }
         _ => Err(format!("redis: unexpected reply {line:?}")),
     }
+}
+
+/// Reads the body of a bulk string whose `$<length>` header is `header`.
+async fn read_bulk(
+    connection: &mut BufReader<TcpStream>,
+    header: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let length: i64 = header[1..]
+        .parse()
+        .map_err(|_| "redis: bad bulk length".to_owned())?;
+    if length < 0 {
+        return Ok(None);
+    }
+    let mut data = vec![0; usize::try_from(length).unwrap_or(0) + 2];
+    connection
+        .read_exact(&mut data)
+        .await
+        .map_err(|error| format!("redis read: {error}"))?;
+    data.truncate(data.len() - 2);
+    Ok(Some(data))
 }
 
 fn text(reply: Reply) -> Result<Option<String>, String> {
@@ -309,7 +363,9 @@ fn text(reply: Reply) -> Result<Option<String>, String> {
             .map(Some)
             .map_err(|_| "redis: value is not UTF-8".to_owned()),
         Reply::Bulk(None) => Ok(None),
-        Reply::Ok | Reply::Integer(_) => Err("redis: expected a value".to_owned()),
+        Reply::Ok | Reply::Integer(_) | Reply::Array(_) => {
+            Err("redis: expected a value".to_owned())
+        }
     }
 }
 
@@ -372,6 +428,18 @@ impl SharedStore for RedisStore {
             _ => Err("redis: SCARD did not return a count".to_owned()),
         }
     }
+
+    async fn members(&self, key: &str) -> Result<Vec<String>, String> {
+        match self.command(&[b"SMEMBERS", key.as_bytes()]).await? {
+            Reply::Array(items) => items
+                .into_iter()
+                .map(|item| {
+                    String::from_utf8(item).map_err(|_| "redis: member is not UTF-8".to_owned())
+                })
+                .collect(),
+            _ => Err("redis: SMEMBERS did not return an array".to_owned()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -412,7 +480,9 @@ mod tests {
         store.remove_member("p", "a").await.unwrap();
         store.remove_member("p", "missing").await.unwrap();
         assert_eq!(store.count_members("p").await.unwrap(), 1);
+        assert_eq!(store.members("p").await.unwrap(), ["b"]);
         store.remove_member("p", "b").await.unwrap();
+        assert!(store.members("p").await.unwrap().is_empty());
         assert_eq!(store.count_members("p").await.unwrap(), 0);
         store
             .add_member("q", "a", Duration::from_millis(1))
@@ -466,8 +536,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.count_members(&set).await.unwrap(), 2);
+        let mut members = store.members(&set).await.unwrap();
+        members.sort();
+        assert_eq!(members, ["a", "b"]);
         store.remove_member(&set, "a").await.unwrap();
         store.remove_member(&set, "b").await.unwrap();
         assert_eq!(store.count_members(&set).await.unwrap(), 0);
+        assert!(store.members(&set).await.unwrap().is_empty());
     }
 }
