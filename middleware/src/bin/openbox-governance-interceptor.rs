@@ -51,7 +51,7 @@ use openbox_verdict_middleware::interceptor::{FrontDesk, Inventory, LogInventory
 use openbox_verdict_middleware::inventory::{
     BackendInventory, GatewayLister, HttpInventory, SandboxLister,
 };
-use openbox_verdict_middleware::sessions::SessionLifecycle;
+use openbox_verdict_middleware::sessions::{END_SWEEP_EVERY, SessionLifecycle};
 use openbox_verdict_middleware::store::{MemoryStore, RedisStore, SharedStore};
 use openbox_verdict_middleware::telemetry;
 use openbox_verdict_middleware::token::TokenVerifier;
@@ -280,6 +280,20 @@ async fn run() -> Result<(), String> {
             env("OPENBOX_FD_GATEWAY_ID"),
         ));
         inventory_sink = lifecycle.clone();
+        // Session ends Core has not accepted yet, from this front desk before
+        // a restart or from another replica: at start, then every minute.
+        let sweeper = Arc::clone(&lifecycle);
+        tokio::spawn(async move {
+            loop {
+                let taken = sweeper.sweep_owed().await;
+                if taken > 0 {
+                    eprintln!(
+                        "openbox-governance-interceptor: retrying {taken} owed session end(s)"
+                    );
+                }
+                tokio::time::sleep(END_SWEEP_EVERY).await;
+            }
+        });
         Some(lifecycle)
     } else {
         eprintln!(
