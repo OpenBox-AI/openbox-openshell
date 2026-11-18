@@ -59,7 +59,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use openshell_core::proto::{Decision, Finding, HttpRequestResult};
+use openshell_core::proto::{
+    Decision, Finding, HeaderMutation, HttpRequestResult, RemoveHeader, header_mutation,
+};
 use opentelemetry::trace::{FutureExt as _, SpanKind, Status, TraceContextExt as _};
 use opentelemetry::{Context, KeyValue};
 use serde_json::{Value, json};
@@ -69,11 +71,13 @@ use sha2::Digest as _;
 use crate::action::{Action, Payload};
 use crate::agent;
 use crate::capture;
+use crate::constrain;
 use crate::core_client::{
     Activity, ApprovalState, Completion, CoreDecision, CoreError, LLM_CALL, Outcome, Verdict,
     activity_name, request_activity_id, request_url, span_ids, started_span, tool_activity_id,
     unix_now,
 };
+use crate::fastpath::{self, LocalDecision, Rules, RulesMode, SlowCore, Tier};
 use crate::metrics::{CoreCall, Metrics};
 use crate::prompt::{self, Capture};
 use crate::sequence::Sequencer;
@@ -82,6 +86,7 @@ use crate::store::{
     tool_key,
 };
 use crate::telemetry;
+use base64::Engine as _;
 
 /// How long an approval can be matched by its retry when Core sends no
 /// expiry with the verdict, unless configured.
@@ -106,6 +111,13 @@ pub const REASON_APPROVAL_REQUIRED: &str = "openbox_approval_required";
 pub const REASON_BLOCKED: &str = "openbox_blocked";
 pub const REASON_HALTED: &str = "openbox_halted";
 pub const REASON_UNAVAILABLE: &str = "openbox_unavailable";
+/// CONSTRAIN came with a change the door guard could not make; the request
+/// is not forwarded.
+pub const REASON_CONSTRAIN_FAILED: &str = "openbox_constrain_failed";
+/// `OpenBox` is still deciding; the identical retry gets the verdict.
+pub const REASON_PENDING: &str = "openbox_pending";
+/// The largest replacement body `OpenShell` accepts.
+const MAX_REWRITTEN_BODY: usize = 4 << 20;
 
 const MAX_REASON_BYTES: usize = 4 * 1024;
 /// How much of a deny reason the `openbox: eval` log line keeps.
@@ -272,6 +284,13 @@ pub struct Guard<G, S: ?Sized> {
     core_budget: Duration,
     /// Keeps each sandbox's events in the order they happened.
     sequence: Arc<Sequencer>,
+    /// Tier 0: the local rule snapshot.
+    rules: Rules,
+    /// Tier 1: how long an allow may be reused when Core says nothing; zero
+    /// turns tier 1 off unless Core sends a TTL.
+    verdict_ttl: Duration,
+    /// Tier 2: what to do while Core is slow.
+    slow_core: SlowCore,
 }
 
 impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
@@ -303,7 +322,37 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             sequence: Sequencer::new(SEQUENCED_CALL_TIMEOUT),
             metrics: Arc::new(Metrics::default()),
             core_budget: DEFAULT_CORE_BUDGET,
+            rules: Rules::off(),
+            verdict_ttl: Duration::ZERO,
+            slow_core: SlowCore::Inline,
         }
+    }
+
+    /// Tier 0: decide matching requests from a local rule snapshot.
+    #[must_use]
+    pub fn with_rules(mut self, rules: Rules) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    /// Tier 1: reuse an allow for an identical action this long, when Core
+    /// does not say otherwise.
+    #[must_use]
+    pub const fn with_verdict_ttl(mut self, ttl: Duration) -> Self {
+        self.verdict_ttl = ttl;
+        self
+    }
+
+    /// Tier 2: what to do while Core is slow.
+    #[must_use]
+    pub const fn with_slow_core(mut self, slow_core: SlowCore) -> Self {
+        self.slow_core = slow_core;
+        self
+    }
+
+    /// Reloads the rule snapshot if its file changed.
+    pub fn refresh_rules(&self) {
+        self.rules.refresh();
     }
 
     /// Replaces [`DEFAULT_CORE_BUDGET`].
@@ -353,6 +402,24 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     /// span carries identifiers and the outcome only, never request content;
     /// see [`eval_line`] for what the log line carries.
     pub async fn evaluate(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
+        self.observe(action, self.decide(action, mode)).await
+    }
+
+    /// [`Self::evaluate`], able to keep evaluating after it has answered:
+    /// tier 2's `pending` mode needs that, so the service calls this.
+    pub async fn evaluate_shared(
+        self: &Arc<Self>,
+        action: &Action,
+        mode: ApprovalMode,
+    ) -> HttpRequestResult {
+        self.observe(action, self.decide_shared(action, mode)).await
+    }
+
+    async fn observe(
+        &self,
+        action: &Action,
+        decision: impl Future<Output = HttpRequestResult>,
+    ) -> HttpRequestResult {
         let started = std::time::Instant::now();
         let span = telemetry::start(
             &Context::current(),
@@ -363,7 +430,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 telemetry::request(&action.request_id),
             ],
         );
-        let result = self.decide(action, mode).with_context(span.clone()).await;
+        let result = decision.with_context(span.clone()).await;
         let elapsed = started.elapsed();
         let allowed = result.decision == Decision::Allow as i32;
         span.span().set_attribute(KeyValue::new(
@@ -404,13 +471,41 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
         outcome
     }
 
-    async fn decide(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
+    /// What every request is checked for before any tier.
+    fn precheck(&self, action: &Action) -> Option<HttpRequestResult> {
         if action.sandbox_id.is_empty() {
-            return deny(REASON_UNAVAILABLE, "request carried no sandbox id", None);
+            return Some(deny(
+                REASON_UNAVAILABLE,
+                "request carried no sandbox id",
+                None,
+            ));
         }
         if self.is_halted(&action.sandbox_id) {
-            return deny(REASON_HALTED, "sandbox was halted by OpenBox", None);
+            return Some(deny(REASON_HALTED, "sandbox was halted by OpenBox", None));
         }
+        None
+    }
+
+    async fn decide(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
+        let started = std::time::Instant::now();
+        if let Some(result) = self.precheck(action) {
+            return result;
+        }
+        let shadow = match self.fast_answer(action).await {
+            Ok((tier, result)) => {
+                self.metrics.record_tier(tier, started.elapsed());
+                return result;
+            }
+            Err(shadow) => shadow,
+        };
+        let result = self.decide_by_core(action, mode).await;
+        self.compare_shadow(action, shadow, &result);
+        self.metrics.record_tier(Tier::Core, started.elapsed());
+        result
+    }
+
+    /// Tier 2 with Core bounded by the Core budget.
+    async fn decide_by_core(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
         tokio::time::timeout(self.core_budget, self.decide_with_core(action, mode))
             .await
             .unwrap_or_else(|_| {
@@ -423,6 +518,221 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                     None,
                 )
             })
+    }
+
+    /// Tiers 0 and 1. `Err` carries the shadow-mode local decision, if any,
+    /// for comparison with Core's.
+    async fn fast_answer(
+        &self,
+        action: &Action,
+    ) -> Result<(Tier, HttpRequestResult), Option<(String, LocalDecision)>> {
+        // Model calls carry the prompt and the tool bookkeeping: always Core.
+        if agent::model_call(action).is_some() {
+            return Err(None);
+        }
+        let local = self.rules.decide(action, unix_now());
+        if let Some((version, rule, decision)) = &local
+            && self.rules.mode == RulesMode::Enforce
+        {
+            let reason = format!("local rule {rule} (snapshot {version})");
+            let result = match decision {
+                LocalDecision::Block => deny(REASON_BLOCKED, &format!("blocked by {reason}"), None),
+                LocalDecision::Allow => {
+                    self.record_fast(action, Tier::LocalRule).await;
+                    local_allow(&reason)
+                }
+            };
+            return Ok((Tier::LocalRule, result));
+        }
+        let shadow = local.map(|(_, rule, decision)| (rule, decision));
+        let key = fastpath::verdict_key(&action.sandbox_id, &action.fingerprint);
+        if matches!(self.store.get(&key).await, Ok(Some(_))) {
+            self.record_fast(action, Tier::RecentVerdict).await;
+            return Ok((
+                Tier::RecentVerdict,
+                local_allow("recent allow of an identical action"),
+            ));
+        }
+        Err(shadow)
+    }
+
+    fn compare_shadow(
+        &self,
+        action: &Action,
+        shadow: Option<(String, LocalDecision)>,
+        result: &HttpRequestResult,
+    ) {
+        let Some((rule, local)) = shadow else { return };
+        if result.reason_code == REASON_UNAVAILABLE || result.reason_code == REASON_PENDING {
+            return;
+        }
+        let allowed = result.decision == Decision::Allow as i32;
+        let agreed = (local == LocalDecision::Allow) == allowed;
+        self.metrics.record_shadow(agreed);
+        if !agreed {
+            eprintln!(
+                "openbox: shadow rule {rule} disagreed with Core request_id={} local={local:?} core_allowed={allowed}",
+                action.request_id
+            );
+        }
+    }
+
+    /// Records a request a fast tier allowed: its activity and span now, so
+    /// its response completes it, and the Core call in the background, in
+    /// order with the sandbox's other events.
+    async fn record_fast(&self, action: &Action, tier: Tier) {
+        let Route {
+            activity,
+            open,
+            closes,
+        } = self.route(action, None).await;
+        let started = SystemTime::now();
+        let mut span = started_span(
+            action,
+            &activity.id,
+            self.governance.body_limit(),
+            self.body_mode(action),
+            started,
+        );
+        span["attributes"]["openbox.tier"] = json!(tier.label());
+        mark_pending(self.store.as_ref(), &action.sandbox_id, &action.request_id).await;
+        let record = json!({
+            "activity": activity_json(&activity),
+            "closes": closes,
+            "api": null,
+            "span": span,
+            "started_ms": millis(started),
+            "capture": self.body_mode(action).name(),
+        });
+        self.remember_request(&action.request_id, &record).await;
+        let governance = Arc::clone(&self.governance);
+        let metrics = Arc::clone(&self.metrics);
+        let action = action.clone();
+        let queue = action.sandbox_id.clone();
+        let job = async move {
+            match governance
+                .evaluate_action(&action, &activity, open, &span)
+                .await
+            {
+                Ok(decision)
+                    if !matches!(decision.verdict, Verdict::Allow | Verdict::Constrain) =>
+                {
+                    metrics.record_fast_disagreement();
+                    eprintln!(
+                        "openbox: fast-path allow later refused by Core request_id={} verdict={:?}",
+                        action.request_id, decision.verdict
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!(
+                    "openbox: fast-path request_id={} not recorded in Core: {error}",
+                    action.request_id
+                ),
+            }
+        };
+        self.sequence.push(
+            &queue,
+            telemetry::job("openbox.fast_record", vec![telemetry::sandbox(&queue)], job),
+        );
+    }
+
+    /// Tier 2's `pending` mode: answer within a short wait, or deny
+    /// `openbox_pending` and keep evaluating; the identical retry gets the
+    /// verdict from the shared store.
+    async fn decide_shared(
+        self: &Arc<Self>,
+        action: &Action,
+        mode: ApprovalMode,
+    ) -> HttpRequestResult {
+        let SlowCore::Pending(wait) = self.slow_core else {
+            return self.decide(action, mode).await;
+        };
+        let started = std::time::Instant::now();
+        if let Some(result) = self.precheck(action) {
+            return result;
+        }
+        // A verdict worked out for an earlier identical attempt comes first:
+        // it carries that attempt's activity, which this request completes.
+        let key = fastpath::pending_key(&action.sandbox_id, &action.fingerprint);
+        match self.store.get(&key).await {
+            Ok(Some(text)) if text == PENDING_RUNNING => {
+                self.metrics.record_tier(Tier::Pending, started.elapsed());
+                return still_pending();
+            }
+            Ok(Some(text)) => {
+                let _ = self.store.delete(&key).await;
+                if let Some(result) = self.adopt_pending(action, &text).await {
+                    self.metrics.record_tier(Tier::Core, started.elapsed());
+                    return result;
+                }
+            }
+            Ok(None) => {}
+            // No shared store: no way to hand the verdict to the retry.
+            Err(_) => return self.decide(action, mode).await,
+        }
+        let shadow = match self.fast_answer(action).await {
+            Ok((tier, result)) => {
+                self.metrics.record_tier(tier, started.elapsed());
+                return result;
+            }
+            Err(shadow) => shadow,
+        };
+        let _ = self
+            .store
+            .set(&key, PENDING_RUNNING, Some(self.core_budget * 2))
+            .await;
+        let (done, verdict) = tokio::sync::oneshot::channel();
+        let me = Arc::clone(self);
+        let request = action.clone();
+        tokio::spawn(async move {
+            let result = me.decide_by_core(&request, mode).await;
+            // Stored before it is handed over, so a waiter that took it can
+            // always remove it.
+            let stored = json!({
+                "request_id": request.request_id,
+                "result": base64::engine::general_purpose::STANDARD
+                    .encode(prost::Message::encode_to_vec(&result)),
+            });
+            let _ = me
+                .store
+                .set(
+                    &fastpath::pending_key(&request.sandbox_id, &request.fingerprint),
+                    &stored.to_string(),
+                    Some(PENDING_RESULT_TTL),
+                )
+                .await;
+            let _ = done.send(result);
+        });
+        if let Ok(Ok(result)) = tokio::time::timeout(wait, verdict).await {
+            let _ = self.store.delete(&key).await;
+            self.compare_shadow(action, shadow, &result);
+            self.metrics.record_tier(Tier::Core, started.elapsed());
+            return result;
+        }
+        self.metrics.record_tier(Tier::Pending, started.elapsed());
+        still_pending()
+    }
+
+    /// The verdict worked out for an earlier identical attempt, for this
+    /// retry. An allow moves the earlier attempt's request record to this
+    /// request, so this request's response completes the activity.
+    async fn adopt_pending(&self, action: &Action, text: &str) -> Option<HttpRequestResult> {
+        let stored: Value = serde_json::from_str(text).ok()?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(stored.get("result")?.as_str()?)
+            .ok()?;
+        let result: HttpRequestResult = prost::Message::decode(bytes.as_slice()).ok()?;
+        let first = stored.get("request_id")?.as_str()?;
+        if result.decision == Decision::Allow as i32
+            && first != action.request_id
+            && let Ok(Some(record)) = self.store.take(&request_key(first)).await
+        {
+            clear_pending(self.store.as_ref(), &action.sandbox_id, first).await;
+            mark_pending(self.store.as_ref(), &action.sandbox_id, &action.request_id).await;
+            self.remember_request(&action.request_id, &record_value(&record))
+                .await;
+        }
+        Some(result)
     }
 
     async fn decide_with_core(&self, action: &Action, mode: ApprovalMode) -> HttpRequestResult {
@@ -497,6 +807,18 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             );
         }
         let result = self.apply(action, mode, &decision);
+        let span = with_rewrite(span, &result);
+        // Tier 1: a plain allow of a new action can be reused for an identical
+        // one. Never an approved retry (its approval is single use), a model
+        // call, or a rewritten request.
+        let reusable = decision.verdict == Verdict::Allow && open && model.is_none();
+        let ttl = decision
+            .verdict_ttl_secs
+            .map_or(self.verdict_ttl, Duration::from_secs);
+        if reusable && !ttl.is_zero() {
+            let key = fastpath::verdict_key(&action.sandbox_id, &action.fingerprint);
+            let _ = self.store.set(&key, "allow", Some(ttl)).await;
+        }
         let held = mode == ApprovalMode::Queue && decision.verdict == Verdict::RequireApproval;
         if result.decision != Decision::Allow as i32 && closes && !held {
             self.close_refused(action, activity.clone(), &decision)
@@ -514,22 +836,27 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                 "started_ms": millis(started),
                 "capture": self.body_mode(action).name(),
             });
-            if let Err(error) = self
-                .store
-                .set(
-                    &request_key(&action.request_id),
-                    &record.to_string(),
-                    Some(REQUEST_TTL),
-                )
-                .await
-            {
-                eprintln!(
-                    "openbox: request_id={} not recorded, its completion carries no duration: {error}",
-                    action.request_id
-                );
-            }
+            self.remember_request(&action.request_id, &record).await;
         }
         result
+    }
+
+    /// Keeps what the response's completion needs, for whichever replica
+    /// sees the response.
+    async fn remember_request(&self, request_id: &str, record: &Value) {
+        if let Err(error) = self
+            .store
+            .set(
+                &request_key(request_id),
+                &record.to_string(),
+                Some(REQUEST_TTL),
+            )
+            .await
+        {
+            eprintln!(
+                "openbox: request_id={request_id} not recorded, its completion carries no duration: {error}"
+            );
+        }
     }
 
     /// Closes the activity of a request Core refused, as the agent SDK closes
@@ -620,6 +947,8 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
                     risk_score: None,
                     approval_expires_at: None,
                     policy_id: None,
+                    constraints: None,
+                    verdict_ttl_secs: None,
                 };
                 Err(self.apply(action, mode, &decision))
             }
@@ -1076,7 +1405,7 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
     ) -> HttpRequestResult {
         match decision.verdict {
             Verdict::Allow => allow(decision, "allow"),
-            Verdict::Constrain => allow(decision, "constrain_met_by_sandbox"),
+            Verdict::Constrain => constrain(action, decision),
             Verdict::RequireApproval if mode == ApprovalMode::Queue => deny(
                 REASON_APPROVAL_REQUIRED,
                 decision
@@ -1365,6 +1694,102 @@ fn allow(decision: &CoreDecision, label: &str) -> HttpRequestResult {
     }
 }
 
+/// The request's span with what CONSTRAIN changed, so its completion
+/// records the rewrite: what was applied, and both bodies' SHA-256.
+fn with_rewrite(mut span: Value, result: &HttpRequestResult) -> Value {
+    for key in [
+        "openbox.constraints_applied",
+        "openbox.original_sha256",
+        "openbox.rewritten_sha256",
+    ] {
+        if let Some(value) = result.metadata.get(key) {
+            span["attributes"][key] = json!(value);
+        }
+    }
+    span
+}
+
+/// CONSTRAIN: allow the request as rewritten by Core's constraints, or deny
+/// it when they cannot be met. Without constraints CONSTRAIN keeps its older
+/// meaning, "allowed because the sandbox already contains it".
+fn constrain(action: &Action, decision: &CoreDecision) -> HttpRequestResult {
+    let Some(constraints) = &decision.constraints else {
+        return allow(decision, "constrain_met_by_sandbox");
+    };
+    let rewrite = constrain::parse(constraints)
+        .and_then(|constraints| constrain::apply(action, &constraints, MAX_REWRITTEN_BODY));
+    let rewrite = match rewrite {
+        Ok(rewrite) => rewrite,
+        Err(error) => {
+            return deny(
+                REASON_CONSTRAIN_FAILED,
+                &format!("the request could not be constrained: {error}"),
+                Some(decision),
+            );
+        }
+    };
+    // Nothing to change (`run_in_sandbox`): allowed as sent, as before.
+    if rewrite.applied.is_empty() && rewrite.body.is_none() {
+        return allow(decision, "constrain_met_by_sandbox");
+    }
+    let mut result = allow(decision, "constrained");
+    result.metadata.insert(
+        "openbox.original_sha256".to_owned(),
+        rewrite.original_sha256.clone(),
+    );
+    result.metadata.insert(
+        "openbox.rewritten_sha256".to_owned(),
+        rewrite.rewritten_sha256.clone(),
+    );
+    result.metadata.insert(
+        "openbox.constraints_applied".to_owned(),
+        truncate(&rewrite.applied.join(","), MAX_REASON_BYTES),
+    );
+    if let Some(body) = rewrite.body {
+        result.body = body;
+        result.has_body = true;
+    }
+    result.header_mutations = rewrite
+        .remove_headers
+        .into_iter()
+        .map(|name| HeaderMutation {
+            operation: Some(header_mutation::Operation::Remove(RemoveHeader { name })),
+        })
+        .collect();
+    result
+}
+
+/// Marks a verdict still being worked out in the shared store.
+const PENDING_RUNNING: &str = "running";
+/// How long a worked-out verdict waits for its retry.
+const PENDING_RESULT_TTL: Duration = Duration::from_secs(120);
+
+fn still_pending() -> HttpRequestResult {
+    deny(
+        REASON_PENDING,
+        "OpenBox is still deciding; send the identical request again shortly",
+        None,
+    )
+}
+
+/// An allow from a fast tier: no Core decision behind it yet.
+fn local_allow(reason: &str) -> HttpRequestResult {
+    let mut result = HttpRequestResult {
+        decision: Decision::Allow as i32,
+        findings: vec![finding("allow_fast_path", "info")],
+        ..HttpRequestResult::default()
+    };
+    result.metadata.insert(
+        "openbox.fast_path".to_owned(),
+        truncate(reason, MAX_REASON_BYTES),
+    );
+    result
+}
+
+fn record_value(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or(Value::Null)
+}
+
 fn deny(reason_code: &str, reason: &str, decision: Option<&CoreDecision>) -> HttpRequestResult {
     let severity = match reason_code {
         REASON_HALTED => "critical",
@@ -1493,6 +1918,10 @@ pub(crate) mod tests {
         /// Everything each call carried that could hold content, as Core
         /// would receive it: activities, spans, outcomes, signal arguments.
         pub sent: Mutex<Vec<String>>,
+        /// Sent with every verdict, as Core's `constraints`.
+        pub constraints: Option<Value>,
+        /// Sent with every verdict, as Core's `verdict_ttl_secs`.
+        pub verdict_ttl_secs: Option<u64>,
     }
 
     fn decision(verdict: Verdict) -> CoreDecision {
@@ -1503,6 +1932,8 @@ pub(crate) mod tests {
             risk_score: Some(0.5),
             approval_expires_at: None,
             policy_id: None,
+            constraints: None,
+            verdict_ttl_secs: None,
         }
     }
 
@@ -1588,6 +2019,8 @@ pub(crate) mod tests {
             match next {
                 Ok(verdict) => Ok(CoreDecision {
                     approval_expires_at: self.approval_expires_at,
+                    constraints: self.constraints.clone(),
+                    verdict_ttl_secs: self.verdict_ttl_secs,
                     ..decision(verdict)
                 }),
                 Err(()) => Err(CoreError::Status(500)),
@@ -2175,6 +2608,288 @@ pub(crate) mod tests {
             headers: Vec::new(),
             body: Some(body.to_vec()),
         }
+    }
+
+    /// W3 tier 1: an allow Core marked reusable answers the identical action
+    /// at once; the action is still recorded in Core, in the background.
+    #[tokio::test]
+    async fn a_recent_allow_answers_an_identical_action_without_waiting() {
+        let core = FakeCore {
+            verdict_ttl_secs: Some(60),
+            ..FakeCore::with_verdicts(&[Verdict::Allow, Verdict::Allow])
+        };
+        let (guard, core, _) = guard(core);
+        assert!(is_allow(
+            &guard.evaluate(&request("req-1"), ApprovalMode::Queue).await
+        ));
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 1);
+        let fast = guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        assert!(is_allow(&fast));
+        assert!(fast.metadata.contains_key("openbox.fast_path"));
+        // Recorded in Core after the answer, as the second evaluation.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while core.evaluate_calls.load(Ordering::SeqCst) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not recorded in Core"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let rendered = guard.metrics().render();
+        assert!(
+            rendered.contains(r#"openbox_mw_tier_total{tier="recent_verdict"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"openbox_mw_tier_total{tier="core"} 1"#),
+            "{rendered}"
+        );
+    }
+
+    /// Without a TTL from Core or the deployment, tier 1 is off.
+    #[tokio::test]
+    async fn without_a_ttl_every_action_goes_to_core() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow; 2]));
+        guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn snapshot(rules: &str) -> fastpath::Snapshot {
+        fastpath::Snapshot::parse(&format!(
+            r#"{{"version": "v1", "expires_at": 4000000000, "rules": {rules}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// W3 tier 0, enforced: a matching block never reaches Core; a matching
+    /// allow answers at once and is recorded in Core afterwards.
+    #[tokio::test]
+    async fn local_rules_decide_when_enforced() {
+        let rules = snapshot(
+            r#"[{"id": "no-pay", "decision": "block", "tools": ["pay"]},
+                {"id": "reads", "decision": "allow", "methods": ["GET"]}]"#,
+        );
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow]));
+        let guard = guard.with_rules(Rules::fixed(RulesMode::Enforce, rules));
+        let blocked = guard.evaluate(&request("req-1"), ApprovalMode::Queue).await;
+        assert_eq!(blocked.reason_code, REASON_BLOCKED);
+        assert!(blocked.reason.contains("no-pay"));
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 0);
+        let mut read = evaluation("GET", "/docs", b"");
+        read.context.as_mut().unwrap().request_id = "req-2".to_owned();
+        let allowed = guard
+            .evaluate(&Action::from_evaluation(&read), ApprovalMode::Queue)
+            .await;
+        assert!(is_allow(&allowed));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while core.evaluate_calls.load(Ordering::SeqCst) < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not recorded in Core"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// W3 tier 0 in shadow: Core decides, and agreement is counted.
+    #[tokio::test]
+    async fn shadow_rules_only_count_agreement() {
+        let rules = snapshot(r#"[{"id": "no-pay", "decision": "block", "tools": ["pay"]}]"#);
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Allow, Verdict::Block]));
+        let guard = guard.with_rules(Rules::fixed(RulesMode::Shadow, rules));
+        assert!(is_allow(
+            &guard.evaluate(&request("req-1"), ApprovalMode::Queue).await
+        ));
+        let blocked = guard.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        assert_eq!(blocked.reason_code, REASON_BLOCKED);
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 2);
+        let rendered = guard.metrics().render();
+        assert!(
+            rendered.contains(r#"openbox_mw_rule_shadow_total{agreement="disagree"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"openbox_mw_rule_shadow_total{agreement="agree"} 1"#),
+            "{rendered}"
+        );
+    }
+
+    /// W3 tier 2, `pending`: a slow Core gets `openbox_pending` at once; the
+    /// identical retry gets the verdict, and its response completes the
+    /// activity the first attempt opened.
+    #[tokio::test]
+    async fn a_slow_verdict_is_handed_to_the_identical_retry() {
+        let core = FakeCore {
+            delay: Duration::from_millis(200),
+            ..FakeCore::with_verdicts(&[Verdict::Allow])
+        };
+        let (guard, core, _) = guard(core);
+        let guard = Arc::new(guard.with_slow_core(SlowCore::Pending(Duration::from_millis(20))));
+        let first = guard
+            .evaluate_shared(&request("req-1"), ApprovalMode::Queue)
+            .await;
+        assert_eq!(first.reason_code, REASON_PENDING);
+        // Still working: the retry is told to wait again, Core is not asked twice.
+        let early = guard
+            .evaluate_shared(&request("req-2"), ApprovalMode::Queue)
+            .await;
+        assert_eq!(early.reason_code, REASON_PENDING);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let retry = guard
+            .evaluate_shared(&request("req-3"), ApprovalMode::Queue)
+            .await;
+        assert!(is_allow(&retry), "{retry:?}");
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 1);
+        guard
+            .complete(response(
+                "req-3",
+                200,
+                br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            ))
+            .await;
+        settle(&core, 1).await;
+        let completions = core.completions.lock().unwrap();
+        assert_eq!(
+            completions[0].activity.id, "oshx-req-1",
+            "the first attempt's activity"
+        );
+        assert_eq!(completions[0].activity.kind, "pay");
+    }
+
+    /// Regression (seen on the ash-barriers env): with tier 1 on as well, the
+    /// retry must take the pending verdict, not the reusable allow it left,
+    /// or the first attempt's activity is never completed.
+    #[tokio::test]
+    async fn a_pending_verdict_wins_over_the_allow_it_left_behind() {
+        let core = FakeCore {
+            delay: Duration::from_millis(200),
+            verdict_ttl_secs: Some(60),
+            ..FakeCore::with_verdicts(&[Verdict::Allow])
+        };
+        let (guard, core, _) = guard(core);
+        let guard = Arc::new(guard.with_slow_core(SlowCore::Pending(Duration::from_millis(20))));
+        assert_eq!(
+            guard
+                .evaluate_shared(&request("req-1"), ApprovalMode::Queue)
+                .await
+                .reason_code,
+            REASON_PENDING
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let retry = guard
+            .evaluate_shared(&request("req-2"), ApprovalMode::Queue)
+            .await;
+        assert!(is_allow(&retry));
+        assert!(
+            !retry.metadata.contains_key("openbox.fast_path"),
+            "{retry:?}"
+        );
+        let key = fastpath::pending_key("sbx-id-1", &request("req-2").fingerprint);
+        assert!(
+            guard.store.get(&key).await.unwrap().is_none(),
+            "the pending verdict was used"
+        );
+        guard
+            .complete(response(
+                "req-2",
+                200,
+                br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            ))
+            .await;
+        settle(&core, 1).await;
+        assert_eq!(
+            core.completions.lock().unwrap()[0].activity.id,
+            "oshx-req-1"
+        );
+    }
+
+    /// W3 tier 2, `pending`, with a fast Core: the verdict comes inline.
+    #[tokio::test]
+    async fn a_quick_verdict_is_answered_inline_in_pending_mode() {
+        let (guard, core, _) = guard(FakeCore::with_verdicts(&[Verdict::Block]));
+        let guard = Arc::new(guard.with_slow_core(SlowCore::Pending(Duration::from_secs(2))));
+        let result = guard
+            .evaluate_shared(&request("req-1"), ApprovalMode::Queue)
+            .await;
+        assert_eq!(result.reason_code, REASON_BLOCKED);
+        assert_eq!(core.evaluate_calls.load(Ordering::SeqCst), 1);
+        // Nothing left behind for a retry: the next identical request asks Core.
+        let key = fastpath::pending_key("sbx-id-1", &request("req-2").fingerprint);
+        assert!(guard.store.get(&key).await.unwrap().is_none());
+    }
+
+    /// W2: CONSTRAIN with constraints goes out rewritten; one that cannot be
+    /// met is denied; CONSTRAIN without constraints is allowed as before.
+    #[tokio::test]
+    async fn constrain_rewrites_the_request_or_denies_it() {
+        let core = FakeCore {
+            constraints: Some(json!([
+                {"kind": "narrow", "tool": "pay", "drop": ["amount"], "set": {"dry_run": true}},
+                {"kind": "strip_headers", "names": ["x-debug"]}
+            ])),
+            ..FakeCore::with_verdicts(&[Verdict::Constrain])
+        };
+        let (first, _, _) = guard(core);
+        let mut evaluation = evaluation(
+            "POST",
+            "/mcp",
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pay","arguments":{"amount":10}}}"#,
+        );
+        evaluation.headers.push(openshell_core::proto::HttpHeader {
+            name: "x-debug".to_owned(),
+            value: "1".to_owned(),
+        });
+        let action = Action::from_evaluation(&evaluation);
+        let fingerprint = action.fingerprint.clone();
+        let result = first.evaluate(&action, ApprovalMode::Queue).await;
+        assert!(is_allow(&result));
+        assert!(result.has_body);
+        let sent: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(sent["params"]["arguments"], json!({"dry_run": true}));
+        assert_eq!(result.header_mutations.len(), 1);
+        assert_eq!(
+            result.metadata["openbox.constraints_applied"],
+            "narrow:pay,strip_header:x-debug"
+        );
+        assert_ne!(
+            result.metadata["openbox.original_sha256"],
+            result.metadata["openbox.rewritten_sha256"]
+        );
+        // The approval fingerprint is still the request as the agent sent it.
+        assert_eq!(action.fingerprint, fingerprint);
+
+        // A constraint the request cannot meet: denied, never forwarded.
+        let core = FakeCore {
+            constraints: Some(
+                json!([{"kind": "narrow", "tool": "delete_repo", "drop": ["force"]}]),
+            ),
+            ..FakeCore::with_verdicts(&[Verdict::Constrain])
+        };
+        let (unmet, _, _) = guard(core);
+        let result = unmet.evaluate(&request("req-2"), ApprovalMode::Queue).await;
+        assert!(!is_allow(&result));
+        assert_eq!(result.reason_code, REASON_CONSTRAIN_FAILED);
+        assert!(!result.has_body);
+
+        // What Core sends today: met by the sandbox, allowed unchanged.
+        let core = FakeCore {
+            constraints: Some(json!(["run_in_sandbox"])),
+            ..FakeCore::with_verdicts(&[Verdict::Constrain])
+        };
+        let (sandboxed, _, _) = guard(core);
+        let result = sandboxed
+            .evaluate(&request("req-4"), ApprovalMode::Queue)
+            .await;
+        assert!(is_allow(&result), "{result:?}");
+        assert!(!result.has_body);
+
+        // No constraints: allowed unchanged, as before W2.
+        let (plain, _, _) = guard(FakeCore::with_verdicts(&[Verdict::Constrain]));
+        let result = plain.evaluate(&request("req-3"), ApprovalMode::Queue).await;
+        assert!(is_allow(&result));
+        assert!(!result.has_body);
+        assert!(result.header_mutations.is_empty());
     }
 
     /// W4's acceptance test: with the default capture, no raw body, prompt,

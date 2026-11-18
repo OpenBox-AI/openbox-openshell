@@ -347,6 +347,102 @@ bypassed OpenBox.
 The trade-off: a policy shipped inside the sandbox image is ignored. Pass
 `--policy` to use it.
 
+## Fast-path verdicts
+
+By default every request waits for Core. Three tiers let the door guard
+answer sooner where that is safe:
+
+| Tier | Answers | Setting |
+|---|---|---|
+| 0, local rules | Requests a rule in a local snapshot matches | `doorGuard.fastPath.rulesConfigMap` (a ConfigMap with `rules.json`), `rulesMode` |
+| 1, recent verdict | An action identical to one Core allowed within a TTL | Core's `verdict_ttl_secs` on the verdict, else `doorGuard.fastPath.verdictTtlSecs` (default 0: off) |
+| 2, Core | Everything else | `doorGuard.fastPath.slowCore`: `pending` (default) or `inline` (wait, as before v0.3) |
+
+A request a fast tier allows is still recorded in Core, in order with the
+sandbox's other events, after it has been answered. If Core then refuses it,
+the door guard logs it and counts it in
+`openbox_mw_fast_path_disagreements_total`; the request has already gone.
+Model calls always go to Core, because their prompt and tool bookkeeping
+happens there. An approved retry is never reused: approvals stay single use.
+
+**Local rules.** The snapshot is JSON, reloaded within 10 s of a change. A
+snapshot past `expires_at` is not used, and requests go to Core:
+
+```json
+{
+  "version": "2026-11-13#42",
+  "expires_at": 1795000000,
+  "rules": [
+    {"id": "no-paste", "decision": "block", "hosts": ["pastebin.com", "*.pastebin.com"]},
+    {"id": "docs-read", "decision": "allow", "hosts": ["docs.example.com"], "methods": ["GET", "HEAD"]},
+    {"id": "safe-tools", "decision": "allow", "tools": ["search"]}
+  ]
+}
+```
+
+Every condition a rule sets must match (`hosts`, `methods`, `path_prefixes`,
+`tools`); the first matching rule decides. Run new rules in `shadow` first:
+Core still decides, and `openbox_mw_rule_shadow_total{agreement=...}` shows
+how often the snapshot agrees. Switch to `enforce` once it does.
+
+**Pending** (the default). With `slowCore: pending`, the door guard waits
+`pendingWaitMs` (2 s) for Core. If Core is slower, the request is denied with
+`openbox_pending` while the door guard keeps evaluating; the agent's identical
+retry gets the verdict at once. This avoids holding a connection open for the
+whole of a slow verdict, which destinations with short idle timeouts drop.
+Agents must retry on `openbox_pending`; the helpers in `clients/` do. An
+agent that cannot retry needs `slowCore: inline`, and with it the full wait
+for every verdict. With
+more than one door guard replica it needs Redis, since the retry can land on
+another replica.
+
+`openbox_mw_tier_total{tier=...}` and `openbox_mw_tier_duration_seconds`
+show how many requests each tier answered and how fast.
+
+## CONSTRAIN: rewriting a request
+
+When Core's verdict is CONSTRAIN and carries `constraints`, the door guard
+changes the request before it goes out and allows it. Core sends the
+constraints in its evaluate response:
+
+```json
+{
+  "verdict": "constrain",
+  "constraints": [
+    {"kind": "redact", "paths": ["/customer/card"], "findings": ["email"]},
+    {"kind": "narrow", "tool": "delete_repo", "drop": ["force"], "set": {"dry_run": true}},
+    {"kind": "strip_headers", "names": ["x-debug-token"]}
+  ]
+}
+```
+
+| Kind | Fields | What the door guard does |
+|---|---|---|
+| `redact` | `paths`: JSON Pointers; `findings`: kinds from "What Core receives" | Replaces the value at each path, and every match of each kind in any string (or in a text body), with `[REDACTED]`. An absent path is already met. |
+| `narrow` | `tool` (optional), `drop`, `set` | In each MCP `tools/call` of that tool (or of any tool), removes the `drop` argument keys and writes the `set` ones. |
+| `strip_headers` | `names` | Removes those request headers. |
+
+What the door guard will not do, and denies with `openbox_constrain_failed`
+instead of forwarding the original:
+
+- a `redact` path into a body that is not JSON, or a `narrow` on a request
+  with no matching `tools/call`;
+- strip a header OpenShell protects: `Authorization`, `Proxy-Authorization`,
+  `Cookie`, `Host`, the framing and hop-by-hop headers, and `x-amz-*`;
+- send a rewritten body over 4 MiB, the most OpenShell accepts;
+- apply a constraint kind it does not know.
+
+The approval fingerprint is the request as the agent sent it, so an identical
+retry still matches its approval. The result's metadata and the request's
+completed span record what was applied and the SHA-256 of both the original
+and the rewritten body.
+
+Core also sends plain strings in `constraints`. `"run_in_sandbox"`, which is
+what Core sends today for a CONSTRAIN policy rule, is met by the sandbox
+itself: the request goes out unchanged. A CONSTRAIN verdict without
+`constraints` is allowed unchanged too, as before. Any other string is a
+constraint the door guard cannot meet.
+
 ## The approval retry contract
 
 OpenShell cannot hold a request, so an approval is deny-then-retry:
