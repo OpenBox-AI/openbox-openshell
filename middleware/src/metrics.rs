@@ -110,6 +110,8 @@ pub struct Metrics {
     halt_stops: Mutex<BTreeMap<bool, u64>>,
     /// Evidence records: (written) → count.
     evidence: Mutex<BTreeMap<bool, u64>>,
+    /// Requests seen again under a request id already answered.
+    duplicates: AtomicU64,
 }
 
 impl Metrics {
@@ -164,6 +166,10 @@ impl Metrics {
         if confirmed {
             self.halt_stop_latency.observe(elapsed);
         }
+    }
+
+    pub fn record_duplicate(&self) {
+        self.duplicates.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_evidence(&self, written: bool) {
@@ -288,6 +294,13 @@ impl Metrics {
         out.push_str("# TYPE openbox_mw_halt_stop_seconds histogram\n");
         self.halt_stop_latency
             .render(out, "openbox_mw_halt_stop_seconds", "");
+        out.push_str("# HELP openbox_mw_duplicate_requests_total Requests answered again under the same request id.\n");
+        out.push_str("# TYPE openbox_mw_duplicate_requests_total counter\n");
+        let _ = writeln!(
+            out,
+            "openbox_mw_duplicate_requests_total {}",
+            self.duplicates.load(Ordering::Relaxed)
+        );
         out.push_str("# HELP openbox_mw_evidence_records_total Verdict records, by whether they were written. Alert on failed: the evidence has a gap.\n");
         out.push_str("# TYPE openbox_mw_evidence_records_total counter\n");
         for (written, count) in self.evidence.lock().expect("metrics lock").iter() {

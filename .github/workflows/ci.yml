@@ -32,6 +32,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # The OpenShell contract (every RPC, field and enum value of the pinned
+      # protos) against its golden copy: a pin bump shows its contract diff.
+      - run: scripts/proto-golden.sh --check
 
   clients:
     name: Agent retry helpers
