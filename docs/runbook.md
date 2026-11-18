@@ -83,6 +83,72 @@ Watch, without paging: the rate of `openbox_blocked` and
 `openbox_approval_required` by deployment. A sudden jump is usually a policy
 change in OpenBox.
 
+## Load: SPEC-001 test A9
+
+A9 is 200 requests a second of 1 MiB bodies for 30 minutes, answered by
+Tier 0 (a local rule from Core allowing them), with Tier 0-1 inside p50 60 ms
+and p99 250 ms at the door guard. Run it with `middleware/examples/loadgen.rs`
+(an in-cluster Job pointed at the door guard Service, signing tokens with
+the gateway's key; it sends each allowed request's response too, as a
+supervisor does).
+
+**It does not pass yet.** Measured on kind on one laptop (10 CPUs for the
+whole cluster, two door guard replicas, the chart's Redis, OpenShell
+v0.1.8, Core on a preview environment taking about 5 s a call):
+
+| Run | Served | Door guard | Client latency |
+|---|---|---|---|
+| 50 rps, 90 s, requests only | 100% | steady | p50 6 ms, p99 140 ms |
+| 100 rps, 60 s, requests only | 100% | memory climbing | p50 6 ms, p99 223 ms |
+| 200 rps, 30 min, before the fixes below | 27% | OOMKilled 19 times | p50 45 ms, p99 > 290 s |
+| 200 rps, 120 s, with the fixes, one connection | 40% (79 rps) | no restarts, under 450 MiB | queued at the client |
+| 200 rps, 120 s, with the fixes, two connections | 49% (98 rps) | no restarts | queued at the client |
+| 100 rps, 60 s, with the Redis pool | 100% | no restarts | p50 19 ms, p99 25 ms |
+| 200 rps, 60 s, with the Redis pool | 100% | no restarts; every Tier 0 answer under 50 ms inside the door guard | p50 10 ms, p99 20 ms |
+
+What the runs found, and what changed:
+
+- **Background Core records held whole requests.** A locally answered request
+  queued a Core record holding the raw body, behind a Core that takes
+  seconds, without limit. The body no longer goes into the queue, and the
+  queue holds at most 256 jobs per sandbox and 4096 in all; past that,
+  background records are dropped and counted in
+  `openbox_mw_core_background_dropped_total`. Verdicts are never dropped.
+- **A replica that fell behind accepted every request a burst brought.** It
+  now takes at most 128 requests in flight per connection
+  (`OPENBOX_MW_MAX_CONCURRENT_STREAMS`); past that the supervisor waits.
+- **One connection lands on one replica.** gRPC runs over one HTTP/2
+  connection, and a Kubernetes Service balances connections, not requests,
+  so with few supervisors one door guard replica takes all of it. Both
+  two-connection runs landed on the same replica.
+
+What held Tier 0 back was the shared store. Each process sent every Redis
+command over one connection, so a command waited for all the others, and
+past the 200 ms store timeout it counted as "nothing remembered" and the
+connection was reopened (before the pool, Redis served about 54 commands
+for each request and its response, and only 12% of Tier 0 answers took
+under 250 ms inside the door guard). Each process now keeps a pool of
+connections (`OPENBOX_REDIS_POOL`, default 16; set it through
+`doorGuard.extraEnv`), and a test holds a Tier 0 request to five store
+commands and its response to one. With the pool, the 200 rps runs above
+served every request.
+
+Still open before A9 passes:
+
+- **The 30-minute run.** The pool runs above are 60 s smoke runs on a
+  laptop; A9 is 30 minutes, on a cluster sized for it.
+- **Background Core records are dropped under load.** Core takes about 5 s
+  a call (PROD-1151), so at 200 rps the background queue fills and records
+  of locally allowed requests are dropped
+  (`openbox_mw_core_background_dropped_total`, about 27,700 in the 200 rps
+  run). Verdicts are never dropped, but those requests are missing from
+  the session in OpenBox until Core is faster or records are batched.
+
+Sizing until then: give each door guard replica 1 GiB of memory for 1 MiB
+bodies at 100 requests a second or more, and set `MALLOC_ARENA_MAX=2`
+(`doorGuard.extraEnv`): glibc's per-thread arenas otherwise keep freed
+1 MiB buffers, which more than doubled resident memory in these runs.
+
 ## Verdicts are slow
 
 A model-call verdict takes 3-8 s on staging. That is normal. Look further when

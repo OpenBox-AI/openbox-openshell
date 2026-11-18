@@ -34,6 +34,7 @@
 //!                                     response completions are matched through
 //!                                     it. Without it they are matched in process,
 //!                                     which is only correct for one replica.
+//!   `OPENBOX_REDIS_POOL`              Redis connections per process, default 16
 //!   `OPENBOX_APPROVAL_TTL_SECS`       how long an approval's retry can match it
 //!                                     when Core sends no expiry with the
 //!                                     verdict, default 900. Otherwise Core's
@@ -63,7 +64,7 @@ use openbox_verdict_middleware::halt::{DenyOnlyStopper, GatewayStopper};
 use openbox_verdict_middleware::metrics::{AdminActions, Resume, serve_admin};
 use openbox_verdict_middleware::prompt::Capture;
 use openbox_verdict_middleware::service::VerdictMiddleware;
-use openbox_verdict_middleware::store::{MemoryStore, RedisStore, SharedStore};
+use openbox_verdict_middleware::store::{DEFAULT_REDIS_POOL, MemoryStore, RedisStore, SharedStore};
 use openbox_verdict_middleware::telemetry;
 use openbox_verdict_middleware::token::TokenVerifier;
 use openshell_core::proto::middleware::v1::http_response_pre_return_server::HttpResponsePreReturnServer;
@@ -371,9 +372,22 @@ fn core_from_env() -> Result<CoreClient, String> {
     .map_err(|error| error.to_string())
 }
 
+/// Requests one connection may have in flight unless
+/// `OPENBOX_MW_MAX_CONCURRENT_STREAMS` says otherwise. Each holds its body
+/// (up to 1 MiB) and copies of it while it is judged; past this the
+/// supervisor waits to send more, instead of the door guard holding every
+/// request a burst brings until it is out of memory.
+const DEFAULT_MAX_CONCURRENT_STREAMS: u64 = 128;
+
 /// The gRPC server, with TLS unless the operator chose plaintext.
 fn server_from_env(insecure: bool) -> Result<Server, String> {
-    let server = Server::builder();
+    let streams = number(
+        "OPENBOX_MW_MAX_CONCURRENT_STREAMS",
+        DEFAULT_MAX_CONCURRENT_STREAMS,
+    )?
+    .max(1);
+    let server =
+        Server::builder().max_concurrent_streams(Some(u32::try_from(streams).unwrap_or(u32::MAX)));
     if insecure {
         return Ok(server);
     }
@@ -389,7 +403,12 @@ fn server_from_env(insecure: bool) -> Result<Server, String> {
 /// Where approvals and completions are matched, and for how long.
 fn store_from_env() -> Result<(Arc<dyn SharedStore>, Duration), String> {
     let store: Arc<dyn SharedStore> = if let Some(url) = env("OPENBOX_REDIS_URL") {
-        Arc::new(RedisStore::from_url(&url, Duration::from_millis(200))?)
+        let pool = env("OPENBOX_REDIS_POOL").map_or(Ok(DEFAULT_REDIS_POOL), |value| {
+            value
+                .parse()
+                .map_err(|_| "OPENBOX_REDIS_POOL must be a number".to_owned())
+        })?;
+        Arc::new(RedisStore::from_url(&url, Duration::from_millis(200))?.with_pool(pool)?)
     } else {
         eprintln!(
             "openbox-verdict-middleware: no OPENBOX_REDIS_URL; approvals and completions are matched in this process only (one replica)"
