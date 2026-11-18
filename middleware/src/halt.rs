@@ -16,6 +16,9 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use crate::guard::SandboxStopper;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the gateway to report the sandbox stopped.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+const CONFIRM_POLL: Duration = Duration::from_millis(250);
 
 /// Gateway client for sandbox stops. Uses a least-privileged mTLS identity
 /// dedicated to `OpenBox` (see the bundle docs).
@@ -78,13 +81,55 @@ impl SandboxStopper for GatewayStopper {
                 ..StopSandboxRequest::default()
             })
             .await
-            .map(|_| ())
-            .map_err(|status| format!("stop failed: {}", status.code()))
+            .map_err(|status| format!("stop failed: {}", status.code()))?;
+        // Stopped means the gateway says so, not that it accepted the request.
+        let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
+        loop {
+            let phase = match client
+                .get_sandbox(GetSandboxRequest {
+                    name: sandbox_name.to_owned(),
+                    workspace_scope: Some(workspace_selector(workspace)),
+                })
+                .await
+            {
+                Ok(found) => found
+                    .into_inner()
+                    .sandbox
+                    .map_or(0, |sandbox| sandbox.phase()),
+                // Gone is stopped.
+                Err(status) if status.code() == tonic::Code::NotFound => return Ok(()),
+                Err(status) => return Err(format!("stop not confirmed: {}", status.code())),
+            };
+            if is_stopped(phase) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "stop requested but not confirmed within {} s (phase {phase})",
+                    CONFIRM_TIMEOUT.as_secs()
+                ));
+            }
+            tokio::time::sleep(CONFIRM_POLL).await;
+        }
     }
 }
 
 /// Used when no gateway credential is configured: a halted sandbox is still
 /// cut off, because every later request from it is denied.
+/// Whether a sandbox phase means its workload no longer runs: stopped,
+/// completed, failed or being deleted.
+fn is_stopped(phase: i32) -> bool {
+    use openshell_core::proto::SandboxPhase;
+    [
+        SandboxPhase::Stopped,
+        SandboxPhase::Completed,
+        SandboxPhase::Error,
+        SandboxPhase::Deleting,
+    ]
+    .iter()
+    .any(|stopped| *stopped as i32 == phase)
+}
+
 pub struct DenyOnlyStopper;
 
 #[tonic::async_trait]

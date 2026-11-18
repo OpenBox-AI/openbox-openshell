@@ -163,6 +163,11 @@ doorGuard:
   # OPENBOX_BODY_CAPTURE: request and response bodies, tool arguments and
   # results, and model replies.
   bodyCapture: findings
+  # The admin resume action (docs/install.md, "Resuming a halted sandbox"):
+  # a Secret holding a token of 32+ characters under `admin-token`
+  # (OPENBOX_MW_ADMIN_TOKEN_FILE). Empty: resume is off; the admin port
+  # serves only probes and metrics.
+  adminTokenSecret: ""
   # Fast-path verdicts (docs/install.md, "Fast-path verdicts").
   fastPath:
     # Tier 0: a local rule snapshot, as JSON under `rules.json` in this

@@ -47,6 +47,13 @@ all. Treat it like `openbox_unavailable`.
    - Rejected: OpenBox reports the rejection as a halt. The request is denied
      with `openbox_halted`, and the sandbox is stopped.
 
+Ready-made helpers do this loop: `clients/python/openbox_retry.py`
+(`with_openbox_retry`, any HTTP client) and `clients/typescript/openbox-retry.ts`
+(`withOpenBoxRetry`, `fetch`). Copy the one file you need into your agent; it
+has no dependencies. Each retries the identical request while the code is
+`openbox_approval_required`, `openbox_pending` or `openbox_unavailable`, and
+raises on the others.
+
 Retry no more often than every 10 to 30 seconds. Each retry costs one call to
 OpenBox, and approvals take a person's time. Tell the user that an approval is
 waiting, so they can go and give it.
@@ -108,7 +115,8 @@ when a person rejects an approval.
   traffic but cannot stop the sandbox.
 
 An agent that sees `openbox_halted` should stop work and report it. Retrying
-does not help.
+does not help. An operator can resume the sandbox (`docs/runbook.md`); its
+traffic is then scored again.
 
 ## Turning approvals into blocks
 

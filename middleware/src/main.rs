@@ -59,7 +59,7 @@ use openbox_verdict_middleware::guard::{
     DEFAULT_APPROVAL_TTL, DEFAULT_CORE_BUDGET, Governance, Guard, SandboxStopper,
 };
 use openbox_verdict_middleware::halt::{DenyOnlyStopper, GatewayStopper};
-use openbox_verdict_middleware::metrics::serve_admin;
+use openbox_verdict_middleware::metrics::{AdminActions, Resume, serve_admin};
 use openbox_verdict_middleware::prompt::Capture;
 use openbox_verdict_middleware::service::VerdictMiddleware;
 use openbox_verdict_middleware::store::{MemoryStore, RedisStore, SharedStore};
@@ -114,6 +114,51 @@ fn with_fast_path<G: Governance, S: SandboxStopper + ?Sized>(
         }
     });
     Ok(guard)
+}
+
+/// The admin listener: probes, metrics and, with a token, resume.
+async fn start_admin<G: Governance, S: SandboxStopper + ?Sized>(
+    guard: &Arc<Guard<G, S>>,
+) -> Result<(), String> {
+    let address: SocketAddr = env("OPENBOX_MW_ADMIN_LISTEN")
+        .unwrap_or_else(|| "127.0.0.1:9464".to_owned())
+        .parse()
+        .map_err(|_| "OPENBOX_MW_ADMIN_LISTEN must be host:port".to_owned())?;
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|error| format!("admin listener {address}: {error}"))?;
+    tokio::spawn(serve_admin(
+        listener,
+        guard.metrics(),
+        admin_actions(guard)?,
+    ));
+    Ok(())
+}
+
+/// The admin resume action, when `OPENBOX_MW_ADMIN_TOKEN_FILE` (or
+/// `OPENBOX_MW_ADMIN_TOKEN`) gives it a token. Without one it is off.
+fn admin_actions<G: Governance, S: SandboxStopper + ?Sized>(
+    guard: &Arc<Guard<G, S>>,
+) -> Result<Option<AdminActions>, String> {
+    let token = match env("OPENBOX_MW_ADMIN_TOKEN_FILE") {
+        Some(path) => Some(
+            std::fs::read_to_string(&path)
+                .map_err(|error| format!("OPENBOX_MW_ADMIN_TOKEN_FILE: {error}"))?
+                .trim()
+                .to_owned(),
+        ),
+        None => env("OPENBOX_MW_ADMIN_TOKEN"),
+    };
+    let Some(token) = token else { return Ok(None) };
+    if token.len() < 32 {
+        return Err("the admin token must be at least 32 characters".to_owned());
+    }
+    let guard = Arc::clone(guard);
+    let resume: Resume = Arc::new(move |sandbox_id| {
+        let guard = Arc::clone(&guard);
+        Box::pin(async move { guard.resume(&sandbox_id).await })
+    });
+    Ok(Some(AdminActions { token, resume }))
 }
 
 /// How often the rule snapshot file is checked for changes.
@@ -340,14 +385,7 @@ async fn run() -> Result<(), String> {
     let guard = with_fast_path(guard)?;
     let metrics = guard.metrics();
     let draining = Arc::clone(&guard);
-    let admin: SocketAddr = env("OPENBOX_MW_ADMIN_LISTEN")
-        .unwrap_or_else(|| "127.0.0.1:9464".to_owned())
-        .parse()
-        .map_err(|_| "OPENBOX_MW_ADMIN_LISTEN must be host:port".to_owned())?;
-    let admin = tokio::net::TcpListener::bind(admin)
-        .await
-        .map_err(|error| format!("admin listener {admin}: {error}"))?;
-    tokio::spawn(serve_admin(admin, Arc::clone(&metrics)));
+    start_admin(&guard).await?;
     let service = Arc::new(VerdictMiddleware::new(
         guard,
         verifier,

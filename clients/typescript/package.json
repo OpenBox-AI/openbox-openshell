@@ -1,0 +1,7 @@
+{
+  "name": "openbox-retry",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": { "test": "node --experimental-strip-types --test openbox-retry.test.ts" }
+}

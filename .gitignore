@@ -1,2 +1,4 @@
 /middleware/target/
 .DS_Store
+__pycache__/
+/middleware/target
