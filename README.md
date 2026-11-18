@@ -337,13 +337,14 @@ Put internal systems behind HTTP or MCP to govern them per request.
 | `middleware/` | Both services (one Rust crate), tests and examples |
 | `Dockerfile` | The image: both services, distroless, UID 65532 |
 | `deploy/helm/openbox-openshell/` | Helm chart for both services |
-| `.github/workflows/` | CI, and the release that publishes the image and chart |
+| `.github/workflows/` | CI on every pull request, the nightly reference stack, and the release that publishes the image and chart |
 | `docs/install.md` | Install on your OpenShell gateway |
 | `docs/runbook.md` | Metrics, alerts, slow verdicts, break-glass |
 | `docs/agent-approvals.md` | Approvals, for agent authors |
 | `docs/websocket.md` | What is governed on a WebSocket |
 | `middleware/scripts/openbox-openshell.sh` | Run OpenShell governed by OpenBox on one machine |
 | `middleware/scripts/verify-*.sh` | Live checks against a real gateway and OpenBox |
+| `middleware/scripts/nightly-reference.sh` | The nightly: OpenShell at the pinned version on kind, this checkout in front of it, a scripted agent |
 
 ## Try it on one machine
 
