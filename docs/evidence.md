@@ -91,9 +91,23 @@ openbox-evidence check --key evidence.pub --certificate cert.json records-*.json
 
 With `doorGuard.evidenceCertifySecs` above 0 (`OPENBOX_EVIDENCE_CERTIFY_SECS`)
 the door guard sends each chain's new records to Core that often, up to 1,000
-per request, and on shutdown. Core (`POST /api/v3/governance/evidence/certify`)
-checks them the way `verify` does, checks that the chain's sandbox is one of
-the agent's own sessions, and returns a Proof Certificate: the range, count
+per request, and on shutdown, with its public key. Core
+(`POST /api/v3/governance/evidence/certify`) certifies only records signed by
+a key registered on the agent, so register `evidence.pub` first. Core takes
+the raw 32-byte key in base64 (what the door guard sends) or the PEM:
+
+```bash
+openssl pkey -pubin -in evidence.pub -outform DER | tail -c 32 | base64
+```
+
+Add it to the agent's config under `openshell.evidence_public_keys`, a list,
+with the backend's agent update call (`PUT /agent/<agent id>`). That call
+replaces the whole `config`: read the agent first, add the key to its current
+`config`, and send all of it back. To rotate the key, add the new one, switch
+the door guard's Secret, then remove the old one.
+
+Core then checks the records the way `verify` does, checks that the chain's
+sandbox is one of the agent's own sessions, and returns a Proof Certificate: the range, count
 and Merkle root of the records, the key that signed them and the previous
 batch's last fingerprint (`first_prev_event`), signed with your
 organisation's attestation key (AWS KMS, ECDSA P-256). The door guard writes
@@ -110,8 +124,11 @@ certificate carries is for reference only:
 openbox-evidence check --core-key org-attestation.pub --certificate cert-line.json records-*.jsonl
 ```
 
-A batch Core cannot take is retried next time; one it refuses (HTTP 422: a
-record changed, a gap, the wrong key) is dropped from the queue and counted
+A batch Core cannot take is retried next time. That includes HTTP 403, a key
+not registered on the agent: register it and the held records (up to 10,000
+per chain) are certified on the next round. A batch Core refuses (HTTP 422: a
+record changed, a gap, a record not signed by the key sent) is dropped from
+the queue and counted
 in `openbox_mw_evidence_certified_records_total{outcome="failed"}`, so the
 chain's later records still get certificates. The records stay in the
 output either way.
