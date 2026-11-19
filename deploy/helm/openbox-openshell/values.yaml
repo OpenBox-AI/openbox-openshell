@@ -163,9 +163,11 @@ doorGuard:
   # OPENBOX_BODY_CAPTURE: request and response bodies, tool arguments and
   # results, and model replies.
   bodyCapture: findings
-  # The admin resume action (docs/install.md, "Resuming a halted sandbox"):
+  # The admin resume action (docs/runbook.md, "Resuming a halted sandbox"):
   # a Secret holding a token of 32+ characters under `admin-token`
-  # (OPENBOX_MW_ADMIN_TOKEN_FILE). Empty: resume is off; the admin port
+  # (OPENBOX_MW_ADMIN_TOKEN_FILE). The door guard also sends it to Core as
+  # the resume key, so register its SHA-256 on the agent's config under
+  # openshell.resume_key_sha256. Empty: resume is off; the admin port
   # serves only probes and metrics.
   adminTokenSecret: ""
   # Signed verdict records (docs/evidence.md): a Secret holding an Ed25519

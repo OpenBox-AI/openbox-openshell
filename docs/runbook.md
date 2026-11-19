@@ -248,7 +248,28 @@ A halted sandbox is stopped, not deleted. Inspect it before you restart it.
 A halt is held in two places: OpenBox Core latches it on the session, and each
 door guard replica caches it. Resume clears both. It is off unless the door
 guard has an admin token (`doorGuard.adminTokenSecret`, a Secret with
-`admin-token`, 32 characters or more):
+`admin-token`, 32 characters or more).
+
+The admin token is also the key Core checks before it clears its latch. The
+agent's own credentials are not enough, so a sandbox cannot resume itself.
+Register the token's SHA-256 on the agent once, in the agent's config:
+
+```bash
+printf %s "$(cat admin-token)" | sha256sum | cut -d' ' -f1   # macOS: shasum -a 256
+```
+
+Hash the token without a trailing newline, as above; the door guard trims it
+before use.
+
+```json
+{ "openshell": { "resume_key_sha256": ["<the 64 hex characters>"] } }
+```
+
+The list can hold more than one digest, so a new token can be added before the
+old one is removed. Core records each resume as `resume-key:` followed by the
+first 12 hex characters of the digest that matched.
+
+To resume:
 
 ```bash
 kubectl -n openbox port-forward deploy/openbox-openbox-openshell-door-guard 9464 &
@@ -259,8 +280,9 @@ openshell sandbox start <sandbox name>
 
 `200` means the door guard and Core both cleared it; the replica that answers
 tells the others through the shared store. `502` means the door guard cleared
-it but Core did not: requests stay halted until Core's latch is cleared.
-Core's side of resume (`POST /api/v3/governance/session/resume`) is proposed
-and not yet served, so today expect `502` with Core's `404`.
+it but Core did not: requests stay halted until Core's latch is cleared. The
+reply says why. With Core's `403`, the token's SHA-256 is not registered on the
+agent: register it and resume again. With Core's `404`, Core does not serve
+`POST /api/v3/governance/session/resume` yet (or does not know the session).
 
 After the resume the sandbox's traffic is scored again from its next request.
