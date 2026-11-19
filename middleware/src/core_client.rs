@@ -39,6 +39,10 @@ const V3_EVALUATE_PATH: &str = "/api/v3/governance/evaluate";
 const V3_APPROVAL_PATH: &str = "/api/v3/governance/approval";
 /// Proposed to Core (R5.4): clears the halt Core holds for a session.
 const V3_RESUME_PATH: &str = "/api/v3/governance/session/resume";
+/// Carries the operator's resume key. Core accepts a resume only when the
+/// key's SHA-256 is registered on the agent's config
+/// (`openshell.resume_key_sha256`); the agent's credentials alone are refused.
+pub const RESUME_KEY_HEADER: &str = "X-OpenBox-Resume-Key";
 const V3_RULES_PATH: &str = "/api/v3/governance/rules/snapshot";
 const V3_CERTIFY_PATH: &str = "/api/v3/governance/evidence/certify";
 const V3_BOOTSTRAP_PATH: &str = "/api/v3/auth/bootstrap";
@@ -435,15 +439,28 @@ impl CoreClient {
         self.evaluate(&payload, &idempotency_key(&key)).await
     }
 
-    /// Asks Core to clear the halt it holds for a sandbox's session. Core
-    /// does not serve this yet (HTTP 404 until it does).
-    pub async fn resume_session(&self, sandbox_id: &str) -> Result<(), CoreError> {
+    /// Asks Core to clear the halt it holds for a sandbox's session, with
+    /// the operator's resume key. Core records the resume against that key
+    /// and answers 403 when its SHA-256 is not registered on the agent; a
+    /// Core without the endpoint answers 404.
+    pub async fn resume_session(
+        &self,
+        sandbox_id: &str,
+        resume_key: &str,
+    ) -> Result<(), CoreError> {
         let body = serde_json::to_vec(&json!({
             "workflow_id": sandbox_id,
             "run_id": sandbox_id,
         }))
         .map_err(|_| CoreError::Malformed)?;
-        let response = self.post(V3_RESUME_PATH, body, None).await?;
+        let response = self
+            .post_with(
+                V3_RESUME_PATH,
+                body,
+                None,
+                &[(RESUME_KEY_HEADER, resume_key)],
+            )
+            .await?;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
             Ok(())
@@ -580,6 +597,16 @@ impl CoreClient {
         body: Vec<u8>,
         idempotency_key: Option<&str>,
     ) -> Result<reqwest::Response, CoreError> {
+        self.post_with(path, body, idempotency_key, &[]).await
+    }
+
+    async fn post_with(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        idempotency_key: Option<&str>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response, CoreError> {
         let url = format!("{}{path}", self.config.base_url.trim_end_matches('/'));
         let mut request = self
             .http
@@ -590,6 +617,9 @@ impl CoreClient {
             .header("X-OpenBox-SDK-Version", SDK_IDENTIFIER);
         if let Some(key) = idempotency_key {
             request = request.header("Idempotency-Key", key);
+        }
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
         }
         if let Some(signer) = &self.config.signer {
             for (name, value) in signer.headers("POST", path, &body, SystemTime::now()) {
@@ -1228,6 +1258,85 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 mod tests {
     use super::*;
     use crate::action::tests::evaluation;
+
+    /// Serves one HTTP request with `status` and returns the request text.
+    async fn serve_one(status: u16) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                seen.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&seen);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if seen.len() >= end + 4 + length || read == 0 {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} X\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&seen).into_owned()
+        });
+        (url, handle)
+    }
+
+    fn client(base_url: String) -> CoreClient {
+        CoreClient::new(CoreConfig {
+            base_url,
+            api_key: "agent-api-key".to_owned(),
+            signer: None,
+            workload: None,
+            timeout: Duration::from_secs(5),
+            body_limit_bytes: 1024,
+        })
+        .unwrap()
+    }
+
+    /// R5.4: the resume carries the operator's key, and nothing that names
+    /// the actor; Core derives that from the key.
+    #[tokio::test]
+    async fn resume_sends_the_resume_key_and_no_actor() {
+        let (url, server) = serve_one(200).await;
+        client(url)
+            .resume_session("sbx-1", "operator-admin-token")
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let lower = request.to_ascii_lowercase();
+        assert!(request.starts_with("POST /api/v3/governance/session/resume "));
+        assert!(
+            lower.contains("x-openbox-resume-key: operator-admin-token\r\n"),
+            "{request}"
+        );
+        assert!(!lower.contains("resumed_by"), "{request}");
+    }
+
+    /// Core refuses a resume key it does not know with 403.
+    #[tokio::test]
+    async fn a_refused_resume_key_is_a_403() {
+        let (url, server) = serve_one(403).await;
+        let error = client(url)
+            .resume_session("sbx-1", "unregistered")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, CoreError::Status(403)));
+    }
 
     #[test]
     fn parses_verdicts_and_legacy_aliases() {

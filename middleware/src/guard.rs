@@ -132,8 +132,10 @@ pub const DEFAULT_CORE_BUDGET: Duration = Duration::from_secs(29);
 /// Core's governance API, as the guard uses it.
 #[tonic::async_trait]
 pub trait Governance: Send + Sync + 'static {
-    /// Clears the halt Core holds for a sandbox's session.
-    async fn resume_session(&self, _sandbox_id: &str) -> Result<(), CoreError> {
+    /// Clears the halt Core holds for a sandbox's session. `resume_key` is
+    /// the operator's key; Core checks it against the agent's registered
+    /// digests and records the resume against it.
+    async fn resume_session(&self, _sandbox_id: &str, _resume_key: &str) -> Result<(), CoreError> {
         Err(CoreError::Status(501))
     }
 
@@ -193,8 +195,8 @@ pub trait Governance: Send + Sync + 'static {
 
 #[tonic::async_trait]
 impl Governance for crate::core_client::CoreClient {
-    async fn resume_session(&self, sandbox_id: &str) -> Result<(), CoreError> {
-        Self::resume_session(self, sandbox_id).await
+    async fn resume_session(&self, sandbox_id: &str, resume_key: &str) -> Result<(), CoreError> {
+        Self::resume_session(self, sandbox_id, resume_key).await
     }
     async fn rule_snapshot(&self) -> Result<String, CoreError> {
         Self::rule_snapshot(self).await
@@ -1774,9 +1776,11 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
 
     /// Resumes a halted sandbox (R5.4): clears this replica's halt, tells
     /// the other replicas through the shared store, and asks Core to clear
-    /// the halt it holds for the session. The sandbox itself is started
-    /// again with `openshell sandbox start`.
-    pub async fn resume(&self, sandbox_id: &str) -> Result<String, String> {
+    /// the halt it holds for the session, presenting `resume_key` (the admin
+    /// token). Core clears it only when the key's SHA-256 is registered on
+    /// the agent. The sandbox itself is started again with
+    /// `openshell sandbox start`.
+    pub async fn resume(&self, sandbox_id: &str, resume_key: &str) -> Result<String, String> {
         self.halted
             .lock()
             .expect("halted set lock")
@@ -1789,10 +1793,18 @@ impl<G: Governance, S: SandboxStopper + ?Sized> Guard<G, S> {
             )
             .await
             .map_err(|error| format!("resume not shared with other replicas: {error}"))?;
-        match self.governance.resume_session(sandbox_id).await {
+        match self.governance.resume_session(sandbox_id, resume_key).await {
             Ok(()) => {
                 eprintln!("openbox: sandbox {sandbox_id} resumed");
                 Ok(format!("resumed {sandbox_id}: door guard and Core cleared"))
+            }
+            Err(CoreError::Status(403)) => {
+                eprintln!(
+                    "openbox: sandbox {sandbox_id} resumed in the door guard; Core refused the resume key (HTTP 403). Register the SHA-256 of the admin token on the agent's config under openshell.resume_key_sha256"
+                );
+                Err(
+                    "door guard cleared, but Core refused the resume key (HTTP 403); register the SHA-256 of the admin token on the agent's config under openshell.resume_key_sha256. Requests stay halted until Core clears its halt"
+                    .to_owned())
             }
             Err(error) => {
                 eprintln!("openbox: sandbox {sandbox_id} resumed in the door guard; Core: {error}");
@@ -2291,9 +2303,12 @@ pub(crate) mod tests {
         pub constraints: Option<Value>,
         /// Sent with every verdict, as Core's `verdict_ttl_secs`.
         pub verdict_ttl_secs: Option<u64>,
-        /// Sandboxes Core was asked to resume; `Err` when it refuses.
-        pub resumed: Mutex<Vec<String>>,
+        /// Sandboxes Core was asked to resume, with the key presented;
+        /// `Err` when it refuses.
+        pub resumed: Mutex<Vec<(String, String)>>,
         pub refuse_resume: bool,
+        /// Refuse the resume key (HTTP 403) instead of the session (404).
+        pub refuse_resume_key: bool,
     }
 
     fn decision(verdict: Verdict) -> CoreDecision {
@@ -2322,9 +2337,18 @@ pub(crate) mod tests {
 
     #[tonic::async_trait]
     impl Governance for FakeCore {
-        async fn resume_session(&self, sandbox_id: &str) -> Result<(), CoreError> {
-            self.resumed.lock().unwrap().push(sandbox_id.to_owned());
-            if self.refuse_resume {
+        async fn resume_session(
+            &self,
+            sandbox_id: &str,
+            resume_key: &str,
+        ) -> Result<(), CoreError> {
+            self.resumed
+                .lock()
+                .unwrap()
+                .push((sandbox_id.to_owned(), resume_key.to_owned()));
+            if self.refuse_resume_key {
+                Err(CoreError::Status(403))
+            } else if self.refuse_resume {
                 Err(CoreError::Status(404))
             } else {
                 Ok(())
@@ -3107,8 +3131,12 @@ pub(crate) mod tests {
             "a halted sandbox is not scored"
         );
         // The admin resumes it on the other replica.
-        second.resume("sbx-id-1").await.unwrap();
-        assert_eq!(*core.resumed.lock().unwrap(), ["sbx-id-1"]);
+        second.resume("sbx-id-1", "admin-token").await.unwrap();
+        assert_eq!(
+            *core.resumed.lock().unwrap(),
+            [("sbx-id-1".to_owned(), "admin-token".to_owned())],
+            "Core gets the admin token as the resume key"
+        );
         assert!(is_allow(
             &first.evaluate(&request("req-3"), ApprovalMode::Queue).await
         ));
@@ -3123,8 +3151,21 @@ pub(crate) mod tests {
             ..FakeCore::default()
         };
         let (guard, _, _) = guard(core);
-        let error = guard.resume("sbx-id-1").await.unwrap_err();
+        let error = guard.resume("sbx-id-1", "admin-token").await.unwrap_err();
         assert!(error.contains("Core did not clear"), "{error}");
+    }
+
+    /// R5.4: Core refusing the resume key says how to register it.
+    #[tokio::test]
+    async fn a_resume_key_core_refuses_says_how_to_register_it() {
+        let core = FakeCore {
+            refuse_resume_key: true,
+            ..FakeCore::default()
+        };
+        let (guard, _, _) = guard(core);
+        let error = guard.resume("sbx-id-1", "admin-token").await.unwrap_err();
+        assert!(error.contains("HTTP 403"), "{error}");
+        assert!(error.contains("openshell.resume_key_sha256"), "{error}");
     }
 
     /// W3 tier 1: an allow Core marked reusable answers the identical action

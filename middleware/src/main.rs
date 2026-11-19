@@ -159,7 +159,8 @@ async fn start_admin<G: Governance, S: SandboxStopper + ?Sized>(
 }
 
 /// The admin resume action, when `OPENBOX_MW_ADMIN_TOKEN_FILE` (or
-/// `OPENBOX_MW_ADMIN_TOKEN`) gives it a token. Without one it is off.
+/// `OPENBOX_MW_ADMIN_TOKEN`) gives it a token. Without one it is off. The
+/// token authorizes the admin call and is sent to Core as the resume key.
 fn admin_actions<G: Governance, S: SandboxStopper + ?Sized>(
     guard: &Arc<Guard<G, S>>,
 ) -> Result<Option<AdminActions>, String> {
@@ -177,9 +178,13 @@ fn admin_actions<G: Governance, S: SandboxStopper + ?Sized>(
         return Err("the admin token must be at least 32 characters".to_owned());
     }
     let guard = Arc::clone(guard);
+    // The admin token is also the resume key Core checks: an operator
+    // registers its SHA-256 on the agent's config.
+    let resume_key: Arc<str> = Arc::from(token.as_str());
     let resume: Resume = Arc::new(move |sandbox_id| {
         let guard = Arc::clone(&guard);
-        Box::pin(async move { guard.resume(&sandbox_id).await })
+        let resume_key = Arc::clone(&resume_key);
+        Box::pin(async move { guard.resume(&sandbox_id, &resume_key).await })
     });
     Ok(Some(AdminActions { token, resume }))
 }
